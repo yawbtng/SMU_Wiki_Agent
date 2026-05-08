@@ -1984,8 +1984,8 @@ with tabs[4]:
         else:
             st.session_state["ollama_model"] = model_row2.text_input(
                 "Ollama model name",
-                value=st.session_state["ollama_model"] or "qwen2.5:3b",
-                help="Example: qwen2.5:3b, llama3.2:3b, mistral:7b",
+                value=st.session_state["ollama_model"] or "qwen2.5:1.5b",
+                help="Example: qwen2.5:1.5b, llama3.2:1b, qwen2.5:3b",
             )
         st.session_state["ollama_base_url"] = st.text_input(
             "Ollama base URL", value=st.session_state.get("ollama_base_url", OLLAMA_BASE_URL)
