@@ -300,6 +300,42 @@ VERY_LOW_SIGNAL = [
 ]
 
 
+MONTH_SLUGS = (
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+)
+
+DATED_ARCHIVE_PATTERNS = [
+    # News/magazine/story permalinks and school-year news folders.
+    r"/latest-at-lyle/\d{4}-\d{2}/",
+    r"/stories/.+20\d{2}",
+    r"/press-releases/20\d{6}",
+    # Event/ceremony archive pages.
+    r"/professors-institute(?:/professors-institute)?-20\d{2}",
+    r"/20\d{2}-virtual-graduation",
+    r"/symposia-and-workshops/20\d{2}",
+    # Year-specific people/result pages.
+    r"/20\d{2}-ntcc-scholars",
+    r"/20\d{2}-20\d{2}-faculty-publications",
+    r"/20\d{2}-20\d{2}-passport-directory",
+    # Old term pages. Current/future terms are handled by year comparison below.
+    r"/coursedescriptions/(fall|spring)-20\d{2}",
+    r"/course-schedule/(fall|spring)-20\d{2}",
+    # COVID / one-off historical instructions.
+    r"alternategrade.*20\d{2}",
+]
+
+
 def parse_lastmod(lastmod_str):
     if not lastmod_str:
         return None
@@ -343,6 +379,44 @@ def score_freshness(lastmod_dt, target_year):
         return 50
 
 
+def extract_url_years(url):
+    return [int(year) for year in re.findall(r"(?<!\d)(20\d{2})(?!\d)", url)]
+
+
+def is_current_or_future_year(year):
+    return year >= TARGET_YEAR - 1
+
+
+def detect_dated_archive(url):
+    """Return a reason when URL content is stale even if sitemap lastmod is fresh."""
+    path = urlparse(url).path.lower()
+    years = extract_url_years(path)
+    oldest_year = min(years) if years else None
+
+    crime_log_month = rf"/crime-log/.*/20\d{{2}}/({'|'.join(MONTH_SLUGS)})$"
+    if re.search(crime_log_month, path, re.IGNORECASE):
+        if oldest_year is None or not is_current_or_future_year(oldest_year):
+            return "historical monthly crime log"
+
+    for pattern in DATED_ARCHIVE_PATTERNS:
+        if re.search(pattern, path, re.IGNORECASE):
+            if oldest_year is None or not is_current_or_future_year(oldest_year):
+                return "dated archive page"
+
+    # Generic dated article permalink. Keep current/future pages, demote older ones.
+    if re.search(r"/20\d{2}-\d{2}-\d{2}-", path):
+        if oldest_year is not None and not is_current_or_future_year(oldest_year):
+            return "old dated article"
+
+    # Old factsheets, tuition snapshots, and similar year-specific artifacts are not
+    # the best answer source when current canonical pages exist.
+    if oldest_year is not None and oldest_year < TARGET_YEAR - 1:
+        if re.search(r"/(tuition|factsheets|directory|schedule|spring|fall)[-_]?", path):
+            return "old year-specific page"
+
+    return ""
+
+
 def score_url(url_item):
     url = url_item.get("url", "")
     path = urlparse(url).path.lower()
@@ -354,6 +428,7 @@ def score_url(url_item):
     freshness = score_freshness(lastmod_dt, TARGET_YEAR)
     source_quality = 85 if url.endswith(".edu") or ".edu/" in url else 70
     scrape_value = 70
+    dated_archive_reason = detect_dated_archive(url)
 
     # Check noisy patterns first
     noisy = False
@@ -405,6 +480,13 @@ def score_url(url_item):
     if medium_match:
         student_value += 10
         scrape_value += 5
+
+    if dated_archive_reason:
+        # Sitemap lastmod often changes because CMS templates, nav, or related
+        # carousels changed. Do not let that make old body content look current.
+        student_value -= 35
+        scrape_value -= 25
+        freshness = min(freshness, 35)
 
     # Root domain bonus
     if path == "/" or path == "":
@@ -474,6 +556,8 @@ def score_url(url_item):
         reasons.append("noisy/technical page")
     if very_low:
         reasons.append("administrative/non-student focus")
+    if dated_archive_reason:
+        reasons.append(dated_archive_reason)
     if depth >= 5:
         reasons.append("deep page hierarchy")
 
