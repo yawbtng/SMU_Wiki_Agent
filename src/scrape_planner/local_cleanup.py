@@ -118,6 +118,56 @@ def cleanup_markdown_with_ollama(
     return content, meta
 
 
+def cleanup_markdown_with_openrouter(
+    markdown: str,
+    *,
+    model: str,
+    api_key: str,
+    max_tokens: int = 2048,
+) -> tuple[str, dict[str, Any]]:
+    prompt = (
+        "You clean scraped markdown for wiki and search indexing.\n"
+        "Rules:\n"
+        "1) Remove navigation/menu/footer/social/share noise.\n"
+        "2) Keep ALL factual content and section headings from source.\n"
+        "3) DO NOT compress or summarize away details.\n"
+        "4) Preserve all numbers, dates, requirements, exceptions, caveats, and links.\n"
+        "5) Do not add facts not present in source.\n"
+        "6) Output markdown only in this exact structure:\n"
+        "# <Title>\n"
+        "## Full Facts Snapshot\n"
+        "- Bullets can be long; include complete details, not shortened versions.\n"
+        "## Key Insights\n"
+        "- highlight implications but keep original factual details intact.\n"
+        "## Cleaned Content\n"
+        "- preserve near-complete factual body in organized sections.\n\n"
+        "Input markdown:\n"
+        f"{markdown}"
+    )
+    resp = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0,
+            "max_tokens": int(max_tokens),
+        },
+        timeout=180,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    content = str(data["choices"][0]["message"]["content"] or "").strip()
+    if not content:
+        raise ValueError("openrouter_empty_response")
+    usage = data.get("usage") or {}
+    return content, {
+        "prompt_eval_count": usage.get("prompt_tokens"),
+        "eval_count": usage.get("completion_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+    }
+
+
 def _slugify_tag(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
     return cleaned[:40]
@@ -350,6 +400,30 @@ def _postprocess_cleaned_markdown(markdown: str) -> str:
     return f"{cleaned}\n" if cleaned else ""
 
 
+def _preclean_skip_reason(markdown: str, url: str = "") -> str:
+    text = re.sub(r"\s+", " ", str(markdown or "")).strip()
+    lowered = text.lower()
+    path = urlparse(str(url or "")).path.lower()
+    if not text:
+        return "empty_markdown"
+    if len(text) < 250:
+        return "thin_markdown"
+    nav_words = sum(1 for key in ["menu", "search", "login", "breadcrumb", "footer", "navigation"] if key in lowered)
+    factual_words = sum(1 for key in ["admission", "tuition", "degree", "program", "deadline", "requirement", "course", "scholarship"] if key in lowered)
+    if nav_words >= 3 and factual_words == 0:
+        return "nav_search_menu_only"
+    current_year = datetime.now(timezone.utc).year
+    year_matches = [int(y) for y in re.findall(r"\b(20\d{2})\b", path)]
+    if year_matches and max(year_matches) <= current_year - 2:
+        if re.search(r"(archive|news|stories|events|recipient|profile|scholar|crime|log|spring|summer|fall|winter|term|20\d{2})", path):
+            return "stale_historical_archive"
+    if re.search(r"/(january|february|march|april|may|june|july|august|september|october|november|december)[-/]?\d{4}", path):
+        return "old_monthly_archive"
+    if re.search(r"(spring|summer|fall|winter)-20\d{2}|20\d{2}-(spring|summer|fall|winter)", path):
+        return "old_term_course_page"
+    return ""
+
+
 def run_sequential_cleanup(
     run_root: Path,
     *,
@@ -357,6 +431,8 @@ def run_sequential_cleanup(
     base_url: str = "http://localhost:11434",
     max_tokens: int = 2048,
     think: bool = False,
+    provider: str = "ollama",
+    openrouter_api_key: str = "",
 ) -> dict[str, Any]:
     pages = read_json(run_root / "scrape_manifest.json", [])
     selected = [p for p in pages if p.get("status") == "success" and p.get("markdown_path")]
@@ -370,13 +446,26 @@ def run_sequential_cleanup(
             records.append({"url": page.get("url"), "status": "skipped", "reason": "missing_markdown"})
             continue
         try:
-            cleaned, _meta = cleanup_markdown_with_ollama(
-                src_path.read_text(encoding="utf-8"),
-                model=model,
-                base_url=base_url,
-                max_tokens=max_tokens,
-                think=think,
-            )
+            source_markdown = src_path.read_text(encoding="utf-8")
+            skip_reason = _preclean_skip_reason(source_markdown, str(page.get("url") or ""))
+            if skip_reason:
+                records.append({"url": page.get("url"), "status": "skipped", "reason": skip_reason, "source_markdown_path": str(src_path)})
+                continue
+            if provider == "openrouter":
+                cleaned, _meta = cleanup_markdown_with_openrouter(
+                    source_markdown,
+                    model=model,
+                    api_key=openrouter_api_key,
+                    max_tokens=max_tokens,
+                )
+            else:
+                cleaned, _meta = cleanup_markdown_with_ollama(
+                    source_markdown,
+                    model=model,
+                    base_url=base_url,
+                    max_tokens=max_tokens,
+                    think=think,
+                )
             cleaned = _postprocess_cleaned_markdown(cleaned)
             base_title = _base_title_for_page(cleaned, str(page.get("url") or ""))
             unique_title = _unique_title(base_title, used_titles)
@@ -441,6 +530,8 @@ class CleanupRunner:
         max_tokens: int,
         concurrency: int,
         think: bool = False,
+        provider: str = "ollama",
+        openrouter_api_key: str = "",
     ) -> None:
         key = self._key(site_id, run_id)
         if key in self._threads and self._threads[key].is_alive():
@@ -457,6 +548,8 @@ class CleanupRunner:
                 "max_tokens": max_tokens,
                 "concurrency": max(1, concurrency),
                 "think": bool(think),
+                "provider": provider,
+                "openrouter_api_key": openrouter_api_key,
             },
             daemon=True,
         )
@@ -481,6 +574,8 @@ class CleanupRunner:
         max_tokens: int,
         concurrency: int,
         think: bool = False,
+        provider: str = "ollama",
+        openrouter_api_key: str = "",
     ) -> None:
         pages = read_json(run_root / "scrape_manifest.json", [])
         selected = [p for p in pages if p.get("status") == "success" and p.get("markdown_path")]
@@ -560,6 +655,7 @@ class CleanupRunner:
             "model": model,
             "base_url": base_url,
             "think": bool(think),
+            "provider": provider,
         }
         self.state.set_cleanup_status(
             site_id,
@@ -610,16 +706,31 @@ class CleanupRunner:
                 update_status()
                 return
             try:
+                source_markdown = src_path.read_text(encoding="utf-8")
+                skip_reason = _preclean_skip_reason(source_markdown, str(row.get("url") or ""))
+                if skip_reason:
+                    update_item(idx, status="skipped", reason=skip_reason)
+                    push_cleanup_event({"ts": _utc_now_iso(), "url": row["url"], "event": "skipped", "reason": skip_reason})
+                    update_status()
+                    return
                 update_item(idx, status="running")
                 update_status()
                 t0 = time.perf_counter()
-                cleaned, meta = cleanup_markdown_with_ollama(
-                    src_path.read_text(encoding="utf-8"),
-                    model=model,
-                    base_url=base_url,
-                    max_tokens=max_tokens,
-                    think=think,
-                )
+                if provider == "openrouter":
+                    cleaned, meta = cleanup_markdown_with_openrouter(
+                        source_markdown,
+                        model=model,
+                        api_key=openrouter_api_key,
+                        max_tokens=max_tokens,
+                    )
+                else:
+                    cleaned, meta = cleanup_markdown_with_ollama(
+                        source_markdown,
+                        model=model,
+                        base_url=base_url,
+                        max_tokens=max_tokens,
+                        think=think,
+                    )
                 cleaned = _postprocess_cleaned_markdown(cleaned)
                 base_title = _base_title_for_page(cleaned, str(row.get("url") or ""))
                 with title_lock:
@@ -642,7 +753,7 @@ class CleanupRunner:
                 append_event(
                     run_root,
                     {
-                        "provider": "ollama",
+                        "provider": provider,
                         "operation": "cleanup_page",
                         "status": "success",
                         "url": row["url"],
@@ -658,7 +769,7 @@ class CleanupRunner:
                 append_event(
                     run_root,
                     {
-                        "provider": "ollama",
+                        "provider": provider,
                         "operation": "cleanup_page",
                         "status": "failed",
                         "url": row["url"],

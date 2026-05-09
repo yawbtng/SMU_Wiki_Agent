@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 WORKFLOW_TABS = [
-    "Workspace",
+    "Setup",
     "Discover",
-    "Select",
+    "Choose URLs",
     "Scrape",
-    "Cleanup",
-    "Metrics",
+    "Clean",
+    "Review",
     "Settings",
 ]
-

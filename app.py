@@ -633,8 +633,8 @@ cleanup_runner = _get_cleanup_runner()
 terminal_skill_runner = _get_terminal_skill_runner()
 tmux_runner = _get_tmux_runner()
 
-st.title("Scrapling Scrape Planner")
-st.caption("Discover sitemap URLs, select pages, scrape with failure visibility, clean with local LLM, and build wiki inputs.")
+st.title("Scrape Pipeline")
+st.caption("Setup -> Discover -> Choose URLs -> Scrape -> Clean -> Review.")
 
 if not st.session_state.get("active_workspace_id"):
     st.subheader("Workspaces")
@@ -691,16 +691,30 @@ if active_ws:
 tabs = st.tabs(WORKFLOW_TABS)
 
 with tabs[0]:
-    st.subheader("Workspace Dashboard")
+    st.subheader("Setup")
     if active_ws:
-        st.caption("You are inside this workspace. Use the tabs above to discover, select, scrape, clean, and inspect metrics.")
-        d1, d2, d3, d4 = st.columns(4)
-        d1.metric("Workspace", active_ws.get("name", "Workspace"))
-        d2.metric("Site ID", st.session_state.get("site_id") or "not_set")
         discovered_count = len(st.session_state.get("discovered") or read_json(_discovered_json_path(st.session_state["site_id"]), []))
-        d3.metric("Discovered URLs", f"{discovered_count:,}")
-        d4.metric("Active Run", st.session_state.get("run_id") or "none")
-        st.info("Next step: go to `Discover` to refresh sitemap URLs, then `Select` to score and choose important URLs before scraping.")
+        next_hint = "Refresh sitemap URLs"
+        if discovered_count:
+            next_hint = "Choose important URLs"
+        if st.session_state.get("run_id"):
+            next_hint = "Continue scrape, clean, or review this run"
+        s1, s2 = st.columns([1, 2])
+        s1.metric("Workspace", active_ws.get("name", "Workspace"))
+        s2.metric("Site URL", active_ws.get("url") or st.session_state.get("site_url") or "not set")
+        d1, d2 = st.columns(2)
+        d1.metric("Active Run ID", st.session_state.get("run_id") or "none")
+        d2.info(f"Next step: {next_hint}.")
+        with st.expander("Recent sites", expanded=False):
+            if st.session_state["site_history"]:
+                st.dataframe(pd.DataFrame({"site_url": st.session_state["site_history"]}), use_container_width=True, hide_index=True)
+            else:
+                st.info("No recent sites saved yet.")
+        with st.expander("Workspace details", expanded=False):
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Workspace ID", st.session_state.get("site_id") or "not_set")
+            d2.metric("Discovered URLs", f"{discovered_count:,}")
+            d3.metric("Workspace Count", f"{len(st.session_state.get('workspaces', [])):,}")
     else:
         st.warning("No active workspace selected. Go back to the workspace list and open one.")
 
@@ -767,8 +781,19 @@ with tabs[0]:
                     st.rerun()
 
 with tabs[1]:
-    st.write("Sitemap discovery from robots.txt and common sitemap paths.")
-    if st.button("Discover Sitemap URLs", disabled=not st.session_state["site_url"], type="primary"):
+    discovered_path = _discovered_json_path(st.session_state["site_id"])
+    discovered_rows_for_summary = st.session_state.get("discovered") or read_json(discovered_path, [])
+    source_count = len(
+        {
+            row.get("source_sitemap")
+            for row in discovered_rows_for_summary
+            if isinstance(row, dict) and row.get("source_sitemap")
+        }
+    )
+    last_refreshed = "never"
+    if discovered_path.exists():
+        last_refreshed = datetime.fromtimestamp(discovered_path.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    if st.button("Refresh Sitemap URLs", disabled=not st.session_state["site_url"], type="primary"):
         result = discover_site_urls(st.session_state["site_url"])
         st.session_state["discovered"] = _to_discovered_rows(result.urls)
         st.session_state["selected_df"] = pd.DataFrame(st.session_state["discovered"])
@@ -776,22 +801,27 @@ with tabs[1]:
         _save_app_state()
         st.info("\n".join(result.notes) if result.notes else "Discovery completed.")
 
-    st.write("Manual URL add (one per line)")
-    st.session_state["manual_urls"] = st.text_area("Manual URLs", value=st.session_state["manual_urls"], height=120)
-    _save_app_state()
-    if st.button("Add Manual URLs"):
-        items = apply_manual_urls(st.session_state["site_url"], st.session_state["manual_urls"].splitlines())
-        merged = {row["url"]: row for row in st.session_state["discovered"]}
-        for item in items:
-            merged[item.url] = item.to_dict()
-        st.session_state["discovered"] = list(merged.values())
-        st.session_state["selected_df"] = pd.DataFrame(st.session_state["discovered"])
-        _save_app_state()
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Discovered URLs", f"{len(discovered_rows_for_summary):,}")
+    d2.metric("Sitemap Sources", f"{source_count:,}")
+    d3.metric("Last Refreshed", last_refreshed)
 
-    if st.session_state["discovered"]:
-        st.dataframe(pd.DataFrame(st.session_state["discovered"]), use_container_width=True)
-    else:
-        st.warning("No URLs discovered yet.")
+    with st.expander("Advanced discovery inputs and raw URLs", expanded=False):
+        st.write("Manual URL add (one per line)")
+        st.session_state["manual_urls"] = st.text_area("Manual URLs", value=st.session_state["manual_urls"], height=120)
+        _save_app_state()
+        if st.button("Add Manual URLs"):
+            items = apply_manual_urls(st.session_state["site_url"], st.session_state["manual_urls"].splitlines())
+            merged = {row["url"]: row for row in st.session_state["discovered"]}
+            for item in items:
+                merged[item.url] = item.to_dict()
+            st.session_state["discovered"] = list(merged.values())
+            st.session_state["selected_df"] = pd.DataFrame(st.session_state["discovered"])
+            _save_app_state()
+        if st.session_state["discovered"]:
+            st.dataframe(pd.DataFrame(st.session_state["discovered"]), use_container_width=True)
+        else:
+            st.info("No raw URL rows yet.")
 
 with tabs[2]:
     if not st.session_state["discovered"]:
@@ -807,9 +837,9 @@ with tabs[2]:
                 st.session_state["last_selection_payload"] = read_json(score_file, {})
             except Exception:
                 pass
-        st.write("Selection stage runs in a live terminal session and imports JSON scores when done.")
+        st.write("Choose important URLs from scoring results. The threshold controls what gets scraped.")
 
-        with st.expander("Terminal", expanded=True):
+        with st.expander("Advanced scoring terminal, prompt, and import controls", expanded=False):
             discovered_path = _discovered_json_path(st.session_state["site_id"])
             scored_out_path = DATA_ROOT / "sites" / st.session_state["site_id"] / "selected_urls_llm.json"
             prompt_path = DATA_ROOT / "sites" / st.session_state["site_id"] / "pi_url_selection_prompt.md"
@@ -1006,7 +1036,7 @@ with tabs[2]:
                             ]
                             pi_payload = {
                                 "selection_method": "pi_prompt_array",
-                                "default_threshold": 70,
+                                "default_threshold": 80,
                                 "scored_urls": pi_scored,
                                 "selected_urls": [
                                     {
@@ -1015,7 +1045,7 @@ with tabs[2]:
                                         "priority": int(row.get("score") or 0),
                                     }
                                     for row in pi_scored
-                                    if int(row.get("score") or 0) >= 70
+                                    if int(row.get("score") or 0) >= 80
                                 ],
                             }
                         else:
@@ -1041,7 +1071,7 @@ with tabs[2]:
                             if replace_cols:
                                 df = df.drop(columns=replace_cols)
                             df = df.merge(pi_df[merge_cols], on="url", how="left")
-                            threshold = int(pi_payload.get("default_threshold", 70))
+                            threshold = int(pi_payload.get("default_threshold", 80))
                             df["selected"] = df["score"].fillna(0).astype(int) >= threshold
                             st.session_state["score_threshold"] = threshold
                             st.session_state["llm_selected"] = [
@@ -1096,15 +1126,15 @@ with tabs[2]:
 
         selected_payload = st.session_state.get("last_selection_payload", {})
         if selected_payload:
-            st.subheader("Selected URLs")
+            st.subheader("Important URLs")
             st.caption(f"Selection method: `{selected_payload.get('selection_method', 'unknown')}`")
             scored_rows = selected_payload.get("scored_urls", [])
             if scored_rows:
                 threshold = st.slider(
-                    "Select URLs with score >= threshold",
+                    "Importance threshold",
                     min_value=0,
                     max_value=100,
-                    value=int(st.session_state.get("score_threshold", selected_payload.get("default_threshold", 70))),
+                    value=int(st.session_state.get("score_threshold", selected_payload.get("default_threshold", 80))),
                     step=5,
                 )
                 st.session_state["score_threshold"] = threshold
@@ -1123,11 +1153,25 @@ with tabs[2]:
                     .sort_values(["score", "freshness"], ascending=[False, False])
                     .reset_index(drop=True)
                 )
+                low_value_count = int((df["score"] < threshold).sum())
+                excluded_stale_count = int(
+                    df.get("reason", pd.Series("", index=df.index))
+                    .fillna("")
+                    .astype(str)
+                    .str.contains("old|dated|archive|stale|term|crime|recipient", case=False, regex=True)
+                    .sum()
+                )
                 metric_1, metric_2, metric_3, metric_4 = st.columns(4)
-                metric_1.metric("Scored URLs", f"{len(scored_rows):,}")
-                metric_2.metric("Shown", f"{len(visible_df):,}")
-                metric_3.metric("Avg Score", f"{float(df['score'].fillna(0).mean()):.1f}")
-                metric_4.metric("Threshold", threshold)
+                metric_1.metric("Selected", f"{len(visible_df):,}")
+                metric_2.metric("Excluded Stale/Archive", f"{excluded_stale_count:,}")
+                metric_3.metric("Low Value", f"{low_value_count:,}")
+                metric_4.metric("Total Scored", f"{len(scored_rows):,}")
+                if st.button("Use Recommended Important URLs", type="primary"):
+                    df["selected"] = df["score"] >= threshold
+                    st.session_state["discovered"] = df.to_dict("records")
+                    st.session_state["selected_df"] = df
+                    _save_app_state()
+                    st.success(f"Using {len(visible_df):,} URLs at threshold {threshold}.")
                 display_cols = [
                     col
                     for col in ["score", "url", "reason", "student_value", "freshness", "source_quality", "scrape_value"]
@@ -1141,8 +1185,7 @@ with tabs[2]:
             else:
                 st.info("No scored URLs yet. Run Terminal scoring or import scores.")
         else:
-            st.subheader("URLs")
-            st.dataframe(df, use_container_width=True)
+            st.info("No scored URLs yet. Open Advanced controls to run or import scoring.")
     else:
         st.info("Discover or add manual URLs first.")
 
@@ -1164,14 +1207,14 @@ with tabs[3]:
 
         c1, c2, c3, c4, c5, c6, c7 = st.columns([1, 1, 1, 1, 1, 1, 2.2])
         concurrency = c3.number_input("Concurrency", min_value=1, max_value=16, value=4, step=1)
-        if c1.button("Start Run", type="primary"):
+        if c1.button("Start Scrape", type="primary"):
             run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
             st.session_state["run_id"] = run_id
             st.session_state["last_run_by_site"][st.session_state["site_id"]] = run_id
             _save_app_state()
             selected_urls = _rows_to_discovered_urls(st.session_state["selected_df"].to_dict("records"))
             if not selected_urls:
-                st.error("No URLs selected. Lower the score threshold or select rows before starting a scrape.")
+                st.error("No URLs selected. Lower the importance threshold or choose URLs before starting a scrape.")
             else:
                 runner.start(
                     st.session_state["site_id"],
@@ -1356,7 +1399,7 @@ with tabs[3]:
                 else:
                     quick_retry_cols[2].caption("Advanced, filtered, and selected retries are available in `Advanced Failure Triage` below.")
 
-            st.subheader("Queue / Activity")
+            st.subheader("Running Pages")
             if pages_df.empty:
                 st.info("Run initializing. Waiting for queue state to be published.")
             else:
@@ -1375,10 +1418,11 @@ with tabs[3]:
 
                 f1, f2, f3, f4 = st.columns([2, 2, 3, 2])
                 status_options = sorted(pages_df["status"].dropna().astype(str).unique().tolist())
+                default_statuses = ["running"] if "running" in status_options else []
                 selected_statuses = f1.multiselect(
                     "Status filter",
                     options=status_options,
-                    default=status_options,
+                    default=default_statuses,
                     key="scrape_live_status_filter",
                 )
                 slow_threshold = f2.number_input("Slow threshold (sec)", min_value=0, max_value=600, value=10, step=1)
@@ -1431,7 +1475,8 @@ with tabs[3]:
                     if waiting_for_first:
                         st.caption("Waiting for first page completion. Queue and worker activity are live.")
 
-            st.subheader("Live Event Timeline")
+            with st.expander("Advanced events, page inspector, and failure triage", expanded=False):
+                st.subheader("Live Event Timeline")
             log_controls = st.columns([2, 2, 2])
             show_latest = int(
                 log_controls[0].number_input("Show latest events", min_value=20, max_value=1500, value=200, step=20)
@@ -2007,9 +2052,16 @@ with tabs[4]:
                     del st.query_params["cleanup_preview"]
                 st.rerun()
 
-        st.subheader("Local Ollama Cleanup")
+        st.subheader("Clean")
+        provider_label = st.selectbox(
+            "Cleanup provider",
+            options=["OpenRouter recommended", "Ollama local"],
+            index=0 if st.session_state.get("cleanup_provider", "openrouter") == "openrouter" else 1,
+        )
+        cleanup_provider = "openrouter" if provider_label.startswith("OpenRouter") else "ollama"
+        st.session_state["cleanup_provider"] = cleanup_provider
         model_row1, model_row2 = st.columns([1, 2])
-        if model_row1.button("Fetch models from Ollama API", key="cleanup_fetch_ollama_models"):
+        if cleanup_provider == "ollama" and model_row1.button("Fetch models from Ollama API", key="cleanup_fetch_ollama_models"):
             try:
                 st.session_state["ollama_models"] = fetch_ollama_models(
                     _normalize_ollama_base_url(st.session_state.get("ollama_base_url", OLLAMA_BASE_URL))
@@ -2017,12 +2069,31 @@ with tabs[4]:
                 st.success(f"Loaded {len(st.session_state.get('ollama_models', []))} models from Ollama.")
             except Exception as exc:
                 st.error(f"Could not fetch models: {exc}")
+        if cleanup_provider == "openrouter" and model_row1.button("Fetch OpenRouter models", key="cleanup_fetch_openrouter_models"):
+            try:
+                st.session_state["openrouter_models"] = fetch_openrouter_models(st.session_state.get("openrouter_api_key", "").strip())
+                st.success(f"Loaded {len(st.session_state.get('openrouter_models', []))} OpenRouter models.")
+            except Exception as exc:
+                st.error(f"Could not fetch models: {exc}")
         ollama_model_options = [
             str(m.get("id") or "").strip()
             for m in st.session_state.get("ollama_models", [])
             if str(m.get("id") or "").strip()
         ]
-        if ollama_model_options:
+        openrouter_model_options = [
+            str(m.get("id") or "").strip()
+            for m in st.session_state.get("openrouter_models", [])
+            if str(m.get("id") or "").strip()
+        ]
+        if cleanup_provider == "openrouter" and openrouter_model_options:
+            current_model = str(st.session_state.get("default_or_model") or "deepseek/deepseek-v4-flash").strip()
+            model_idx = openrouter_model_options.index(current_model) if current_model in openrouter_model_options else 0
+            cleanup_model = model_row2.selectbox("OpenRouter model", options=openrouter_model_options, index=model_idx)
+            st.session_state["default_or_model"] = cleanup_model
+        elif cleanup_provider == "openrouter":
+            cleanup_model = model_row2.text_input("OpenRouter model", value=st.session_state.get("default_or_model", "deepseek/deepseek-v4-flash"))
+            st.session_state["default_or_model"] = cleanup_model
+        elif ollama_model_options:
             current_ollama_model = str(st.session_state.get("ollama_model") or "").strip()
             model_idx = ollama_model_options.index(current_ollama_model) if current_ollama_model in ollama_model_options else 0
             st.session_state["ollama_model"] = model_row2.selectbox(
@@ -2037,9 +2108,10 @@ with tabs[4]:
                 value=st.session_state["ollama_model"] or "qwen2.5:1.5b",
                 help="Example: qwen2.5:1.5b, llama3.2:1b, qwen2.5:3b",
             )
-        st.session_state["ollama_base_url"] = st.text_input(
-            "Ollama base URL", value=st.session_state.get("ollama_base_url", OLLAMA_BASE_URL)
-        )
+        with st.expander("Advanced cleanup model settings", expanded=False):
+            st.session_state["ollama_base_url"] = st.text_input(
+                "Ollama base URL", value=st.session_state.get("ollama_base_url", OLLAMA_BASE_URL)
+            )
         st.session_state["ollama_base_url"] = _normalize_ollama_base_url(st.session_state["ollama_base_url"])
         ollama_url = st.session_state["ollama_base_url"]
         max_tokens = st.number_input("Max tokens per page cleanup", min_value=256, max_value=8192, value=2048, step=256)
@@ -2049,9 +2121,8 @@ with tabs[4]:
             help="OFF uses `think: false` with `/api/chat` for faster cleanup calls.",
         )
         concurrency = st.slider("Cleanup concurrency limit", min_value=1, max_value=8, value=1, step=1)
-        available = ollama_available(ollama_url)
-        st.write(f"Ollama reachable: `{available}`")
-        if not available:
+        available = bool(st.session_state.get("openrouter_api_key")) if cleanup_provider == "openrouter" else ollama_available(ollama_url)
+        if cleanup_provider == "ollama" and not available:
             if st.button("Auto-detect Ollama URL", key="cleanup_detect_ollama_url"):
                 detected = _detect_reachable_ollama_url(ollama_url)
                 st.session_state["ollama_base_url"] = detected
@@ -2060,16 +2131,20 @@ with tabs[4]:
                 st.rerun()
         cleanup_active = cleanup_runner.is_active(cleanup_site_id, cleanup_run_id)
         c1, c2, c3 = st.columns(3)
-        if c1.button("Start Cleanup Queue", type="primary", disabled=(not available) or cleanup_active):
+        if cleanup_provider == "openrouter" and not available:
+            st.warning("Save `OPENROUTER_API_KEY` in Settings before starting OpenRouter cleanup.")
+        if c1.button("Start Cleaning", type="primary", disabled=(not available) or cleanup_active):
             cleanup_runner.start(
                 site_id=cleanup_site_id,
                 run_id=cleanup_run_id,
                 run_root=root,
-                model=st.session_state["ollama_model"],
+                model=st.session_state["default_or_model"] if cleanup_provider == "openrouter" else st.session_state["ollama_model"],
                 base_url=ollama_url,
                 max_tokens=int(max_tokens),
                 concurrency=int(concurrency),
                 think=bool(think_enabled),
+                provider=cleanup_provider,
+                openrouter_api_key=st.session_state.get("openrouter_api_key", "").strip(),
             )
             st.success("Cleanup started/resumed.")
         if c2.button("Cancel Cleanup Queue", disabled=not cleanup_active):
@@ -2080,11 +2155,13 @@ with tabs[4]:
                 site_id=cleanup_site_id,
                 run_id=cleanup_run_id,
                 run_root=root,
-                model=st.session_state["ollama_model"],
+                model=st.session_state["default_or_model"] if cleanup_provider == "openrouter" else st.session_state["ollama_model"],
                 base_url=ollama_url,
                 max_tokens=int(max_tokens),
                 concurrency=int(concurrency),
                 think=bool(think_enabled),
+                provider=cleanup_provider,
+                openrouter_api_key=st.session_state.get("openrouter_api_key", "").strip(),
             )
             st.success("Cleanup resume requested.")
         auto_refresh_cleanup = st.checkbox("Auto-refresh queue", value=True)
@@ -2114,8 +2191,7 @@ with tabs[4]:
             cleanup_events = read_json(root / "cleanup_events.jsonl", [])
 
         if cleanup_status:
-            st.subheader("Queue Status")
-            st.json(cleanup_status)
+            st.subheader("Progress")
             state = str(cleanup_status.get("state") or "").lower()
             if cleanup_active:
                 st.info("Cleanup worker is active.")
@@ -2134,7 +2210,7 @@ with tabs[4]:
             done = cleaned + failed + skipped
             st.progress((done / total) if total else 0.0, text=f"Cleanup progress: {done}/{total} done")
         if cleanup_items:
-            st.subheader("Realtime Queue")
+            st.subheader("Currently Running")
             qdf = pd.DataFrame(cleanup_items)
             running_qdf = qdf[qdf["status"] == "running"].copy() if "status" in qdf.columns else pd.DataFrame()
             if running_qdf.empty:
@@ -2146,10 +2222,14 @@ with tabs[4]:
             k1.metric("Pending", int((qdf["status"] == "pending").sum()))
             k2.metric("Running", int((qdf["status"] == "running").sum()))
             k3.metric("Cleaned", int((qdf["status"] == "cleaned").sum()))
-            k4.metric("Failed", int((qdf["status"] == "failed").sum()))
+            k4.metric("Skipped / Failed", int((qdf["status"] == "skipped").sum()) + int((qdf["status"] == "failed").sum()))
+            with st.expander("Advanced full cleanup queue", expanded=False):
+                st.dataframe(qdf, use_container_width=True, hide_index=True)
+                if cleanup_status:
+                    st.json(cleanup_status)
         if cleanup_events:
-            st.subheader("Queue Events")
-            st.dataframe(pd.DataFrame(cleanup_events), use_container_width=True)
+            with st.expander("Advanced cleanup events", expanded=False):
+                st.dataframe(pd.DataFrame(cleanup_events), use_container_width=True)
 
         cleanup_manifest = read_json(root / "cleanup_manifest.json", cleanup_items)
         cleaned_rows = [r for r in cleanup_manifest if r.get("status") == "cleaned" and r.get("cleaned_markdown_path")]
@@ -2236,7 +2316,7 @@ with tabs[4]:
         st.info("Complete a scrape run first.")
 
 with tabs[5]:
-    st.subheader("Metrics")
+    st.subheader("Review")
     if not st.session_state.get("site_id"):
         st.info("Select or create a site first.")
     else:
@@ -2353,6 +2433,9 @@ with tabs[5]:
             )
             pages, failures, run_status, scrape_events = _load_run_analytics_inputs(st.session_state["site_id"], selected_run, run_root)
             selected_urls = read_json(run_root / "selected_urls.json", [])
+            cleanup_manifest = read_json(run_root / "cleanup_manifest.json", [])
+            cleaned_pages = [r for r in cleanup_manifest if isinstance(r, dict) and r.get("status") == "cleaned"]
+            skipped_pages = [r for r in cleanup_manifest if isinstance(r, dict) and r.get("status") == "skipped"]
             total_hint = len(selected_urls) if isinstance(selected_urls, list) else None
             processed = len(pages) if pages else 0
             page_summary = summarize_pages(pages, run_status=run_status, total_hint=total_hint)
@@ -2373,15 +2456,14 @@ with tabs[5]:
                     return f"{val/1_000:.1f}K"
                 return f"{int(val)}" if val.is_integer() else f"{val:.1f}"
 
-            st.caption("Scrape Run Analytics")
+            st.caption("Run Summary")
             with st.container(border=True):
-                st.caption("Run Outcome")
                 ra1, ra2, ra3, ra4, ra5 = st.columns(5)
-                ra1.metric("Total URLs", _fmt_compact_number(int(page_summary.get("total", 0))))
-                ra2.metric("Success", _fmt_compact_number(int(page_summary.get("success", 0))))
-                ra3.metric("Failed", _fmt_compact_number(int(page_summary.get("failed", 0))))
-                ra4.metric("Success Rate", f"{float(page_summary.get('success_rate', 0.0)):.1f}%")
-                ra5.metric("Queued", _fmt_compact_number(int(page_summary.get("queued", 0))))
+                ra1.metric("Selected URLs", _fmt_compact_number(len(selected_urls) if isinstance(selected_urls, list) else 0))
+                ra2.metric("Scraped Pages", _fmt_compact_number(int(page_summary.get("success", 0))))
+                ra3.metric("Cleaned Pages", _fmt_compact_number(len(cleaned_pages)))
+                ra4.metric("Skipped Pages", _fmt_compact_number(len(skipped_pages)))
+                ra5.metric("Failed Pages", _fmt_compact_number(int(page_summary.get("failed", 0))))
 
                 st.write("")
                 st.caption("Performance")
@@ -2399,7 +2481,7 @@ with tabs[5]:
                 rc1.metric("Markdown Bytes", _fmt_compact_number(int(output_summary.get("markdown_total_bytes", 0))))
                 rc2.metric("Raw HTML Bytes", _fmt_compact_number(int(output_summary.get("raw_html_total_bytes", 0))))
                 rc3.metric("Avg Text Length", _fmt_compact_number(float(output_summary.get("text_avg", 0.0))))
-                rc4.metric("Scrape Events", _fmt_compact_number(len(scrape_events)))
+                rc4.metric("Avg Cleanup Duration", "see trace")
 
             if int(page_summary.get("total", 0)) == 0 and len(trace_df) > 0:
                 st.info(
@@ -2511,8 +2593,8 @@ with tabs[5]:
                     else pd.Series(dtype=float, index=trace_df.index)
                 )
                 run_cost_series = (
-                    pd.to_numeric(trace_df["estimated_cost_usd"], errors="coerce")
-                    if "estimated_cost_usd" in trace_df.columns
+                    pd.to_numeric(trace_df["cost_usd"], errors="coerce")
+                    if "cost_usd" in trace_df.columns
                     else pd.Series(0.0, index=trace_df.index)
                 )
                 success_count = int((status_series == "success").sum()) if not trace_df.empty else 0
@@ -2528,8 +2610,8 @@ with tabs[5]:
 
                 agg1, agg2, agg3 = st.columns(3)
                 full_cost_series = (
-                    pd.to_numeric(full_df["estimated_cost_usd"], errors="coerce")
-                    if not full_df.empty and "estimated_cost_usd" in full_df.columns
+                    pd.to_numeric(full_df["cost_usd"], errors="coerce")
+                    if not full_df.empty and "cost_usd" in full_df.columns
                     else pd.Series(0.0, index=full_df.index)
                 )
                 full_cost = float(full_cost_series.fillna(0.0).sum()) if not full_df.empty else 0.0
@@ -2645,27 +2727,27 @@ with tabs[5]:
                             use_container_width=True,
                         )
 
-                    if "estimated_cost_usd" in trace_df.columns:
-                        cost_df = trace_df.groupby("provider", as_index=False)["estimated_cost_usd"].sum()
-                        cost_df = cost_df[cost_df["estimated_cost_usd"] > 0].sort_values("estimated_cost_usd", ascending=False)
+                    if "cost_usd" in trace_df.columns:
+                        cost_df = trace_df.groupby("provider", as_index=False)["cost_usd"].sum()
+                        cost_df = cost_df[cost_df["cost_usd"] > 0].sort_values("cost_usd", ascending=False)
                         st.caption("Where estimated LLM/tool cost was incurred across providers.")
                         if cost_df.empty:
                             st.info("No non-zero provider cost recorded for this run.")
                         elif len(cost_df) == 1:
                             row = cost_df.iloc[0]
-                            st.metric("Cost Concentration", str(row["provider"]), f"${float(row['estimated_cost_usd']):.4f}")
+                            st.metric("Cost Concentration", str(row["provider"]), f"${float(row['cost_usd']):.4f}")
                         elif len(cost_df) <= 4:
                             bars = (
                                 alt.Chart(cost_df)
                                 .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
                                 .encode(
-                                    x=alt.X("estimated_cost_usd:Q", title=None, axis=alt.Axis(grid=False, ticks=False, labels=False)),
+                                    x=alt.X("cost_usd:Q", title=None, axis=alt.Axis(grid=False, ticks=False, labels=False)),
                                     y=alt.Y("provider:N", title="Provider", sort="-x"),
-                                    tooltip=["provider", "estimated_cost_usd"],
+                                    tooltip=["provider", "cost_usd"],
                                 )
                             )
                             labels = bars.mark_text(align="left", dx=5).encode(
-                                text=alt.Text("estimated_cost_usd:Q", format=".4f")
+                                text=alt.Text("cost_usd:Q", format=".4f")
                             )
                             st.altair_chart((bars + labels).properties(height=190), use_container_width=True)
                         else:
@@ -2673,9 +2755,9 @@ with tabs[5]:
                                 alt.Chart(cost_df)
                                 .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
                                 .encode(
-                                    x=alt.X("estimated_cost_usd:Q", title="Estimated Cost (USD)"),
+                                    x=alt.X("cost_usd:Q", title="Estimated Cost (USD)"),
                                     y=alt.Y("provider:N", title="Provider", sort="-x"),
-                                    tooltip=["provider", "estimated_cost_usd"],
+                                    tooltip=["provider", "cost_usd"],
                                 )
                                 .properties(height=260),
                                 use_container_width=True,
@@ -2823,83 +2905,3 @@ with tabs[6]:
     if st.button("Save Defaults"):
         _save_app_state()
         st.success("Defaults saved.")
-
-    st.subheader("Observability")
-    if not st.session_state.get("site_id"):
-        st.info("Select or create a site first to view telemetry.")
-    else:
-        site_root = DATA_ROOT / "sites" / st.session_state["site_id"]
-        run_choices = sorted([d.name for d in site_root.iterdir() if d.is_dir() and d.name != "meta"]) if site_root.exists() else []
-        if not run_choices:
-            st.info("No runs yet for this site.")
-        else:
-            selected_run = st.selectbox("Run for observability", options=run_choices, index=len(run_choices) - 1, key="observability_run")
-            run_root = site_root / selected_run
-            trace_df = _build_trace_df(
-                run_events=load_events(run_root),
-                site_events=load_events(site_root / "meta"),
-                model_map={m.get("id"): m for m in st.session_state.get("openrouter_models", [])},
-                tavily_per_call=float(st.session_state.get("tavily_cost_per_call_usd", 0.0)),
-                ollama_in_per_m=float(st.session_state.get("ollama_input_per_m_usd", 0.0)),
-                ollama_out_per_m=float(st.session_state.get("ollama_output_per_m_usd", 0.0)),
-            )
-            if trace_df.empty:
-                st.info("No telemetry events recorded yet for this site/run.")
-            else:
-                total_calls = len(trace_df)
-                success_calls = int((trace_df["status"] == "success").sum())
-                success_rate = (success_calls / total_calls * 100.0) if total_calls else 0.0
-                lat_series = trace_df["latency_ms"].dropna()
-                avg_latency = float(lat_series.mean()) if not lat_series.empty else 0.0
-                p95_latency = float(lat_series.quantile(0.95)) if not lat_series.empty else 0.0
-                fallback_calls = int((trace_df["status"] == "fallback").sum())
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Total Calls", total_calls)
-                c2.metric("Success Rate", f"{success_rate:.1f}%")
-                c3.metric("Avg Latency", f"{avg_latency:.1f} ms")
-                c4.metric("P95 Latency", f"{p95_latency:.1f} ms")
-                c5.metric("Fallback Calls", fallback_calls)
-
-                prov = (
-                    trace_df.groupby("provider", as_index=False)
-                    .agg(
-                        calls=("provider", "size"),
-                        failed=("status", lambda s: int((s != "success").sum())),
-                        avg_latency_ms=("latency_ms", "mean"),
-                    )
-                    .set_index("provider")
-                    .reindex(PROVIDERS, fill_value=0)
-                    .reset_index()
-                )
-                prov["avg_latency_ms"] = prov["avg_latency_ms"].fillna(0.0).round(1)
-                st.caption("Provider Health Summary")
-                st.dataframe(prov, use_container_width=True, hide_index=True)
-
-                calls_by_provider = trace_df["provider"].value_counts().reindex(PROVIDERS, fill_value=0).reset_index()
-                calls_by_provider.columns = ["provider", "calls"]
-                status_by_provider = (
-                    trace_df.groupby(["provider", "status"], as_index=False).size().rename(columns={"size": "calls"})
-                )
-                ch1, ch2 = st.columns(2)
-                ch1.altair_chart(
-                    alt.Chart(calls_by_provider)
-                    .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
-                    .encode(x=alt.X("provider:N", title="Provider"), y=alt.Y("calls:Q", title="Calls"), tooltip=["provider", "calls"])
-                    .properties(height=260),
-                    use_container_width=True,
-                )
-                ch2.altair_chart(
-                    alt.Chart(status_by_provider)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("provider:N", title="Provider"),
-                        y=alt.Y("calls:Q", title="Calls"),
-                        color=alt.Color("status:N", title="Status"),
-                        tooltip=["provider", "status", "calls"],
-                    )
-                    .properties(height=260),
-                    use_container_width=True,
-                )
-
-                with st.expander("Inspect Raw Events", expanded=False):
-                    st.dataframe(trace_df, use_container_width=True)

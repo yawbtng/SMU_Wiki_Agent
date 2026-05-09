@@ -248,7 +248,7 @@ def _choose_top_urls_batched(
     selected_urls = [
         {"url": row["url"], "reason": row.get("reason", ""), "priority": row.get("score", 0)}
         for row in scored_urls
-        if int(row.get("score") or 0) >= 70
+        if int(row.get("score") or 0) >= 80
     ]
     return {
         "selection_method": "openrouter_deepseek_scored",
@@ -261,7 +261,7 @@ def _choose_top_urls_batched(
         "batch_size": batch_size,
         "batch_errors": batch_errors,
         "batch_trace": batch_trace,
-        "default_threshold": 70,
+        "default_threshold": 80,
     }
 
 
