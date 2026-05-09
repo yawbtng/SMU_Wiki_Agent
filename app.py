@@ -691,30 +691,80 @@ if active_ws:
 tabs = st.tabs(WORKFLOW_TABS)
 
 with tabs[0]:
-    if st.session_state["site_history"]:
-        options = [""] + st.session_state["site_history"]
-        current_url = st.session_state.get("site_url", "")
-        idx = options.index(current_url) if current_url in options else 0
-        recent = st.selectbox("Recent Sites", options=options, index=idx)
-        if recent:
-            st.session_state["site_url"] = recent
-            st.session_state["site_id"] = _site_slug(recent)
+    st.subheader("Workspace Dashboard")
+    if active_ws:
+        st.caption("You are inside this workspace. Use the tabs above to discover, select, scrape, clean, and inspect metrics.")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Workspace", active_ws.get("name", "Workspace"))
+        d2.metric("Site ID", st.session_state.get("site_id") or "not_set")
+        discovered_count = len(st.session_state.get("discovered") or read_json(_discovered_json_path(st.session_state["site_id"]), []))
+        d3.metric("Discovered URLs", f"{discovered_count:,}")
+        d4.metric("Active Run", st.session_state.get("run_id") or "none")
+        st.info("Next step: go to `Discover` to refresh sitemap URLs, then `Select` to score and choose important URLs before scraping.")
+    else:
+        st.warning("No active workspace selected. Go back to the workspace list and open one.")
+
+    with st.expander("Advanced: change active site URL", expanded=False):
+        st.warning("Only use this if you intentionally want this workspace to point at a different root URL.")
+        if st.session_state["site_history"]:
+            options = [""] + st.session_state["site_history"]
+            current_url = st.session_state.get("site_url", "")
+            idx = options.index(current_url) if current_url in options else 0
+            recent = st.selectbox("Recent Sites", options=options, index=idx)
+            if recent and recent != st.session_state.get("site_url", ""):
+                st.session_state["site_url"] = recent
+                st.session_state["site_id"] = _site_slug(recent)
+                st.session_state["run_id"] = st.session_state["last_run_by_site"].get(st.session_state["site_id"], "")
+                _hydrate_site_workspace(st.session_state["site_id"])
+                _save_app_state()
+                st.rerun()
+        site_input = st.text_input("Website root URL", value=st.session_state["site_url"], placeholder="https://example.com")
+        if st.button("Update Active Site", type="secondary"):
+            normalized = normalize_site_url(site_input)
+            st.session_state["site_url"] = normalized
+            st.session_state["site_id"] = _site_slug(normalized)
             st.session_state["run_id"] = st.session_state["last_run_by_site"].get(st.session_state["site_id"], "")
             _hydrate_site_workspace(st.session_state["site_id"])
+            st.session_state["site_history"] = [normalized] + [u for u in st.session_state["site_history"] if u != normalized]
+            st.session_state["site_history"] = st.session_state["site_history"][:50]
+            (DATA_ROOT / "sites" / st.session_state["site_id"]).mkdir(parents=True, exist_ok=True)
             _save_app_state()
-    site_input = st.text_input("Website root URL", value=st.session_state["site_url"], placeholder="https://example.com")
-    if st.button("Create Site Workspace", type="primary"):
-        normalized = normalize_site_url(site_input)
-        st.session_state["site_url"] = normalized
-        st.session_state["site_id"] = _site_slug(normalized)
-        st.session_state["run_id"] = st.session_state["last_run_by_site"].get(st.session_state["site_id"], "")
-        _hydrate_site_workspace(st.session_state["site_id"])
-        st.session_state["site_history"] = [normalized] + [u for u in st.session_state["site_history"] if u != normalized]
-        st.session_state["site_history"] = st.session_state["site_history"][:50]
-        (DATA_ROOT / "sites" / st.session_state["site_id"]).mkdir(parents=True, exist_ok=True)
-        _save_app_state()
-        st.success(f"Site ready: {normalized}")
-    st.write(f"Current site ID: `{st.session_state['site_id'] or 'not_set'}`")
+            st.success(f"Active site updated: {normalized}")
+
+    with st.expander("Manage workspaces", expanded=False):
+        st.caption("Workspace creation/deletion is hidden here so the active workflow stays focused.")
+        with st.form("new_workspace_form_inside_active", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            ws_name = c1.text_input("University Name", placeholder="Southern Methodist University")
+            ws_url = c2.text_input("Website URL", placeholder="https://www.smu.edu")
+            submitted = st.form_submit_button("+ Add Workspace")
+            if submitted and ws_name.strip() and ws_url.strip():
+                normalized = normalize_site_url(ws_url.strip())
+                ws_id = _site_slug(normalized)
+                new_ws = {"id": ws_id, "name": ws_name.strip(), "url": normalized}
+                existing = [w for w in st.session_state["workspaces"] if w.get("id") != ws_id]
+                st.session_state["workspaces"] = [new_ws] + existing
+                (DATA_ROOT / "sites" / ws_id).mkdir(parents=True, exist_ok=True)
+                _save_app_state()
+                st.rerun()
+        for ws in st.session_state.get("workspaces", []):
+            with st.container(border=True):
+                st.markdown(f"**{ws.get('name','Unnamed University')}**")
+                st.caption(ws.get("url", ""))
+                c1, c2 = st.columns(2)
+                is_current = ws.get("id") == st.session_state.get("active_workspace_id")
+                if c1.button("Open Workspace" if not is_current else "Current Workspace", key=f"manage_open_ws_{ws.get('id')}", disabled=is_current):
+                    st.session_state["active_workspace_id"] = ws.get("id", "")
+                    st.session_state["site_url"] = ws.get("url", "")
+                    st.session_state["site_id"] = ws.get("id", "")
+                    st.session_state["run_id"] = st.session_state.get("last_run_by_site", {}).get(ws.get("id", ""), "")
+                    _hydrate_site_workspace(st.session_state["site_id"])
+                    _save_app_state()
+                    st.rerun()
+                if c2.button("Delete Workspace", key=f"manage_del_ws_{ws.get('id')}", disabled=is_current):
+                    st.session_state["workspaces"] = [w for w in st.session_state["workspaces"] if w.get("id") != ws.get("id")]
+                    _save_app_state()
+                    st.rerun()
 
 with tabs[1]:
     st.write("Sitemap discovery from robots.txt and common sitemap paths.")
