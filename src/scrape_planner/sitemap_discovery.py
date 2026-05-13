@@ -50,8 +50,20 @@ def category_from_path(path: str) -> str:
     return "other"
 
 
+def _registered_domain(host: str) -> str:
+    parts = [part for part in (host or "").lower().split(".") if part]
+    if len(parts) <= 2:
+        return ".".join(parts)
+    second_level_suffixes = {"co", "ac", "edu", "gov", "org", "net", "com"}
+    if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in second_level_suffixes:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
 def _same_domain(candidate: str, root_host: str) -> bool:
-    return urlparse(candidate).netloc.lower() == root_host.lower()
+    candidate_host = urlparse(candidate).netloc.lower()
+    root_host = root_host.lower()
+    return candidate_host == root_host or _registered_domain(candidate_host) == _registered_domain(root_host)
 
 
 def _extract_sitemap_from_robots(site_url: str, timeout: int = 15) -> tuple[list[str], str | None]:
@@ -163,7 +175,7 @@ def apply_manual_urls(site_url: str, urls: Iterable[str]) -> list[DiscoveredURL]
         if not candidate.startswith(("http://", "https://")):
             candidate = urljoin(normalized, candidate)
         parsed = urlparse(candidate)
-        excluded = None if parsed.netloc == host else "off_domain"
+        excluded = None if _same_domain(candidate, host) else "off_domain"
         items.append(
             DiscoveredURL(
                 url=candidate,

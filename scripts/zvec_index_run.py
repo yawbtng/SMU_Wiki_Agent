@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+import requests
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _ollama_embed(text: str, *, model: str, base_url: str) -> list[float]:
+    payload = {"model": model, "prompt": text}
+    resp = requests.post(f"{base_url.rstrip('/')}/api/embeddings", json=payload, timeout=120)
+    if resp.status_code == 404:
+        resp = requests.post(f"{base_url.rstrip('/')}/api/embed", json={"model": model, "input": text}, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    if "embedding" in data:
+        return [float(v) for v in data["embedding"]]
+    embeddings = data.get("embeddings") or []
+    if embeddings:
+        return [float(v) for v in embeddings[0]]
+    raise ValueError("ollama embedding response did not include an embedding")
+
+
+def _chunks(text: str, *, chunk_chars: int = 1800, overlap: int = 200) -> list[str]:
+    cleaned = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not cleaned:
+        return []
+    chunks: list[str] = []
+    start = 0
+    while start < len(cleaned):
+        end = min(len(cleaned), start + chunk_chars)
+        chunk = cleaned[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(cleaned):
+            break
+        start = max(end - overlap, start + 1)
+    return chunks
+
+
+def _load_cleaned_docs(run_root: Path) -> list[dict[str, str]]:
+    manifest = _read_json(run_root / "cleanup_manifest.json", [])
+    docs: list[dict[str, str]] = []
+    for row in manifest if isinstance(manifest, list) else []:
+        if not isinstance(row, dict) or row.get("status") != "cleaned":
+            continue
+        path = Path(str(row.get("cleaned_markdown_path") or ""))
+        if not path.exists():
+            continue
+        docs.append({
+            "url": str(row.get("url") or ""),
+            "title": str(row.get("title") or path.stem),
+            "path": str(path),
+            "text": path.read_text(encoding="utf-8", errors="replace"),
+        })
+    wiki_root = run_root / "wiki"
+    if wiki_root.exists():
+        for path in sorted(wiki_root.rglob("*.md")):
+            docs.append({"url": "", "title": path.stem, "path": str(path), "text": path.read_text(encoding="utf-8", errors="replace")})
+    return docs
+
+
+def _create_schema(zvec: Any, *, dimension: int) -> Any:
+    return zvec.CollectionSchema(
+        name="smu_wiki",
+        fields=[
+            zvec.FieldSchema(name="text", data_type=zvec.DataType.STRING),
+            zvec.FieldSchema(name="title", data_type=zvec.DataType.STRING),
+            zvec.FieldSchema(name="url", data_type=zvec.DataType.STRING),
+            zvec.FieldSchema(name="path", data_type=zvec.DataType.STRING),
+        ],
+        vectors=[
+            zvec.VectorSchema(
+                name="embedding",
+                data_type=zvec.DataType.VECTOR_FP32,
+                dimension=dimension,
+                index_param=zvec.HnswIndexParam(metric_type=zvec.MetricType.COSINE),
+            )
+        ],
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Index cleaned run/wiki markdown into Zvec with Ollama embeddings.")
+    parser.add_argument("run_root", type=Path)
+    parser.add_argument("--db", type=Path, default=None)
+    parser.add_argument("--model", default="nomic-embed-text:latest")
+    parser.add_argument("--ollama", default="http://localhost:11434")
+    parser.add_argument("--chunk-chars", type=int, default=1800)
+    args = parser.parse_args()
+
+    try:
+        import zvec
+    except Exception as exc:
+        raise SystemExit(f"zvec is not installed. Install with: pip install zvec. Error: {exc}")
+
+    run_root = args.run_root.resolve()
+    db_path = (args.db or (run_root / "zvec_index")).resolve()
+    docs = _load_cleaned_docs(run_root)
+    if not docs:
+        raise SystemExit(f"No cleaned markdown/wiki docs found under {run_root}")
+
+    first_text = docs[0]["text"][: args.chunk_chars]
+    first_embedding = _ollama_embed(first_text, model=args.model, base_url=args.ollama)
+    schema = _create_schema(zvec, dimension=len(first_embedding))
+    collection = zvec.create_and_open(path=str(db_path), schema=schema)
+
+    zdocs = []
+    count = 0
+    for doc in docs:
+        for idx, chunk in enumerate(_chunks(doc["text"], chunk_chars=args.chunk_chars), start=1):
+            embedding = first_embedding if count == 0 else _ollama_embed(chunk, model=args.model, base_url=args.ollama)
+            doc_id = hashlib.sha1(f"{doc['path']}:{idx}".encode("utf-8")).hexdigest()
+            zdocs.append(
+                zvec.Doc(
+                    id=doc_id,
+                    vectors={"embedding": embedding},
+                    fields={"text": chunk, "title": doc["title"], "url": doc["url"], "path": doc["path"]},
+                )
+            )
+            count += 1
+            if len(zdocs) >= 64:
+                collection.upsert(zdocs) if hasattr(collection, "upsert") else collection.insert(zdocs)
+                zdocs = []
+    if zdocs:
+        collection.upsert(zdocs) if hasattr(collection, "upsert") else collection.insert(zdocs)
+    collection.optimize()
+    out = {"db_path": str(db_path), "docs": len(docs), "chunks": count, "embedding_model": args.model, "dimension": len(first_embedding)}
+    (run_root / "zvec_index_manifest.json").write_text(json.dumps(out, indent=2), encoding="utf-8")
+    print(json.dumps(out, indent=2))
+
+
+if __name__ == "__main__":
+    main()

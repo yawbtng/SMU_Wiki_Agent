@@ -61,3 +61,18 @@ Key files:
 - `wiki/index.md`
 - `wiki/graph.json`
 - `wiki/subwikis/<topic>/index.md`
+
+## Local Zvec Query MCP
+
+Optional local semantic query path after scrape + clean + wiki build:
+
+1. Install optional dependencies:
+   `pip install -r requirements-mcp.txt`
+2. Ensure Ollama has the embedding model:
+   `ollama pull nomic-embed-text:latest`
+3. Build a Zvec index from a run directory:
+   `python scripts/zvec_index_run.py data/sites/<site_id>/<run_id> --model nomic-embed-text:latest`
+4. Connect an agent to the MCP server:
+   `ZVEC_DB_PATH=/absolute/path/to/run/zvec_index OLLAMA_EMBED_MODEL=nomic-embed-text:latest python mcp_servers/smu_zvec_mcp.py`
+
+The MCP exposes `query_smu_wiki` and `zvec_index_info` for Claude, Codex, or any MCP client.

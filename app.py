@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 
 import altair as alt
 import pandas as pd
@@ -47,6 +47,7 @@ from src.scrape_planner.terminal_skill_runner import TerminalSkillRunner
 from src.scrape_planner.tmux_runner import TmuxRunner
 from src.scrape_planner.ui_claude_plan import render_claude_plan_section
 from src.scrape_planner.ui_navigation import WORKFLOW_TABS
+from src.scrape_planner.url_quality import UrlCriteria, score_and_filter_rows
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT / "data"
@@ -926,370 +927,211 @@ with tabs[1]:
             st.info("No raw URL rows yet.")
 
 with tabs[2]:
-    if not st.session_state["discovered"]:
-        disk_rows = read_json(_discovered_json_path(st.session_state["site_id"]), [])
-        if disk_rows:
-            st.session_state["discovered"] = disk_rows
-            st.session_state["selected_df"] = pd.DataFrame(disk_rows)
-    if st.session_state["discovered"]:
-        df = pd.DataFrame(st.session_state["discovered"])
-        score_file = DATA_ROOT / "sites" / st.session_state["site_id"] / "selected_urls_llm.json"
-        if not st.session_state.get("last_selection_payload") and score_file.exists():
-            try:
-                st.session_state["last_selection_payload"] = read_json(score_file, {})
-            except Exception:
-                pass
-        st.write("Choose important URLs from scoring results. The threshold controls what gets scraped.")
-
-        with st.expander("Advanced scoring terminal, prompt, and import controls", expanded=False):
-            discovered_path = _discovered_json_path(st.session_state["site_id"])
-            scored_out_path = DATA_ROOT / "sites" / st.session_state["site_id"] / "selected_urls_llm.json"
-            prompt_path = DATA_ROOT / "sites" / st.session_state["site_id"] / "pi_url_selection_prompt.md"
-            batch_dir = DATA_ROOT / "sites" / st.session_state["site_id"] / "pi_url_batches"
-            master_instruction_path = DATA_ROOT / "sites" / st.session_state["site_id"] / "pi_url_scoring_master.md"
-            if not st.session_state.get("tmux_binary"):
-                st.session_state["tmux_binary"] = _detect_tmux_binary()
-            if not st.session_state.get("pi_binary"):
-                st.session_state["pi_binary"] = _detect_pi_binary()
-            if "pi_prompt_template" not in st.session_state:
-                if PI_PROMPT_TEMPLATE_PATH.exists():
-                    st.session_state["pi_prompt_template"] = PI_PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-                else:
-                    st.session_state["pi_prompt_template"] = "{DISCOVERED_URLS_JSON}"
-
-            st.caption(f"{len(df):,} discovered URLs ready for scoring.")
-            with st.expander("Prompt", expanded=False):
-                st.session_state["pi_prompt_template"] = st.text_area(
-                    "Scoring prompt template",
-                    value=st.session_state["pi_prompt_template"],
-                    height=260,
-                    key="pi_prompt_template_input",
-                    label_visibility="collapsed",
-                )
-                if st.button("Save Prompt Template"):
-                    PI_PROMPT_TEMPLATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-                    PI_PROMPT_TEMPLATE_PATH.write_text(st.session_state["pi_prompt_template"], encoding="utf-8")
-                    st.success(f"Saved prompt template to {PI_PROMPT_TEMPLATE_PATH}")
-
-            with st.expander("Advanced Paths", expanded=False):
-                st.session_state["pi_binary"] = st.text_input(
-                    "Agent binary",
-                    value=st.session_state.get("pi_binary", ""),
-                    key="pi_binary_input",
-                    help="Example: /Users/abhsheno/.local/bin/pi",
-                )
-                st.session_state["tmux_binary"] = st.text_input(
-                    "tmux binary",
-                    value=st.session_state.get("tmux_binary", ""),
-                    key="tmux_binary_input",
-                    help="Example: /opt/homebrew/bin/tmux",
-                )
-                st.session_state["pi_tmux_session_name"] = st.text_input(
-                    "tmux session",
-                    value=st.session_state.get("pi_tmux_session_name", "pi-url-scorer"),
-                    key="pi_tmux_session_name_input",
-                )
-                st.session_state["pi_batch_size"] = int(
-                    st.number_input(
-                        "URLs per agent call",
-                        min_value=25,
-                        max_value=1000,
-                        value=int(st.session_state.get("pi_batch_size", 250)),
-                        step=25,
-                    )
-                )
-                st.text_input("Output file", value=str(scored_out_path), disabled=True)
-
-            tmux_bin = st.session_state.get("tmux_binary", "").strip() or None
-            tmux_name = st.session_state.get("pi_tmux_session_name", "pi-url-scorer")
-            tmux_available = tmux_runner.available(tmux_bin=tmux_bin)
-            tmux_exists = tmux_available and tmux_runner.session_exists(tmux_name, tmux_bin=tmux_bin)
-
-            def _build_scoring_instructions() -> str:
-                discovered_payload = read_json(discovered_path, [])
-                batch_size = int(st.session_state.get("pi_batch_size", 250))
-                batch_dir.mkdir(parents=True, exist_ok=True)
-                for old_file in batch_dir.glob("*"):
-                    if old_file.is_file():
-                        old_file.unlink()
-                batches = [
-                    discovered_payload[idx : idx + batch_size]
-                    for idx in range(0, len(discovered_payload), batch_size)
-                ]
-                for idx, batch in enumerate(batches, start=1):
-                    prompt_text = st.session_state["pi_prompt_template"].replace(
-                        "{DISCOVERED_URLS_JSON}",
-                        pd.DataFrame(batch).to_json(orient="records", force_ascii=True),
-                    )
-                    (batch_dir / f"batch_{idx:04d}.prompt.md").write_text(prompt_text, encoding="utf-8")
-                prompt_text = st.session_state["pi_prompt_template"].replace(
-                    "{DISCOVERED_URLS_JSON}",
-                    f"Split into {len(batches)} batch prompt files under {batch_dir}",
-                )
-                prompt_path.parent.mkdir(parents=True, exist_ok=True)
-                prompt_path.write_text(prompt_text, encoding="utf-8")
-                master = (
-                    "# URL Scoring Terminal Task\n\n"
-                    "You are running inside an interactive tmux session launched by the Streamlit UI.\n"
-                    "Work visibly: briefly announce which batch you are processing, then write strict JSON outputs.\n\n"
-                    "## Task\n"
-                    f"Process every batch prompt file in: `{batch_dir}`\n"
-                    "For each `batch_####.prompt.md`, read the file, follow its instructions exactly, and write only the JSON array output to:\n"
-                    "`batch_####.prompt.output.json` in the same directory.\n\n"
-                    "## Rules\n"
-                    "- Do not paste large JSON into the terminal.\n"
-                    "- Do not use network search unless the batch prompt explicitly asks for it.\n"
-                    "- Keep going batch by batch until all prompt files have matching `.output.json` files.\n"
-                    "- If a batch fails, write a short error note to `batch_####.error.txt` and continue.\n"
-                    "- Final response in the terminal should say how many batch outputs were written.\n\n"
-                    "## Import\n"
-                    f"When finished, the UI will import all `*.output.json` files from `{batch_dir}`.\n"
-                )
-                master_instruction_path.write_text(master, encoding="utf-8")
-                return str(master_instruction_path)
-
-            action_1, action_2, action_3, action_4, action_5 = st.columns([1, 1, 1, 1, 1])
-            if action_1.button("Build Prompt", type="secondary"):
-                instruction_file = _build_scoring_instructions()
-                st.session_state["pi_agent_command"] = instruction_file
-                st.success("Prompt built.")
-
-            def _start_scoring_session() -> None:
-                if not tmux_available:
-                    st.error("tmux not found. Set the tmux binary path in Advanced Paths.")
-                    return
-                instruction_file = _build_scoring_instructions()
-                st.session_state["pi_agent_command"] = instruction_file
-                pi_bin = st.session_state.get("pi_binary", "").strip() or "pi"
-                res = tmux_runner.start_shell(tmux_name, str(ROOT), tmux_bin=tmux_bin)
-                if not res.get("ok"):
-                    st.error(res.get("error", "Failed to start scoring."))
-                else:
-                    tmux_runner.send_line(tmux_name, pi_bin, tmux_bin=tmux_bin)
-                    time.sleep(0.8)
-                    tmux_runner.send_line(
-                        tmux_name,
-                        f"Read and execute the full task from this file: {instruction_file}",
-                        tmux_bin=tmux_bin,
-                    )
-                    st.success("Scoring started.")
-
-            if action_2.button("Start Scoring", type="primary", disabled=tmux_exists):
-                try:
-                    _start_scoring_session()
-                except Exception as exc:
-                    st.error(f"Could not start scoring: {exc}")
-
-            if action_3.button("Stop", disabled=not tmux_exists):
-                res = tmux_runner.kill(tmux_name, tmux_bin=tmux_bin)
-                if not res.get("ok"):
-                    st.error(res.get("error", "Failed to stop scoring."))
-                else:
-                    st.warning("Scoring stopped.")
-                    st.rerun()
-
-            if action_4.button("Restart", disabled=not tmux_available):
-                if tmux_exists:
-                    tmux_runner.kill(tmux_name, tmux_bin=tmux_bin)
-                try:
-                    _start_scoring_session()
-                except Exception as exc:
-                    st.error(f"Could not restart scoring: {exc}")
-
-            batch_outputs_available = batch_dir.exists() and any(batch_dir.glob("batch_*.output.json"))
-            if action_5.button("Import Scores", disabled=not batch_outputs_available):
-                batch_outputs = sorted(batch_dir.glob("batch_*.output.json")) if batch_dir.exists() else []
-                if not scored_out_path.exists() and not batch_outputs:
-                    st.error(f"Output file not found: {scored_out_path}")
-                else:
-                    try:
-                        if batch_outputs:
-                            merged_batch_rows = []
-                            failed_outputs = []
-                            for output_file in batch_outputs:
-                                try:
-                                    payload_part = _extract_json_payload_from_text(output_file.read_text(encoding="utf-8"))
-                                    if isinstance(payload_part, list):
-                                        merged_batch_rows.extend(payload_part)
-                                    elif isinstance(payload_part, dict) and isinstance(payload_part.get("scored_urls"), list):
-                                        merged_batch_rows.extend(payload_part["scored_urls"])
-                                    else:
-                                        failed_outputs.append(output_file.name)
-                                except Exception:
-                                    failed_outputs.append(output_file.name)
-                            if failed_outputs:
-                                st.warning(f"Skipped {len(failed_outputs)} batch outputs that were not valid JSON.")
-                            pi_payload = merged_batch_rows
-                        else:
-                            pi_payload = _extract_json_payload_from_text(scored_out_path.read_text(encoding="utf-8"))
-                        if isinstance(pi_payload, list):
-                            pi_scored = [
-                                {
-                                    "url": row.get("url"),
-                                    "score": int(round(float(row.get("final_score", row.get("score", 0))))),
-                                    "reason": row.get("selected_reason", row.get("reason", "")),
-                                    "student_value": row.get("relevance_score", row.get("student_value")),
-                                    "freshness": row.get("freshness_score", row.get("freshness")),
-                                    "source_quality": None,
-                                    "scrape_value": None,
-                                }
-                                for row in pi_payload
-                                if isinstance(row, dict) and row.get("url")
-                            ]
-                            pi_payload = {
-                                "selection_method": "pi_prompt_array",
-                                "default_threshold": 80,
-                                "scored_urls": pi_scored,
-                                "selected_urls": [
-                                    {
-                                        "url": row.get("url"),
-                                        "reason": row.get("reason", ""),
-                                        "priority": int(row.get("score") or 0),
-                                    }
-                                    for row in pi_scored
-                                    if int(row.get("score") or 0) >= 80
-                                ],
-                            }
-                        else:
-                            pi_scored = pi_payload.get("scored_urls", []) if isinstance(pi_payload, dict) else []
-                        if not pi_scored:
-                            st.error("No `scored_urls` found in Pi output JSON.")
-                        else:
-                            pi_df = pd.DataFrame(pi_scored)
-                            merge_cols = [
-                                col
-                                for col in [
-                                    "url",
-                                    "score",
-                                    "reason",
-                                    "student_value",
-                                    "freshness",
-                                    "source_quality",
-                                    "scrape_value",
-                                ]
-                                if col in pi_df.columns
-                            ]
-                            replace_cols = [c for c in merge_cols if c != "url" and c in df.columns]
-                            if replace_cols:
-                                df = df.drop(columns=replace_cols)
-                            df = df.merge(pi_df[merge_cols], on="url", how="left")
-                            threshold = int(pi_payload.get("default_threshold", 80))
-                            df["selected"] = df["score"].fillna(0).astype(int) >= threshold
-                            st.session_state["score_threshold"] = threshold
-                            st.session_state["llm_selected"] = [
-                                {
-                                    "url": row["url"],
-                                    "reason": row.get("reason", ""),
-                                    "priority": int(row.get("score") or 0),
-                                }
-                                for row in pi_scored
-                                if int(row.get("score") or 0) >= threshold
-                            ]
-                            st.session_state["last_selection_payload"] = pi_payload
-                            write_json(scored_out_path, pi_payload)
-                            st.session_state["discovered"] = df.to_dict("records")
-                            st.session_state["selected_df"] = df
-                            _save_app_state()
-                            st.success(
-                                f"Imported Pi output: {len(pi_scored)} scored URLs. "
-                                f"Auto-selected score >= {threshold}."
-                            )
-                    except Exception as exc:
-                        st.error(f"Failed to import Pi output: {exc}")
-
-            state_label = "live terminal" if tmux_exists else "idle"
-            status_cols = st.columns([1, 1, 4])
-            status_cols[0].caption(f"Console status: {state_label}")
-            if status_cols[1].button("Refresh Terminal", disabled=not tmux_exists):
-                st.rerun()
-            if tmux_exists:
-                st.code(tmux_runner.capture(tmux_name, lines=300, tmux_bin=tmux_bin), language="text")
-                send_col, send_btn_col, kill_col = st.columns([6, 1.2, 1.4])
-                tmux_input = send_col.text_input(
-                    "Terminal input",
-                    value="",
-                    key="pi_tmux_send_input",
-                    placeholder="Type a follow-up or correction for the live agent...",
-                    label_visibility="collapsed",
-                )
-                if send_btn_col.button("Send", use_container_width=True):
-                    res = tmux_runner.send_line(tmux_name, tmux_input, tmux_bin=tmux_bin)
-                    if not res.get("ok"):
-                        st.error(res.get("error", "Failed to send input."))
-                if kill_col.button("Kill", use_container_width=True):
-                    res = tmux_runner.kill(tmux_name, tmux_bin=tmux_bin)
-                    if not res.get("ok"):
-                        st.error(res.get("error", "Failed to kill session."))
-                    else:
-                        st.warning("Session killed.")
-                        st.rerun()
-            elif not tmux_available:
-                st.warning("tmux is not available. Open Advanced Paths and set `/opt/homebrew/bin/tmux`.")
-
-        selected_payload = st.session_state.get("last_selection_payload", {})
-        if selected_payload:
-            st.subheader("Important URLs")
-            st.caption(f"Selection method: `{selected_payload.get('selection_method', 'unknown')}`")
-            scored_rows = selected_payload.get("scored_urls", [])
-            if scored_rows:
-                threshold = st.slider(
-                    "Importance threshold",
-                    min_value=0,
-                    max_value=100,
-                    value=int(st.session_state.get("score_threshold", selected_payload.get("default_threshold", 80))),
-                    step=5,
-                )
-                st.session_state["score_threshold"] = threshold
-                score_lookup = {row["url"]: row for row in scored_rows if row.get("url")}
-                df["score"] = df["url"].map(lambda url: int((score_lookup.get(url) or {}).get("score") or 0))
-                df["reason"] = df["url"].map(lambda url: (score_lookup.get(url) or {}).get("reason", ""))
-                df["student_value"] = df["url"].map(lambda url: (score_lookup.get(url) or {}).get("student_value"))
-                df["freshness"] = df["url"].map(lambda url: (score_lookup.get(url) or {}).get("freshness"))
-                df["source_quality"] = df["url"].map(lambda url: (score_lookup.get(url) or {}).get("source_quality"))
-                df["scrape_value"] = df["url"].map(lambda url: (score_lookup.get(url) or {}).get("scrape_value"))
-                df["selected"] = df["score"] >= threshold
-                st.session_state["discovered"] = df.to_dict("records")
-                st.session_state["selected_df"] = df
-                visible_df = (
-                    df[df["selected"]]
-                    .sort_values(["score", "freshness"], ascending=[False, False])
-                    .reset_index(drop=True)
-                )
-                low_value_count = int((df["score"] < threshold).sum())
-                excluded_stale_count = int(
-                    df.get("reason", pd.Series("", index=df.index))
-                    .fillna("")
-                    .astype(str)
-                    .str.contains("old|dated|archive|stale|term|crime|recipient", case=False, regex=True)
-                    .sum()
-                )
-                metric_1, metric_2, metric_3, metric_4 = st.columns(4)
-                metric_1.metric("Selected", f"{len(visible_df):,}")
-                metric_2.metric("Excluded Stale/Archive", f"{excluded_stale_count:,}")
-                metric_3.metric("Low Value", f"{low_value_count:,}")
-                metric_4.metric("Total Scored", f"{len(scored_rows):,}")
-                if st.button("Use Recommended Important URLs", type="primary"):
-                    df["selected"] = df["score"] >= threshold
-                    st.session_state["discovered"] = df.to_dict("records")
-                    st.session_state["selected_df"] = df
-                    _save_app_state()
-                    st.success(f"Using {len(visible_df):,} URLs at threshold {threshold}.")
-                display_cols = [
-                    col
-                    for col in ["score", "url", "reason", "student_value", "freshness", "source_quality", "scrape_value"]
-                    if col in visible_df.columns
-                ]
-                _render_paginated_df(
-                    visible_df[display_cols],
-                    key_prefix="selected_scored_urls",
-                    default_page_size=100,
-                )
-            else:
-                st.info("No scored URLs yet. Run Terminal scoring or import scores.")
-        else:
-            st.info("No scored URLs yet. Open Advanced controls to run or import scoring.")
+    site_id = st.session_state.get("site_id", "")
+    if not site_id:
+        st.info("Create or open a workspace first.")
     else:
-        st.info("Discover or add manual URLs first.")
+        if not st.session_state["discovered"]:
+            disk_rows = read_json(_discovered_json_path(site_id), [])
+            if disk_rows:
+                st.session_state["discovered"] = disk_rows
+                st.session_state["selected_df"] = pd.DataFrame(disk_rows)
+
+        site_root = DATA_ROOT / "sites" / site_id
+        site_root.mkdir(parents=True, exist_ok=True)
+        pdf_dir = site_root / "sources" / "pdf_uploads"
+        pdf_manifest_path = site_root / "sources" / "pdf_manifest.json"
+        score_file = site_root / "selected_urls_llm.json"
+        rows = [row for row in st.session_state.get("discovered", []) if isinstance(row, dict)]
+
+        st.subheader("Choose URLs")
+        st.caption("Pick high-signal student pages. Keep spam, archives, login/search pages, and stale content out of the scrape.")
+
+        quick_add, quick_docs = st.columns([1.15, 1])
+        with quick_add:
+            manual_input = st.text_area(
+                "Add manual links",
+                value=st.session_state.get("manual_urls", ""),
+                height=96,
+                placeholder="https://admissions.smu.edu/...\n/registrar/...",
+                key="choose_manual_urls_input",
+            )
+            st.session_state["manual_urls"] = manual_input
+            add_links_col, clear_links_col = st.columns([1, 1])
+            if add_links_col.button("Add links", type="primary", use_container_width=True):
+                items = apply_manual_urls(st.session_state["site_url"], manual_input.splitlines())
+                merged = {row.get("url"): row for row in rows if row.get("url")}
+                accepted = 0
+                excluded = 0
+                for item in items:
+                    row = item.to_dict()
+                    if row.get("excluded_reason"):
+                        excluded += 1
+                    else:
+                        accepted += 1
+                    merged[item.url] = row
+                st.session_state["discovered"] = list(merged.values())
+                st.session_state["selected_df"] = pd.DataFrame(st.session_state["discovered"])
+                write_json(_discovered_json_path(site_id), st.session_state["discovered"])
+                _save_app_state()
+                st.success(f"Added {accepted:,} in-scope link(s). Excluded {excluded:,} off-domain link(s).")
+                st.rerun()
+            if clear_links_col.button("Clear input", use_container_width=True):
+                st.session_state["manual_urls"] = ""
+                _save_app_state()
+                st.rerun()
+
+        with quick_docs:
+            uploaded_pdfs = st.file_uploader(
+                "Add PDFs for wiki",
+                type=["pdf"],
+                accept_multiple_files=True,
+                key="choose_pdf_uploads",
+            )
+            pdf_manifest = read_json(pdf_manifest_path, [])
+            if uploaded_pdfs:
+                pdf_dir.mkdir(parents=True, exist_ok=True)
+                existing = {row.get("path"): row for row in pdf_manifest if isinstance(row, dict)}
+                for uploaded in uploaded_pdfs:
+                    target = pdf_dir / _safe_uploaded_filename(uploaded.name)
+                    target.write_bytes(uploaded.getbuffer())
+                    existing[str(target)] = {
+                        "name": uploaded.name,
+                        "path": str(target),
+                        "size_bytes": int(target.stat().st_size),
+                        "added_at": datetime.now(timezone.utc).isoformat(),
+                        "status": "ready_for_wiki_ingest",
+                    }
+                pdf_manifest = sorted(existing.values(), key=lambda row: row.get("name", ""))
+                write_json(pdf_manifest_path, pdf_manifest)
+                st.success(f"Saved {len(uploaded_pdfs):,} PDF(s).")
+            st.metric("PDF Sources", f"{len(pdf_manifest):,}")
+            if pdf_manifest:
+                with st.expander("PDF source list", expanded=False):
+                    st.dataframe(pd.DataFrame(pdf_manifest), use_container_width=True, hide_index=True)
+
+        if not rows:
+            st.info("Discover URLs or add manual links to start selection.")
+        else:
+            current_df = pd.DataFrame(rows)
+            if "url" not in current_df.columns:
+                st.info("Discovered rows do not contain URLs yet.")
+            else:
+                current_df["host"] = current_df["url"].astype(str).map(lambda value: urlparse(value).netloc.lower())
+                host_options = sorted([host for host in current_df["host"].dropna().unique().tolist() if host])
+                filter_box = st.container(border=True)
+                with filter_box:
+                    f1, f2, f3, f4 = st.columns([1, 1, 1, 1])
+                    threshold = int(f1.slider("Usefulness", min_value=0, max_value=100, value=int(st.session_state.get("score_threshold", 70)), step=5))
+                    st.session_state["score_threshold"] = threshold
+                    max_urls = int(f2.number_input("Max URLs", min_value=1, max_value=50000, value=int(st.session_state.get("choose_max_urls", 500)), step=50))
+                    st.session_state["choose_max_urls"] = max_urls
+                    include_pdfs = f3.toggle("Include PDF links", value=bool(st.session_state.get("choose_include_pdfs", True)))
+                    st.session_state["choose_include_pdfs"] = include_pdfs
+                    apply_now = f4.button("Apply", type="primary", use_container_width=True)
+                    f5, f6 = st.columns([1, 1])
+                    include_text = f5.text_input(
+                        "Must contain",
+                        value=st.session_state.get("choose_include_text", ""),
+                        placeholder="admission, registrar, tuition",
+                    )
+                    exclude_text = f6.text_input(
+                        "Exclude contains",
+                        value=st.session_state.get("choose_exclude_text", "search, login, tag, archive, alumni, giving"),
+                    )
+                    st.session_state["choose_include_text"] = include_text
+                    st.session_state["choose_exclude_text"] = exclude_text
+                    selected_hosts = st.multiselect(
+                        "Hosts/subdomains",
+                        options=host_options,
+                        default=st.session_state.get("choose_hosts", []),
+                        placeholder="All hosts",
+                    )
+                    st.session_state["choose_hosts"] = selected_hosts
+
+                criteria = UrlCriteria(
+                    include_text=include_text,
+                    exclude_text=exclude_text,
+                    include_hosts=tuple(selected_hosts),
+                    max_urls=max_urls,
+                    threshold=threshold,
+                    include_pdfs=include_pdfs,
+                )
+                scored_rows, counts = score_and_filter_rows(rows, criteria)
+                scored_df = pd.DataFrame(scored_rows)
+                if scored_df.empty:
+                    st.warning("No URLs match the current criteria.")
+                else:
+                    st.session_state["discovered"] = scored_df.to_dict("records")
+                    st.session_state["selected_df"] = scored_df
+                    selected_df = scored_df[scored_df["selected"] == True].copy()  # noqa: E712
+                    spammy_df = scored_df[(scored_df.get("spammy", False) == True) | (scored_df["selected"] == False)].copy()  # noqa: E712
+                    payload = {
+                        "selection_method": "local_rules_choose_urls",
+                        "default_threshold": threshold,
+                        "criteria": {
+                            "include_text": include_text,
+                            "exclude_text": exclude_text,
+                            "hosts": selected_hosts,
+                            "max_urls": max_urls,
+                            "include_pdfs": include_pdfs,
+                        },
+                        "scored_urls": scored_df[[col for col in ["url", "score", "reason", "student_value", "freshness", "source_quality", "scrape_value", "host", "is_pdf"] if col in scored_df.columns]].to_dict("records"),
+                        "selected_urls": selected_df[[col for col in ["url", "score", "reason"] if col in selected_df.columns]].rename(columns={"score": "priority"}).to_dict("records"),
+                    }
+                    st.session_state["last_selection_payload"] = payload
+                    if apply_now:
+                        write_json(score_file, payload)
+                        write_json(_discovered_json_path(site_id), scored_df.to_dict("records"))
+                        _save_app_state()
+                        st.success(f"Selection saved: {len(selected_df):,} URL(s) will be scraped.")
+
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Selected", f"{len(selected_df):,}")
+                    m2.metric("Spammy/Low", f"{len(spammy_df):,}")
+                    m3.metric("Filtered", f"{counts.get('filtered', 0):,}")
+                    m4.metric("PDF Links", f"{counts.get('pdfs', 0):,}")
+                    m5.metric("Total", f"{counts.get('total', 0):,}")
+
+                    display_cols = [col for col in ["score", "url", "host", "reason", "student_value", "freshness", "scrape_value"] if col in selected_df.columns]
+                    st.dataframe(
+                        selected_df.sort_values("score", ascending=False)[display_cols].head(max_urls),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    with st.expander("Excluded / spammy URLs", expanded=False):
+                        excluded_cols = [col for col in ["score", "url", "host", "reason"] if col in spammy_df.columns]
+                        _render_paginated_df(spammy_df.sort_values("score", ascending=True)[excluded_cols], key_prefix="choose_spammy_urls", default_page_size=100)
+
+        with st.expander("Advanced: Pi scoring import and raw discovered rows", expanded=False):
+            st.caption("Legacy agent scoring is still available as an import path. The normal scrape path uses the selected rows above.")
+            scored_out_path = DATA_ROOT / "sites" / site_id / "selected_urls_llm.json"
+            uploaded_score = st.file_uploader("Import scored URL JSON", type=["json"], key="choose_import_score_json")
+            if uploaded_score is not None:
+                try:
+                    imported_payload = json.loads(uploaded_score.getvalue().decode("utf-8"))
+                    scored = imported_payload.get("scored_urls", []) if isinstance(imported_payload, dict) else imported_payload
+                    if not isinstance(scored, list):
+                        raise ValueError("Expected a list or an object with scored_urls.")
+                    by_url = {str(row.get("url")): row for row in scored if isinstance(row, dict) and row.get("url")}
+                    merged_rows = []
+                    for row in st.session_state.get("discovered", []):
+                        url = str(row.get("url") or "")
+                        score_row = by_url.get(url, {})
+                        merged_rows.append({**row, **score_row, "selected": int(score_row.get("score") or 0) >= int(st.session_state.get("score_threshold", 70))})
+                    st.session_state["discovered"] = merged_rows
+                    st.session_state["selected_df"] = pd.DataFrame(merged_rows)
+                    st.session_state["last_selection_payload"] = imported_payload if isinstance(imported_payload, dict) else {"scored_urls": scored}
+                    write_json(scored_out_path, st.session_state["last_selection_payload"])
+                    _save_app_state()
+                    st.success(f"Imported {len(scored):,} scored URL rows.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not import scores: {exc}")
+            if st.session_state.get("discovered"):
+                _render_paginated_df(pd.DataFrame(st.session_state["discovered"]), key_prefix="choose_raw_discovered", default_page_size=100)
+            else:
+                st.info("No discovered rows yet.")
 
 with tabs[3]:
     if not st.session_state["site_id"]:
