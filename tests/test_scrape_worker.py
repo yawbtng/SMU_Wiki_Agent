@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+import threading
+import time
 
 from src.scrape_planner.models import DiscoveredURL
 from src.scrape_planner.scrape_worker import ScrapeRunner
@@ -143,3 +146,92 @@ def test_cancel_mid_run(monkeypatch, tmp_path: Path):
     assert status["state"] == "cancelled"
     assert status["success"] == 1
     assert len(pages) == 1
+
+
+def test_pause_then_unpause_blocks_new_queue_items(monkeypatch, tmp_path: Path):
+    runner, state = _make_runner(tmp_path)
+    release = threading.Event()
+    seen: list[str] = []
+
+    def fake_fetch(mode: str, url: str):
+        seen.append(url)
+        if url.endswith("/1"):
+            runner.pause("site-a", "run-6")
+            release.wait(timeout=2.0)
+        return _FakeResponse()
+
+    monkeypatch.setattr(runner, "_fetch_with_mode", fake_fetch)
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape_worker.extract_content",
+        lambda html: ("text", "# ok", 1000, 0.01),
+    )
+
+    runner.start(
+        "site-a",
+        "run-6",
+        _selected_urls("https://example.com/1", "https://example.com/2"),
+        concurrency=1,
+    )
+    time.sleep(0.25)
+    paused_status = state.get_status("site-a", "run-6")
+    assert paused_status["state"] in {"pausing", "paused"}
+    assert seen == ["https://example.com/1"]
+
+    runner.unpause("site-a", "run-6")
+    release.set()
+    time.sleep(0.35)
+
+    final_status = state.get_status("site-a", "run-6")
+    assert final_status["state"] == "completed"
+    assert final_status["success"] == 2
+    assert seen == ["https://example.com/1", "https://example.com/2"]
+
+
+def test_resume_reuses_existing_success_pages(monkeypatch, tmp_path: Path):
+    runner, state = _make_runner(tmp_path)
+    run_root = tmp_path / "sites" / "site-a" / "run-7"
+    run_root.mkdir(parents=True, exist_ok=True)
+    selected = _selected_urls("https://example.com/1", "https://example.com/2")
+    (run_root / "selected_urls.json").write_text(
+        json.dumps([item.to_dict() for item in selected], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    state.set_pages(
+        "site-a",
+        "run-7",
+        [
+            {"url": "https://example.com/1", "status": "success", "fetch_mode": "fetcher"},
+            {"url": "https://example.com/2", "status": "cancelled", "fetch_mode": "fetcher"},
+        ],
+    )
+    state.set_status(
+        "site-a",
+        "run-7",
+        {"state": "cancelled", "running": 0, "success": 1, "failed": 0, "cancelled": 1, "queued": 0, "total": 2},
+    )
+
+    seen: list[str] = []
+
+    def fake_fetch(mode: str, url: str):
+        seen.append(url)
+        return _FakeResponse()
+
+    monkeypatch.setattr(runner, "_fetch_with_mode", fake_fetch)
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape_worker.extract_content",
+        lambda html: ("text", "# ok", 1000, 0.01),
+    )
+
+    resumed = runner.resume("site-a", "run-7", concurrency=1)
+    assert resumed is True
+    time.sleep(0.35)
+
+    pages = state.get_pages("site-a", "run-7")
+    by_url = {row["url"]: row for row in pages}
+    status = state.get_status("site-a", "run-7")
+
+    assert seen == ["https://example.com/2"]
+    assert by_url["https://example.com/1"]["status"] == "success"
+    assert by_url["https://example.com/2"]["status"] == "success"
+    assert status["state"] == "completed"

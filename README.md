@@ -34,6 +34,7 @@ Optional:
 - OpenRouter: set `OPENROUTER_API_KEY` for URL-selection stage
 - Claude CLI: install/login `claude` to enable LLM selection and wiki build
 - Ollama: run local server at `http://localhost:11434` for cleanup
+- PDF/document wiki ingest: use Python 3.10+ and install `pip install -r requirements-pdf.txt`; the Pi `document-wiki-ingest` skill uses Microsoft MarkItDown to convert PDFs/documents to markdown before graph wiki indexing.
 
 ## Data layout
 
@@ -53,3 +54,10 @@ Key files:
 - `metadata/*.json`
 - `claude_wiki_manifest.json`
 - `claude_wiki_prompt.md`
+- `sources/pdf_uploads/*`
+- `document_ingest/converted_markdown/*.md`
+- `document_ingest/manifest.json`
+- `document_ingest/report.md`
+- `wiki/index.md`
+- `wiki/graph.json`
+- `wiki/subwikis/<topic>/index.md`

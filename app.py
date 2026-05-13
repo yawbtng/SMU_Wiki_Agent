@@ -13,6 +13,10 @@ from urllib.parse import quote, unquote
 import altair as alt
 import pandas as pd
 import streamlit as st
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
 
 from src.scrape_planner.failure_classifier import classify_failure
 from src.scrape_planner.llm_orchestrator import (
@@ -51,6 +55,7 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:1143
 ENV_PATH = ROOT / ".env"
 APP_STATE_PATH = DATA_ROOT / "app_state.json"
 PI_PROMPT_TEMPLATE_PATH = ROOT / "prompts" / "pi_url_selection_prompt.md"
+DOCUMENT_WIKI_SKILL_PATH = ROOT / ".pi" / "skills" / "document-wiki-ingest" / "SKILL.md"
 
 
 def _site_slug(url: str) -> str:
@@ -244,6 +249,11 @@ def _next_retry_run_id(source_run_id: str, site_id: str) -> str:
     while (site_root / f"{base}{idx:02d}").exists():
         idx += 1
     return f"{base}{idx:02d}"
+
+
+def _safe_uploaded_filename(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name or "document.pdf")).strip(".-")
+    return cleaned[:160] or "document.pdf"
 
 
 def _discovered_json_path(site_id: str) -> Path:
@@ -528,6 +538,13 @@ def _build_trace_df(
     return df
 
 
+def _schedule_live_refresh(*, key: str, enabled: bool, active: bool, interval_seconds: float = 1.0) -> None:
+    if not enabled or not active:
+        return
+    if st_autorefresh is not None:
+        st_autorefresh(interval=max(250, int(interval_seconds * 1000)), key=key)
+
+
 def _load_run_analytics_inputs(site_id: str, run_id: str, run_root: Path) -> tuple[list[dict], list[dict], dict, list[dict]]:
     pages: list[dict] = []
     seen_urls: set[str] = set()
@@ -570,7 +587,92 @@ def _load_run_analytics_inputs(site_id: str, run_id: str, run_root: Path) -> tup
     return pages, failures if isinstance(failures, list) else [], run_status if isinstance(run_status, dict) else {}, scrape_events if isinstance(scrape_events, list) else []
 
 
+def _apply_compact_ui_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        html, body, [class*="st-"], [data-testid="stAppViewContainer"] {
+            font-size: 13px;
+        }
+        .main .block-container {
+            padding-top: 1.2rem;
+            padding-bottom: 1.6rem;
+            max-width: 100%;
+        }
+        h1 {
+            font-size: 1.45rem !important;
+            line-height: 1.2 !important;
+            margin-bottom: 0.35rem !important;
+        }
+        h2, h3 {
+            font-size: 1.02rem !important;
+            line-height: 1.25 !important;
+            margin-top: 0.8rem !important;
+            margin-bottom: 0.35rem !important;
+        }
+        p, label, .stMarkdown, .stCaption, [data-testid="stMarkdownContainer"] {
+            font-size: 0.82rem !important;
+            line-height: 1.35 !important;
+        }
+        [data-testid="stMetric"] {
+            padding: 0.15rem 0;
+        }
+        [data-testid="stMetricLabel"] p {
+            font-size: 0.72rem !important;
+        }
+        [data-testid="stMetricValue"] {
+            font-size: 1.08rem !important;
+            line-height: 1.15 !important;
+        }
+        button, input, textarea, select, [role="tab"] {
+            font-size: 0.8rem !important;
+        }
+        [data-testid="stDataFrame"] {
+            font-size: 0.78rem !important;
+        }
+        div[data-testid="stExpander"] details summary p {
+            font-size: 0.82rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_cleanup_direct_preview() -> None:
+    cleanup_preview_param = str(st.query_params.get("cleanup_preview", "") or "").strip()
+    if not cleanup_preview_param:
+        return
+
+    raw_path = Path(unquote(cleanup_preview_param))
+    preview_path = raw_path if raw_path.is_absolute() else (ROOT / raw_path)
+    try:
+        resolved_path = preview_path.resolve()
+        data_root = DATA_ROOT.resolve()
+        is_allowed = resolved_path == data_root or data_root in resolved_path.parents
+    except Exception:
+        resolved_path = preview_path
+        is_allowed = False
+
+    st.title("Cleaned Page Preview")
+    st.caption(f"File: `{resolved_path}`")
+    if not is_allowed:
+        st.error("Preview blocked because the file is outside this project's data directory.")
+    elif not resolved_path.exists():
+        st.error("Preview file not found. The cleanup manifest may point at a stale path.")
+    else:
+        st.markdown(resolved_path.read_text(encoding="utf-8", errors="replace"))
+
+    if st.button("Back to Cleanup Results"):
+        if "cleanup_preview" in st.query_params:
+            del st.query_params["cleanup_preview"]
+        st.rerun()
+    st.stop()
+
+
 st.set_page_config(page_title="Scrapling Scrape Planner", layout="wide")
+_apply_compact_ui_styles()
+_render_cleanup_direct_preview()
 _init_state()
 loaded_env = _load_env_file(ENV_PATH)
 loaded_app_state = _load_app_state()
@@ -1240,7 +1342,9 @@ with tabs[3]:
             runner.cancel(st.session_state["site_id"], st.session_state["run_id"])
         if c6.button("Refresh", use_container_width=True):
             st.rerun()
-        autorefresh = c7.checkbox("Auto-refresh every 1s", value=True)
+        autorefresh = c7.checkbox("Auto-refresh every 1s", value=False)
+        if autorefresh and st_autorefresh is None:
+            c7.caption("Install `streamlit-autorefresh` to enable this without blocking. Use Refresh for now.")
         st.caption(
             f"Selected URLs: `{len(selected_url_strings):,}`   |   Active run: `{st.session_state.get('run_id') or 'none'}`"
         )
@@ -1477,532 +1581,535 @@ with tabs[3]:
 
             with st.expander("Advanced events, page inspector, and failure triage", expanded=False):
                 st.subheader("Live Event Timeline")
-            log_controls = st.columns([2, 2, 2])
-            show_latest = int(
-                log_controls[0].number_input("Show latest events", min_value=20, max_value=1500, value=200, step=20)
-            )
-            event_filter = log_controls[1].text_input("Filter event name", value="", key="event_name_filter")
-            only_current = log_controls[2].checkbox("Current URL only", value=False, key="event_current_only")
-            events_df = pd.DataFrame(events or [])
-            if events_df.empty:
-                st.info("No events yet. Run initializing.")
-            else:
-                if event_filter.strip() and "event" in events_df.columns:
-                    events_df = events_df[
-                        events_df["event"].astype(str).str.contains(event_filter.strip(), case=False, na=False)
-                    ]
-                if only_current and status.get("current_url") and "url" in events_df.columns:
-                    events_df = events_df[events_df["url"] == status.get("current_url")]
-                if "ts" in events_df.columns:
-                    events_df["ts_dt"] = pd.to_datetime(events_df["ts"], errors="coerce", utc=True)
-                    events_df = events_df.sort_values("ts_dt", ascending=False, na_position="last")
-                    events_df["ts_readable"] = events_df["ts_dt"].dt.strftime("%Y-%m-%d %H:%M:%S UTC").fillna("n/a")
+                log_controls = st.columns([2, 2, 2])
+                show_latest = int(
+                    log_controls[0].number_input("Show latest events", min_value=20, max_value=1500, value=200, step=20)
+                )
+                event_filter = log_controls[1].text_input("Filter event name", value="", key="event_name_filter")
+                only_current = log_controls[2].checkbox("Current URL only", value=False, key="event_current_only")
+                events_df = pd.DataFrame(events or [])
+                if events_df.empty:
+                    st.info("No events yet. Run initializing.")
                 else:
-                    events_df["ts_readable"] = "n/a"
-                events_df = events_df.head(show_latest)
-                for _, row in events_df.iterrows():
-                    with st.container(border=True):
-                        line = (
-                            f"`{row.get('ts_readable', 'n/a')}` "
-                            f"`{row.get('event', 'event')}` "
-                            f"`{row.get('status') or row.get('state') or ''}`"
-                        )
-                        st.markdown(line)
-                        detail_bits = []
-                        if row.get("url"):
-                            detail_bits.append(f"url: {row.get('url')}")
-                        if row.get("worker_id"):
-                            detail_bits.append(f"worker: {row.get('worker_id')}")
-                        if row.get("fetch_mode"):
-                            detail_bits.append(f"mode: {row.get('fetch_mode')}")
-                        if row.get("http_status") is not None:
-                            detail_bits.append(f"http: {row.get('http_status')}")
-                        reason = row.get("failure_reason") or row.get("error")
-                        if reason:
-                            detail_bits.append(f"reason: {str(reason)[:160]}")
-                        if detail_bits:
-                            st.caption(" | ".join(detail_bits))
-                with st.expander("Raw events"):
-                    st.dataframe(events_df, use_container_width=True)
-
-            st.subheader("Page Inspector")
-            available_urls = list(page_rows_by_url.keys())
-            inspector_url = str(st.session_state.get("scrape_inspector_url") or "")
-            inspector_manual = bool(st.session_state.get("scrape_inspector_manual", False))
-            running_candidates = [
-                str(row.get("url") or "").strip()
-                for row in page_rows_by_url.values()
-                if str(row.get("status") or "").lower() == "running" and str(row.get("url") or "").strip()
-            ]
-            running_url = running_candidates[0] if running_candidates else ""
-            if not inspector_manual and running_url:
-                inspector_url = running_url
-            if inspector_url not in available_urls:
-                inspector_manual = False
-                if running_url:
-                    inspector_url = running_url
-                else:
-                    sorted_candidates = sorted(
-                        page_rows_by_url.values(),
-                        key=lambda row: (
-                            0 if str(row.get("status") or "").lower() == "running" else 1,
-                            pd.to_datetime(
-                                row.get("finished_at") or row.get("started_at"),
-                                errors="coerce",
-                                utc=True,
-                            ).value
-                            if pd.notna(pd.to_datetime(row.get("finished_at") or row.get("started_at"), errors="coerce", utc=True))
-                            else -1,
-                        ),
-                        reverse=True,
-                    )
-                    inspector_url = str(sorted_candidates[0].get("url") or "") if sorted_candidates else (available_urls[0] if available_urls else "")
-            st.session_state["scrape_inspector_url"] = inspector_url
-            st.session_state["scrape_inspector_manual"] = inspector_manual
-
-            selector_cols = st.columns([3, 1.3, 1.3, 2])
-            selected_inspector_url = selector_cols[0].selectbox(
-                "Inspect URL",
-                options=available_urls,
-                index=available_urls.index(inspector_url) if inspector_url in available_urls else 0,
-                key="scrape_inspector_url_selector",
-            )
-            if selected_inspector_url != st.session_state.get("scrape_inspector_url"):
-                st.session_state["scrape_inspector_manual"] = True
-                st.session_state["scrape_inspector_url"] = selected_inspector_url
-            if selector_cols[1].button("Follow Running", use_container_width=True):
-                st.session_state["scrape_inspector_manual"] = False
-                if running_url:
-                    st.session_state["scrape_inspector_url"] = running_url
-                st.rerun()
-            if selector_cols[2].button("Reset Auto", use_container_width=True):
-                st.session_state["scrape_inspector_manual"] = False
-                st.rerun()
-            selector_cols[3].caption(
-                f"Mode: `{'manual' if st.session_state.get('scrape_inspector_manual') else 'auto-follow'}`"
-            )
-
-            selected_url = str(st.session_state.get("scrape_inspector_url") or "")
-            selected_page = dict(page_rows_by_url.get(selected_url) or {})
-            page_events = []
-            for event in events or []:
-                if not isinstance(event, dict):
-                    continue
-                if str(event.get("url") or "").strip() == selected_url:
-                    page_events.append(event)
-            page_events = sorted(
-                page_events,
-                key=lambda e: pd.to_datetime(e.get("ts"), errors="coerce", utc=True).value
-                if pd.notna(pd.to_datetime(e.get("ts"), errors="coerce", utc=True))
-                else 0,
-            )
-            retry_event_count = len(
-                [
-                    e
-                    for e in page_events
-                    if str(e.get("event") or "") in {"fetch_retrying_next_mode", "fetch_exception"}
-                ]
-            )
-            preview_tabs = st.tabs(["Preview", "Markdown", "Raw HTML", "Metadata", "Events", "Failure"])
-
-            with preview_tabs[0]:
-                c_a, c_b, c_c, c_d = st.columns(4)
-                c_a.metric("Status", str(selected_page.get("status") or "queued"))
-                c_b.metric("Fetch Mode", str(selected_page.get("fetch_mode") or "n/a"))
-                c_c.metric("HTTP", str(selected_page.get("http_status") if selected_page.get("http_status") is not None else "n/a"))
-                c_d.metric("Duration (s)", f"{float(selected_page.get('duration_ms') or 0)/1000.0:.2f}")
-                p1, p2, p3, p4 = st.columns(4)
-                markdown_text, markdown_path, markdown_size, markdown_err = _safe_read_text(
-                    selected_page.get("markdown_path"),
-                    limit_chars=8000,
-                )
-                raw_text, raw_path, raw_size, raw_err = _safe_read_text(
-                    selected_page.get("raw_html_path"),
-                    limit_chars=8000,
-                )
-                text_len = len(markdown_text or "")
-                link_count = (raw_text or "").count("href=")
-                raw_len = max(len(raw_text or ""), 1)
-                link_density = (link_count / raw_len) * 1000.0
-                p1.metric("Markdown chars", f"{text_len:,}")
-                p2.metric("Raw chars", f"{len(raw_text or ''):,}")
-                p3.metric("Links (raw)", f"{link_count:,}")
-                p4.metric("Link density", f"{link_density:.2f}/1k chars")
-                st.caption(f"URL: `{selected_url}`")
-                st.caption(f"markdown_path: `{selected_page.get('markdown_path') or 'n/a'}`")
-                st.caption(f"raw_html_path: `{selected_page.get('raw_html_path') or 'n/a'}`")
-                st.caption(f"metadata_path: `{selected_page.get('metadata_path') or 'n/a'}`")
-                if markdown_text:
-                    st.markdown(markdown_text[:4000])
-                elif raw_text:
-                    st.code(raw_text[:3000], language="html")
-                else:
-                    st.info("No preview artifact yet. Page may still be queued/running.")
-                    if page_events:
-                        st.caption(f"Recent events for this URL: {len(page_events)}")
-                    if markdown_err:
-                        st.caption(f"Markdown: {markdown_err}")
-                    if raw_err:
-                        st.caption(f"Raw HTML: {raw_err}")
-
-            with preview_tabs[1]:
-                md_len = st.selectbox("Preview length", options=[2000, 8000, 20000, -1], index=1, format_func=lambda v: "full" if v == -1 else f"{v:,} chars")
-                md_text, md_path, md_size, md_err = _safe_read_text(
-                    selected_page.get("markdown_path"),
-                    limit_chars=None if md_len == -1 else int(md_len),
-                )
-                if md_path:
-                    st.caption(f"Path: `{md_path}`")
-                if md_size is not None:
-                    st.caption(f"Size: `{md_size/1024.0:.1f} KB`")
-                if md_err:
-                    st.warning(md_err)
-                elif md_text is not None:
-                    st.code(md_text, language="markdown")
-                else:
-                    st.info("Markdown not available yet.")
-
-            with preview_tabs[2]:
-                raw_len_choice = st.selectbox("Preview length (raw)", options=[2000, 8000, 20000, -1], index=1, format_func=lambda v: "full" if v == -1 else f"{v:,} chars")
-                html_text, html_path, html_size, html_err = _safe_read_text(
-                    selected_page.get("raw_html_path"),
-                    limit_chars=None if raw_len_choice == -1 else int(raw_len_choice),
-                )
-                if html_path:
-                    st.caption(f"Path: `{html_path}`")
-                if html_size is not None:
-                    st.caption(f"Size: `{html_size/1024.0:.1f} KB`")
-                if html_err:
-                    st.warning(html_err)
-                elif html_text is not None:
-                    st.code(html_text, language="html")
-                else:
-                    st.info("Raw HTML not available yet.")
-
-            with preview_tabs[3]:
-                merged_metadata = dict(selected_page)
-                metadata_payload, metadata_path, metadata_err = _safe_read_json(selected_page.get("metadata_path"))
-                if metadata_path:
-                    st.caption(f"Metadata file: `{metadata_path}`")
-                if metadata_err:
-                    st.caption(metadata_err)
-                st.write("Page row")
-                st.json(selected_page)
-                if metadata_payload is not None:
-                    st.write("Metadata file payload")
-                    st.json(metadata_payload)
-                    if isinstance(metadata_payload, dict):
-                        for key, val in metadata_payload.items():
-                            merged_metadata.setdefault(f"metadata.{key}", val)
-                st.write("Merged view")
-                st.json(merged_metadata)
-
-            with preview_tabs[4]:
-                if not page_events:
-                    st.info("No events captured for this URL yet.")
-                else:
-                    timeline_df = pd.DataFrame(page_events)
-                    if "ts" in timeline_df.columns:
-                        timeline_df["ts_dt"] = pd.to_datetime(timeline_df["ts"], errors="coerce", utc=True)
-                        timeline_df["ts_readable"] = timeline_df["ts_dt"].dt.strftime("%Y-%m-%d %H:%M:%S UTC").fillna("n/a")
-                    important = [
-                        "page_started",
-                        "fetch_attempt",
-                        "fetch_retrying_next_mode",
-                        "fetch_exception",
-                        "artifacts_saved",
-                        "page_done",
-                    ]
-                    timeline_df = timeline_df[
-                        timeline_df["event"].astype(str).isin(important)
-                    ] if "event" in timeline_df.columns else timeline_df
-                    _render_paginated_df(
-                        timeline_df[
-                            [
-                                c
-                                for c in [
-                                    "ts_readable",
-                                    "event",
-                                    "status",
-                                    "worker_id",
-                                    "attempt",
-                                    "fetch_mode",
-                                    "http_status",
-                                    "failure_reason",
-                                    "error",
-                                ]
-                                if c in timeline_df.columns
-                            ]
-                        ],
-                        key_prefix="scrape_inspector_events",
-                        default_page_size=25,
-                    )
-
-            with preview_tabs[5]:
-                failure_reason = selected_page.get("failure_reason") or selected_page.get("error")
-                failed_status = str(selected_page.get("status") or "").lower() == "failed"
-                if not failed_status and not failure_reason:
-                    st.info("No failure recorded for this URL.")
-                else:
-                    st.error(str(failure_reason or "Failure recorded without reason"))
-                    st.caption(f"HTTP status: `{selected_page.get('http_status')}`")
-                    st.caption(f"Fetch mode: `{selected_page.get('fetch_mode') or 'n/a'}`")
-                    st.caption(f"Attempt: `{selected_page.get('attempt') or 0}`")
-                    st.caption(f"Retry-related events: `{retry_event_count}`")
-                    st.write("Recommended next action")
-                    st.info("Retry this URL with fallback fetch mode and inspect raw HTML artifact for partial content.")
-
-            st.subheader("Advanced Failure Triage")
-            failed_pages = [
-                dict(row)
-                for row in page_rows_by_url.values()
-                if str(row.get("status") or "").lower() == "failed"
-            ]
-            if not failed_pages:
-                st.info("No failed pages for this run yet.")
-            else:
-                failed_df = pd.DataFrame(failed_pages)
-                failed_df["normalized_reason"] = failed_df.apply(
-                    lambda row: _normalize_failure_reason(row.to_dict() if hasattr(row, "to_dict") else dict(row)),
-                    axis=1,
-                )
-                http_status_series = (
-                    failed_df["http_status"] if "http_status" in failed_df.columns else pd.Series(pd.NA, index=failed_df.index)
-                )
-                failed_df["http_status"] = pd.to_numeric(http_status_series, errors="coerce").astype("Int64")
-                failed_attempt_series = (
-                    failed_df["attempt"] if "attempt" in failed_df.columns else pd.Series(0, index=failed_df.index)
-                )
-                failed_df["attempt"] = pd.to_numeric(failed_attempt_series, errors="coerce").fillna(0).astype(int)
-                failed_df["last_event_ts"] = pd.to_datetime(
-                    failed_df.get("finished_at").fillna(failed_df.get("started_at")),
-                    errors="coerce",
-                    utc=True,
-                ).dt.strftime("%Y-%m-%d %H:%M:%S UTC").fillna("n/a")
-                failed_df["duration_sec"] = (
-                    (
-                        pd.to_datetime(failed_df.get("finished_at"), errors="coerce", utc=True)
-                        - pd.to_datetime(failed_df.get("started_at"), errors="coerce", utc=True)
-                    )
-                    .dt.total_seconds()
-                    .round(2)
-                    .fillna(0.0)
-                )
-                failed_df["error"] = failed_df.get("error", pd.Series(dtype=str)).fillna("").astype(str)
-                failed_df["selected"] = True
-
-                reason_counts = failed_df["normalized_reason"].value_counts(dropna=False).to_dict()
-                fsum1, fsum2, fsum3, fsum4 = st.columns(4)
-                fsum1.metric("Failed URLs", f"{len(failed_df):,}")
-                fsum2.metric("Failure Types", f"{len(reason_counts):,}")
-                top_reason = max(reason_counts, key=reason_counts.get) if reason_counts else "n/a"
-                fsum3.metric("Top Reason", str(top_reason))
-                fsum4.metric("Max Attempts", f"{int(failed_df['attempt'].max()) if not failed_df.empty else 0}")
-
-                st.caption("Failure groups")
-                grp_df = pd.DataFrame(
-                    [{"reason": key, "count": int(val)} for key, val in sorted(reason_counts.items(), key=lambda x: (-x[1], x[0]))]
-                )
-                st.dataframe(grp_df, use_container_width=True, hide_index=True)
-
-                ff1, ff2, ff3, ff4 = st.columns([2, 2, 3, 2])
-                reason_options = sorted(failed_df["normalized_reason"].dropna().astype(str).unique().tolist())
-                selected_reasons = ff1.multiselect(
-                    "Failure reason",
-                    options=reason_options,
-                    default=reason_options,
-                    key="triage_reason_filter",
-                )
-                http_options = sorted(
-                    [int(x) for x in failed_df["http_status"].dropna().astype(int).unique().tolist()]
-                )
-                selected_http = ff2.multiselect(
-                    "HTTP status",
-                    options=http_options,
-                    default=http_options,
-                    key="triage_http_filter",
-                )
-                url_filter = ff3.text_input("URL contains", value="", key="triage_url_filter")
-                mode_options = sorted(failed_df.get("fetch_mode", pd.Series(dtype=str)).fillna("unknown").astype(str).unique().tolist())
-                selected_modes = ff4.multiselect(
-                    "Fetch mode",
-                    options=mode_options,
-                    default=mode_options,
-                    key="triage_mode_filter",
-                )
-
-                triage_df = failed_df.copy()
-                if selected_reasons:
-                    triage_df = triage_df[triage_df["normalized_reason"].isin(selected_reasons)]
-                if selected_http:
-                    triage_df = triage_df[triage_df["http_status"].isin(selected_http)]
-                if url_filter.strip():
-                    triage_df = triage_df[triage_df["url"].astype(str).str.contains(url_filter.strip(), case=False, na=False)]
-                if selected_modes:
-                    triage_df = triage_df[triage_df.get("fetch_mode", pd.Series(dtype=str)).fillna("unknown").astype(str).isin(selected_modes)]
-
-                triage_df = triage_df.sort_values(["normalized_reason", "attempt", "url"], ascending=[True, False, True])
-                if triage_df.empty:
-                    st.info("No failed pages match current triage filters.")
-                else:
-                    st.caption("Failed pages")
-                    editable_df = triage_df[
-                        [
-                            "selected",
-                            "url",
-                            "normalized_reason",
-                            "failure_reason",
-                            "http_status",
-                            "fetch_mode",
-                            "attempt",
-                            "duration_sec",
-                            "error",
-                            "last_event_ts",
+                    if event_filter.strip() and "event" in events_df.columns:
+                        events_df = events_df[
+                            events_df["event"].astype(str).str.contains(event_filter.strip(), case=False, na=False)
                         ]
-                    ].copy()
-                    edited = st.data_editor(
-                        editable_df,
-                        use_container_width=True,
-                        hide_index=True,
-                        key="triage_failed_editor",
-                        column_config={"selected": st.column_config.CheckboxColumn("selected", default=True)},
-                        disabled=[
-                            "url",
-                            "normalized_reason",
-                            "failure_reason",
-                            "http_status",
-                            "fetch_mode",
-                            "attempt",
-                            "duration_sec",
-                            "error",
-                            "last_event_ts",
-                        ],
-                    )
-                    selected_urls = edited[edited["selected"] == True]["url"].astype(str).tolist()  # noqa: E712
-                    selected_reason_for_group = st.selectbox(
-                        "Retry by failure type",
-                        options=reason_options,
-                        index=0 if reason_options else None,
-                        key="triage_retry_reason",
-                    )
-                    retry_cols = st.columns([1.2, 1.2, 1.2, 1.2, 2.2])
-                    tavily_enabled = bool(st.session_state.get("tavily_api_key"))
-                    tavily_depth = retry_cols[4].selectbox("Tavily depth", options=["basic", "advanced"], index=0, key="triage_tavily_depth")
-                    tavily_fmt = retry_cols[4].selectbox("Tavily format", options=["markdown", "text"], index=0, key="triage_tavily_fmt")
-
-                    def _start_retry_run(urls_for_retry: list[str], *, reason_scope: str) -> None:
-                        if not urls_for_retry:
-                            st.warning("No URLs selected for retry.")
-                            return
-                        retry_run_id = _next_retry_run_id(st.session_state["run_id"], st.session_state["site_id"])
-                        retry_urls = [
-                            DiscoveredURL(
-                                url=url,
-                                source_sitemap="retry",
-                                path_category="retry",
-                                selected=True,
+                    if only_current and status.get("current_url") and "url" in events_df.columns:
+                        events_df = events_df[events_df["url"] == status.get("current_url")]
+                    if "ts" in events_df.columns:
+                        events_df["ts_dt"] = pd.to_datetime(events_df["ts"], errors="coerce", utc=True)
+                        events_df = events_df.sort_values("ts_dt", ascending=False, na_position="last")
+                        events_df["ts_readable"] = events_df["ts_dt"].dt.strftime("%Y-%m-%d %H:%M:%S UTC").fillna("n/a")
+                    else:
+                        events_df["ts_readable"] = "n/a"
+                    events_df = events_df.head(show_latest)
+                    for _, row in events_df.iterrows():
+                        with st.container(border=True):
+                            line = (
+                                f"`{row.get('ts_readable', 'n/a')}` "
+                                f"`{row.get('event', 'event')}` "
+                                f"`{row.get('status') or row.get('state') or ''}`"
                             )
-                            for url in urls_for_retry
+                            st.markdown(line)
+                            detail_bits = []
+                            if row.get("url"):
+                                detail_bits.append(f"url: {row.get('url')}")
+                            if row.get("worker_id"):
+                                detail_bits.append(f"worker: {row.get('worker_id')}")
+                            if row.get("fetch_mode"):
+                                detail_bits.append(f"mode: {row.get('fetch_mode')}")
+                            if row.get("http_status") is not None:
+                                detail_bits.append(f"http: {row.get('http_status')}")
+                            reason = row.get("failure_reason") or row.get("error")
+                            if reason:
+                                detail_bits.append(f"reason: {str(reason)[:160]}")
+                            if detail_bits:
+                                st.caption(" | ".join(detail_bits))
+                    with st.expander("Raw events"):
+                        st.dataframe(events_df, use_container_width=True)
+
+                st.subheader("Page Inspector")
+                available_urls = list(page_rows_by_url.keys())
+                inspector_url = str(st.session_state.get("scrape_inspector_url") or "")
+                inspector_manual = bool(st.session_state.get("scrape_inspector_manual", False))
+                running_candidates = [
+                    str(row.get("url") or "").strip()
+                    for row in page_rows_by_url.values()
+                    if str(row.get("status") or "").lower() == "running" and str(row.get("url") or "").strip()
+                ]
+                running_url = running_candidates[0] if running_candidates else ""
+                if not inspector_manual and running_url:
+                    inspector_url = running_url
+                if inspector_url not in available_urls:
+                    inspector_manual = False
+                    if running_url:
+                        inspector_url = running_url
+                    else:
+                        sorted_candidates = sorted(
+                            page_rows_by_url.values(),
+                            key=lambda row: (
+                                0 if str(row.get("status") or "").lower() == "running" else 1,
+                                pd.to_datetime(
+                                    row.get("finished_at") or row.get("started_at"),
+                                    errors="coerce",
+                                    utc=True,
+                                ).value
+                                if pd.notna(pd.to_datetime(row.get("finished_at") or row.get("started_at"), errors="coerce", utc=True))
+                                else -1,
+                            ),
+                            reverse=True,
+                        )
+                        inspector_url = str(sorted_candidates[0].get("url") or "") if sorted_candidates else (available_urls[0] if available_urls else "")
+                st.session_state["scrape_inspector_url"] = inspector_url
+                st.session_state["scrape_inspector_manual"] = inspector_manual
+
+                selector_cols = st.columns([3, 1.3, 1.3, 2])
+                selected_inspector_url = selector_cols[0].selectbox(
+                    "Inspect URL",
+                    options=available_urls,
+                    index=available_urls.index(inspector_url) if inspector_url in available_urls else 0,
+                    key="scrape_inspector_url_selector",
+                )
+                if selected_inspector_url != st.session_state.get("scrape_inspector_url"):
+                    st.session_state["scrape_inspector_manual"] = True
+                    st.session_state["scrape_inspector_url"] = selected_inspector_url
+                if selector_cols[1].button("Follow Running", use_container_width=True):
+                    st.session_state["scrape_inspector_manual"] = False
+                    if running_url:
+                        st.session_state["scrape_inspector_url"] = running_url
+                    st.rerun()
+                if selector_cols[2].button("Reset Auto", use_container_width=True):
+                    st.session_state["scrape_inspector_manual"] = False
+                    st.rerun()
+                selector_cols[3].caption(
+                    f"Mode: `{'manual' if st.session_state.get('scrape_inspector_manual') else 'auto-follow'}`"
+                )
+
+                selected_url = str(st.session_state.get("scrape_inspector_url") or "")
+                selected_page = dict(page_rows_by_url.get(selected_url) or {})
+                page_events = []
+                for event in events or []:
+                    if not isinstance(event, dict):
+                        continue
+                    if str(event.get("url") or "").strip() == selected_url:
+                        page_events.append(event)
+                page_events = sorted(
+                    page_events,
+                    key=lambda e: pd.to_datetime(e.get("ts"), errors="coerce", utc=True).value
+                    if pd.notna(pd.to_datetime(e.get("ts"), errors="coerce", utc=True))
+                    else 0,
+                )
+                retry_event_count = len(
+                    [
+                        e
+                        for e in page_events
+                        if str(e.get("event") or "") in {"fetch_retrying_next_mode", "fetch_exception"}
+                    ]
+                )
+                preview_tabs = st.tabs(["Preview", "Markdown", "Raw HTML", "Metadata", "Events", "Failure"])
+
+                with preview_tabs[0]:
+                    c_a, c_b, c_c, c_d = st.columns(4)
+                    c_a.metric("Status", str(selected_page.get("status") or "queued"))
+                    c_b.metric("Fetch Mode", str(selected_page.get("fetch_mode") or "n/a"))
+                    c_c.metric("HTTP", str(selected_page.get("http_status") if selected_page.get("http_status") is not None else "n/a"))
+                    c_d.metric("Duration (s)", f"{float(selected_page.get('duration_ms') or 0)/1000.0:.2f}")
+                    p1, p2, p3, p4 = st.columns(4)
+                    markdown_text, markdown_path, markdown_size, markdown_err = _safe_read_text(
+                        selected_page.get("markdown_path"),
+                        limit_chars=8000,
+                    )
+                    raw_text, raw_path, raw_size, raw_err = _safe_read_text(
+                        selected_page.get("raw_html_path"),
+                        limit_chars=8000,
+                    )
+                    text_len = len(markdown_text or "")
+                    link_count = (raw_text or "").count("href=")
+                    raw_len = max(len(raw_text or ""), 1)
+                    link_density = (link_count / raw_len) * 1000.0
+                    p1.metric("Markdown chars", f"{text_len:,}")
+                    p2.metric("Raw chars", f"{len(raw_text or ''):,}")
+                    p3.metric("Links (raw)", f"{link_count:,}")
+                    p4.metric("Link density", f"{link_density:.2f}/1k chars")
+                    st.caption(f"URL: `{selected_url}`")
+                    st.caption(f"markdown_path: `{selected_page.get('markdown_path') or 'n/a'}`")
+                    st.caption(f"raw_html_path: `{selected_page.get('raw_html_path') or 'n/a'}`")
+                    st.caption(f"metadata_path: `{selected_page.get('metadata_path') or 'n/a'}`")
+                    if markdown_text:
+                        st.markdown(markdown_text[:4000])
+                    elif raw_text:
+                        st.code(raw_text[:3000], language="html")
+                    else:
+                        st.info("No preview artifact yet. Page may still be queued/running.")
+                        if page_events:
+                            st.caption(f"Recent events for this URL: {len(page_events)}")
+                        if markdown_err:
+                            st.caption(f"Markdown: {markdown_err}")
+                        if raw_err:
+                            st.caption(f"Raw HTML: {raw_err}")
+
+                with preview_tabs[1]:
+                    md_len = st.selectbox("Preview length", options=[2000, 8000, 20000, -1], index=1, format_func=lambda v: "full" if v == -1 else f"{v:,} chars")
+                    md_text, md_path, md_size, md_err = _safe_read_text(
+                        selected_page.get("markdown_path"),
+                        limit_chars=None if md_len == -1 else int(md_len),
+                    )
+                    if md_path:
+                        st.caption(f"Path: `{md_path}`")
+                    if md_size is not None:
+                        st.caption(f"Size: `{md_size/1024.0:.1f} KB`")
+                    if md_err:
+                        st.warning(md_err)
+                    elif md_text is not None:
+                        st.code(md_text, language="markdown")
+                    else:
+                        st.info("Markdown not available yet.")
+
+                with preview_tabs[2]:
+                    raw_len_choice = st.selectbox("Preview length (raw)", options=[2000, 8000, 20000, -1], index=1, format_func=lambda v: "full" if v == -1 else f"{v:,} chars")
+                    html_text, html_path, html_size, html_err = _safe_read_text(
+                        selected_page.get("raw_html_path"),
+                        limit_chars=None if raw_len_choice == -1 else int(raw_len_choice),
+                    )
+                    if html_path:
+                        st.caption(f"Path: `{html_path}`")
+                    if html_size is not None:
+                        st.caption(f"Size: `{html_size/1024.0:.1f} KB`")
+                    if html_err:
+                        st.warning(html_err)
+                    elif html_text is not None:
+                        st.code(html_text, language="html")
+                    else:
+                        st.info("Raw HTML not available yet.")
+
+                with preview_tabs[3]:
+                    merged_metadata = dict(selected_page)
+                    metadata_payload, metadata_path, metadata_err = _safe_read_json(selected_page.get("metadata_path"))
+                    if metadata_path:
+                        st.caption(f"Metadata file: `{metadata_path}`")
+                    if metadata_err:
+                        st.caption(metadata_err)
+                    st.write("Page row")
+                    st.json(selected_page)
+                    if metadata_payload is not None:
+                        st.write("Metadata file payload")
+                        st.json(metadata_payload)
+                        if isinstance(metadata_payload, dict):
+                            for key, val in metadata_payload.items():
+                                merged_metadata.setdefault(f"metadata.{key}", val)
+                    st.write("Merged view")
+                    st.json(merged_metadata)
+
+                with preview_tabs[4]:
+                    if not page_events:
+                        st.info("No events captured for this URL yet.")
+                    else:
+                        timeline_df = pd.DataFrame(page_events)
+                        if "ts" in timeline_df.columns:
+                            timeline_df["ts_dt"] = pd.to_datetime(timeline_df["ts"], errors="coerce", utc=True)
+                            timeline_df["ts_readable"] = timeline_df["ts_dt"].dt.strftime("%Y-%m-%d %H:%M:%S UTC").fillna("n/a")
+                        important = [
+                            "page_started",
+                            "fetch_attempt",
+                            "fetch_retrying_next_mode",
+                            "fetch_exception",
+                            "artifacts_saved",
+                            "page_done",
                         ]
-                        retry_root = _run_root(st.session_state["site_id"], retry_run_id)
-                        write_json(
-                            retry_root / "retry_source.json",
-                            {
-                                "source_run_id": st.session_state["run_id"],
-                                "source_site_id": st.session_state["site_id"],
-                                "retry_reason_scope": reason_scope,
-                                "urls": urls_for_retry,
-                                "created_at": datetime.now(timezone.utc).isoformat(),
-                            },
+                        timeline_df = timeline_df[
+                            timeline_df["event"].astype(str).isin(important)
+                        ] if "event" in timeline_df.columns else timeline_df
+                        _render_paginated_df(
+                            timeline_df[
+                                [
+                                    c
+                                    for c in [
+                                        "ts_readable",
+                                        "event",
+                                        "status",
+                                        "worker_id",
+                                        "attempt",
+                                        "fetch_mode",
+                                        "http_status",
+                                        "failure_reason",
+                                        "error",
+                                    ]
+                                    if c in timeline_df.columns
+                                ]
+                            ],
+                            key_prefix="scrape_inspector_events",
+                            default_page_size=25,
                         )
-                        runner.start(
-                            st.session_state["site_id"],
-                            retry_run_id,
-                            retry_urls,
-                            concurrency=int(concurrency),
+
+                with preview_tabs[5]:
+                    failure_reason = selected_page.get("failure_reason") or selected_page.get("error")
+                    failed_status = str(selected_page.get("status") or "").lower() == "failed"
+                    if not failed_status and not failure_reason:
+                        st.info("No failure recorded for this URL.")
+                    else:
+                        st.error(str(failure_reason or "Failure recorded without reason"))
+                        st.caption(f"HTTP status: `{selected_page.get('http_status')}`")
+                        st.caption(f"Fetch mode: `{selected_page.get('fetch_mode') or 'n/a'}`")
+                        st.caption(f"Attempt: `{selected_page.get('attempt') or 0}`")
+                        st.caption(f"Retry-related events: `{retry_event_count}`")
+                        st.write("Recommended next action")
+                        st.info("Retry this URL with fallback fetch mode and inspect raw HTML artifact for partial content.")
+
+                st.subheader("Advanced Failure Triage")
+                failed_pages = [
+                    dict(row)
+                    for row in page_rows_by_url.values()
+                    if str(row.get("status") or "").lower() == "failed"
+                ]
+                if not failed_pages:
+                    st.info("No failed pages for this run yet.")
+                else:
+                    failed_df = pd.DataFrame(failed_pages)
+                    failed_df["normalized_reason"] = failed_df.apply(
+                        lambda row: _normalize_failure_reason(row.to_dict() if hasattr(row, "to_dict") else dict(row)),
+                        axis=1,
+                    )
+                    http_status_series = (
+                        failed_df["http_status"] if "http_status" in failed_df.columns else pd.Series(pd.NA, index=failed_df.index)
+                    )
+                    failed_df["http_status"] = pd.to_numeric(http_status_series, errors="coerce").astype("Int64")
+                    failed_attempt_series = (
+                        failed_df["attempt"] if "attempt" in failed_df.columns else pd.Series(0, index=failed_df.index)
+                    )
+                    failed_df["attempt"] = pd.to_numeric(failed_attempt_series, errors="coerce").fillna(0).astype(int)
+                    failed_df["last_event_ts"] = pd.to_datetime(
+                        failed_df.get("finished_at").fillna(failed_df.get("started_at")),
+                        errors="coerce",
+                        utc=True,
+                    ).dt.strftime("%Y-%m-%d %H:%M:%S UTC").fillna("n/a")
+                    failed_df["duration_sec"] = (
+                        (
+                            pd.to_datetime(failed_df.get("finished_at"), errors="coerce", utc=True)
+                            - pd.to_datetime(failed_df.get("started_at"), errors="coerce", utc=True)
                         )
-                        st.session_state["run_id"] = retry_run_id
-                        st.session_state["last_run_by_site"][st.session_state["site_id"]] = retry_run_id
-                        _save_app_state()
-                        st.success(f"Started retry run `{retry_run_id}` with {len(urls_for_retry):,} URL(s).")
-                        st.rerun()
-
-                    if retry_cols[0].button("Retry selected", use_container_width=True):
-                        _start_retry_run(selected_urls, reason_scope="selected")
-                    if retry_cols[1].button("Retry all failed", use_container_width=True):
-                        _start_retry_run(failed_df["url"].astype(str).tolist(), reason_scope="all_failed")
-                    if retry_cols[2].button("Retry by type", use_container_width=True):
-                        urls_for_type = failed_df[failed_df["normalized_reason"] == selected_reason_for_group]["url"].astype(str).tolist()
-                        _start_retry_run(urls_for_type, reason_scope=f"type:{selected_reason_for_group}")
-
-                    tavily_call_count = len(selected_urls)
-                    tavily_unit_cost = float(st.session_state.get("tavily_cost_per_call_usd", 0.0))
-                    est_cost = tavily_call_count * tavily_unit_cost
-                    st.caption(
-                        f"Tavily fallback: selected `{tavily_call_count}` URL(s), "
-                        f"estimated cost `${est_cost:.4f}` @ `${tavily_unit_cost:.4f}`/call."
+                        .dt.total_seconds()
+                        .round(2)
+                        .fillna(0.0)
                     )
-                    if retry_cols[3].button(
-                        "Retry with Tavily fallback",
-                        disabled=(not tavily_enabled) or tavily_call_count == 0,
-                        use_container_width=True,
-                    ):
-                        run_root = _run_root(st.session_state["site_id"], st.session_state["run_id"])
-                        updated_pages, summary = retry_failed_with_tavily(
-                            run_root=run_root,
-                            pages=list(page_rows_by_url.values()),
-                            tavily_api_key=st.session_state["tavily_api_key"],
-                            extract_depth=tavily_depth,
-                            fmt=tavily_fmt,
-                            target_urls=selected_urls,
-                            source_run_id=st.session_state["run_id"],
+                    failed_df["error"] = failed_df.get("error", pd.Series(dtype=str)).fillna("").astype(str)
+                    failed_df["selected"] = True
+
+                    reason_counts = failed_df["normalized_reason"].value_counts(dropna=False).to_dict()
+                    fsum1, fsum2, fsum3, fsum4 = st.columns(4)
+                    fsum1.metric("Failed URLs", f"{len(failed_df):,}")
+                    fsum2.metric("Failure Types", f"{len(reason_counts):,}")
+                    top_reason = max(reason_counts, key=reason_counts.get) if reason_counts else "n/a"
+                    fsum3.metric("Top Reason", str(top_reason))
+                    fsum4.metric("Max Attempts", f"{int(failed_df['attempt'].max()) if not failed_df.empty else 0}")
+
+                    st.caption("Failure groups")
+                    grp_df = pd.DataFrame(
+                        [{"reason": key, "count": int(val)} for key, val in sorted(reason_counts.items(), key=lambda x: (-x[1], x[0]))]
+                    )
+                    st.dataframe(grp_df, use_container_width=True, hide_index=True)
+
+                    ff1, ff2, ff3, ff4 = st.columns([2, 2, 3, 2])
+                    reason_options = sorted(failed_df["normalized_reason"].dropna().astype(str).unique().tolist())
+                    selected_reasons = ff1.multiselect(
+                        "Failure reason",
+                        options=reason_options,
+                        default=reason_options,
+                        key="triage_reason_filter",
+                    )
+                    http_options = sorted(
+                        [int(x) for x in failed_df["http_status"].dropna().astype(int).unique().tolist()]
+                    )
+                    selected_http = ff2.multiselect(
+                        "HTTP status",
+                        options=http_options,
+                        default=http_options,
+                        key="triage_http_filter",
+                    )
+                    url_filter = ff3.text_input("URL contains", value="", key="triage_url_filter")
+                    mode_options = sorted(failed_df.get("fetch_mode", pd.Series(dtype=str)).fillna("unknown").astype(str).unique().tolist())
+                    selected_modes = ff4.multiselect(
+                        "Fetch mode",
+                        options=mode_options,
+                        default=mode_options,
+                        key="triage_mode_filter",
+                    )
+
+                    triage_df = failed_df.copy()
+                    if selected_reasons:
+                        triage_df = triage_df[triage_df["normalized_reason"].isin(selected_reasons)]
+                    if selected_http:
+                        triage_df = triage_df[triage_df["http_status"].isin(selected_http)]
+                    if url_filter.strip():
+                        triage_df = triage_df[triage_df["url"].astype(str).str.contains(url_filter.strip(), case=False, na=False)]
+                    if selected_modes:
+                        triage_df = triage_df[triage_df.get("fetch_mode", pd.Series(dtype=str)).fillna("unknown").astype(str).isin(selected_modes)]
+
+                    triage_df = triage_df.sort_values(["normalized_reason", "attempt", "url"], ascending=[True, False, True])
+                    if triage_df.empty:
+                        st.info("No failed pages match current triage filters.")
+                    else:
+                        st.caption("Failed pages")
+                        editable_df = triage_df[
+                            [
+                                "selected",
+                                "url",
+                                "normalized_reason",
+                                "failure_reason",
+                                "http_status",
+                                "fetch_mode",
+                                "attempt",
+                                "duration_sec",
+                                "error",
+                                "last_event_ts",
+                            ]
+                        ].copy()
+                        edited = st.data_editor(
+                            editable_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            key="triage_failed_editor",
+                            column_config={"selected": st.column_config.CheckboxColumn("selected", default=True)},
+                            disabled=[
+                                "url",
+                                "normalized_reason",
+                                "failure_reason",
+                                "http_status",
+                                "fetch_mode",
+                                "attempt",
+                                "duration_sec",
+                                "error",
+                                "last_event_ts",
+                            ],
                         )
-                        store.set_pages(st.session_state["site_id"], st.session_state["run_id"], updated_pages)
-                        store.set_status(
-                            st.session_state["site_id"],
-                            st.session_state["run_id"],
-                            {
-                                **status,
-                                "success": sum(1 for p in updated_pages if str(p.get("status") or "").lower() == "success"),
-                                "failed": sum(1 for p in updated_pages if str(p.get("status") or "").lower() == "failed"),
-                                "updated_at": datetime.now(timezone.utc).isoformat(),
-                            },
+                        selected_urls = edited[edited["selected"] == True]["url"].astype(str).tolist()  # noqa: E712
+                        selected_reason_for_group = st.selectbox(
+                            "Retry by failure type",
+                            options=reason_options,
+                            index=0 if reason_options else None,
+                            key="triage_retry_reason",
                         )
-                        st.success("Tavily fallback retry completed.")
-                        st.json(summary)
-                        st.rerun()
-                    if not tavily_enabled:
-                        st.info("Set `TAVILY_API_KEY` in Settings to enable Tavily fallback retries.")
+                        retry_cols = st.columns([1.2, 1.2, 1.2, 1.2, 2.2])
+                        tavily_enabled = bool(st.session_state.get("tavily_api_key"))
+                        tavily_depth = retry_cols[4].selectbox("Tavily depth", options=["basic", "advanced"], index=0, key="triage_tavily_depth")
+                        tavily_fmt = retry_cols[4].selectbox("Tavily format", options=["markdown", "text"], index=0, key="triage_tavily_fmt")
 
-                    export_urls_txt = "\n".join(triage_df["url"].astype(str).tolist()) + "\n"
-                    export_csv = triage_df.to_csv(index=False)
-                    export_json = triage_df.to_json(orient="records", indent=2)
-                    e1, e2, e3 = st.columns(3)
-                    e1.download_button(
-                        "Export failed URLs TXT",
-                        data=export_urls_txt,
-                        file_name=f"{st.session_state['run_id']}-failed-urls.txt",
-                        mime="text/plain",
-                        use_container_width=True,
-                    )
-                    e2.download_button(
-                        "Export failed pages CSV",
-                        data=export_csv,
-                        file_name=f"{st.session_state['run_id']}-failed-pages.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-                    e3.download_button(
-                        "Export failures JSON",
-                        data=export_json,
-                        file_name=f"{st.session_state['run_id']}-failures.json",
-                        mime="application/json",
-                        use_container_width=True,
-                    )
+                        def _start_retry_run(urls_for_retry: list[str], *, reason_scope: str) -> None:
+                            if not urls_for_retry:
+                                st.warning("No URLs selected for retry.")
+                                return
+                            retry_run_id = _next_retry_run_id(st.session_state["run_id"], st.session_state["site_id"])
+                            retry_urls = [
+                                DiscoveredURL(
+                                    url=url,
+                                    source_sitemap="retry",
+                                    path_category="retry",
+                                    selected=True,
+                                )
+                                for url in urls_for_retry
+                            ]
+                            retry_root = _run_root(st.session_state["site_id"], retry_run_id)
+                            write_json(
+                                retry_root / "retry_source.json",
+                                {
+                                    "source_run_id": st.session_state["run_id"],
+                                    "source_site_id": st.session_state["site_id"],
+                                    "retry_reason_scope": reason_scope,
+                                    "urls": urls_for_retry,
+                                    "created_at": datetime.now(timezone.utc).isoformat(),
+                                },
+                            )
+                            runner.start(
+                                st.session_state["site_id"],
+                                retry_run_id,
+                                retry_urls,
+                                concurrency=int(concurrency),
+                            )
+                            st.session_state["run_id"] = retry_run_id
+                            st.session_state["last_run_by_site"][st.session_state["site_id"]] = retry_run_id
+                            _save_app_state()
+                            st.success(f"Started retry run `{retry_run_id}` with {len(urls_for_retry):,} URL(s).")
+                            st.rerun()
 
-            if autorefresh and run_state in {"running", "pausing", "paused", "initializing"}:
-                time.sleep(1)
-                st.rerun()
+                        if retry_cols[0].button("Retry selected", use_container_width=True):
+                            _start_retry_run(selected_urls, reason_scope="selected")
+                        if retry_cols[1].button("Retry all failed", use_container_width=True):
+                            _start_retry_run(failed_df["url"].astype(str).tolist(), reason_scope="all_failed")
+                        if retry_cols[2].button("Retry by type", use_container_width=True):
+                            urls_for_type = failed_df[failed_df["normalized_reason"] == selected_reason_for_group]["url"].astype(str).tolist()
+                            _start_retry_run(urls_for_type, reason_scope=f"type:{selected_reason_for_group}")
+
+                        tavily_call_count = len(selected_urls)
+                        tavily_unit_cost = float(st.session_state.get("tavily_cost_per_call_usd", 0.0))
+                        est_cost = tavily_call_count * tavily_unit_cost
+                        st.caption(
+                            f"Tavily fallback: selected `{tavily_call_count}` URL(s), "
+                            f"estimated cost `${est_cost:.4f}` @ `${tavily_unit_cost:.4f}`/call."
+                        )
+                        if retry_cols[3].button(
+                            "Retry with Tavily fallback",
+                            disabled=(not tavily_enabled) or tavily_call_count == 0,
+                            use_container_width=True,
+                        ):
+                            run_root = _run_root(st.session_state["site_id"], st.session_state["run_id"])
+                            updated_pages, summary = retry_failed_with_tavily(
+                                run_root=run_root,
+                                pages=list(page_rows_by_url.values()),
+                                tavily_api_key=st.session_state["tavily_api_key"],
+                                extract_depth=tavily_depth,
+                                fmt=tavily_fmt,
+                                target_urls=selected_urls,
+                                source_run_id=st.session_state["run_id"],
+                            )
+                            store.set_pages(st.session_state["site_id"], st.session_state["run_id"], updated_pages)
+                            store.set_status(
+                                st.session_state["site_id"],
+                                st.session_state["run_id"],
+                                {
+                                    **status,
+                                    "success": sum(1 for p in updated_pages if str(p.get("status") or "").lower() == "success"),
+                                    "failed": sum(1 for p in updated_pages if str(p.get("status") or "").lower() == "failed"),
+                                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                                },
+                            )
+                            st.success("Tavily fallback retry completed.")
+                            st.json(summary)
+                            st.rerun()
+                        if not tavily_enabled:
+                            st.info("Set `TAVILY_API_KEY` in Settings to enable Tavily fallback retries.")
+
+                        export_urls_txt = "\n".join(triage_df["url"].astype(str).tolist()) + "\n"
+                        export_csv = triage_df.to_csv(index=False)
+                        export_json = triage_df.to_json(orient="records", indent=2)
+                        e1, e2, e3 = st.columns(3)
+                        e1.download_button(
+                            "Export failed URLs TXT",
+                            data=export_urls_txt,
+                            file_name=f"{st.session_state['run_id']}-failed-urls.txt",
+                            mime="text/plain",
+                            use_container_width=True,
+                        )
+                        e2.download_button(
+                            "Export failed pages CSV",
+                            data=export_csv,
+                            file_name=f"{st.session_state['run_id']}-failed-pages.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+                        e3.download_button(
+                            "Export failures JSON",
+                            data=export_json,
+                            file_name=f"{st.session_state['run_id']}-failures.json",
+                            mime="application/json",
+                            use_container_width=True,
+                        )
+
+            _schedule_live_refresh(
+                key="scrape_live_autorefresh_tick",
+                enabled=autorefresh,
+                active=run_state in {"running", "pausing", "paused", "initializing"},
+                interval_seconds=1.0,
+            )
         else:
             st.subheader("Run Health")
             k1, k2, k3, k4 = st.columns(4)
@@ -2038,21 +2145,118 @@ with tabs[4]:
 
     if cleanup_site_id and cleanup_run_id:
         root = _run_root(cleanup_site_id, cleanup_run_id)
-        cleanup_preview_param = str(st.query_params.get("cleanup_preview", "") or "").strip()
-        if cleanup_preview_param:
-            preview_path = Path(unquote(cleanup_preview_param))
-            st.subheader("Direct Preview")
-            st.caption(f"File: `{preview_path}`")
-            if preview_path.exists():
-                st.markdown(preview_path.read_text(encoding="utf-8"))
-            else:
-                st.error("Preview file not found.")
-            if st.button("Clear Direct Preview"):
-                if "cleanup_preview" in st.query_params:
-                    del st.query_params["cleanup_preview"]
-                st.rerun()
-
         st.subheader("Clean")
+        with st.expander("PDF Documents and Graph Wiki Agent", expanded=False):
+            st.caption("Upload university PDFs, convert with Microsoft MarkItDown through Pi, then build graph-style wiki indexes.")
+            doc_topic_hint = st.text_input(
+                "Document topic hint",
+                value=st.session_state.get("document_topic_hint", "registrar schedules catalog finance admissions"),
+                key="document_topic_hint_input",
+            )
+            st.session_state["document_topic_hint"] = doc_topic_hint
+            uploaded_docs = st.file_uploader(
+                "Upload PDFs or office documents",
+                type=["pdf", "docx", "pptx", "xlsx", "xls", "html", "txt", "csv", "json", "xml"],
+                accept_multiple_files=True,
+                key="document_wiki_uploads",
+            )
+            upload_dir = root / "sources" / "pdf_uploads"
+            saved_paths: list[str] = []
+            if uploaded_docs:
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                for uploaded in uploaded_docs:
+                    target = upload_dir / _safe_uploaded_filename(uploaded.name)
+                    target.write_bytes(uploaded.getbuffer())
+                    saved_paths.append(str(target))
+                st.success(f"Saved {len(saved_paths)} uploaded document(s) to `{upload_dir}`.")
+
+            if not st.session_state.get("tmux_binary"):
+                st.session_state["tmux_binary"] = _detect_tmux_binary()
+            if not st.session_state.get("pi_binary"):
+                st.session_state["pi_binary"] = _detect_pi_binary()
+            doc_tmux_name = st.text_input(
+                "Document agent tmux session",
+                value=st.session_state.get("document_wiki_tmux_session", "pi-document-wiki"),
+                key="document_wiki_tmux_session_input",
+            )
+            st.session_state["document_wiki_tmux_session"] = doc_tmux_name
+            tmux_bin = st.session_state.get("tmux_binary", "").strip() or None
+            tmux_available = tmux_runner.available(tmux_bin=tmux_bin)
+            doc_tmux_exists = tmux_available and tmux_runner.session_exists(doc_tmux_name, tmux_bin=tmux_bin)
+            instruction_path = root / "document_wiki_agent_task.md"
+            if st.button("Build Document Wiki Agent Task"):
+                source_dir = upload_dir
+                task = f"""# Document Wiki Ingest Task
+
+Use the Pi skill at:
+`{DOCUMENT_WIKI_SKILL_PATH}`
+
+## Inputs
+
+- run_root: `{root}`
+- source_dir: `{source_dir}`
+- site_url: `{st.session_state.get("site_url", "")}`
+- run_id: `{cleanup_run_id}`
+- topic_hint: `{doc_topic_hint}`
+
+## Required work
+
+1. Read the skill file exactly.
+2. Use Microsoft MarkItDown to convert every supported document in `source_dir` to markdown.
+3. Write converted markdown and metadata under `{root / "document_ingest"}`.
+4. Build or update graph-style wiki artifacts under `{root / "wiki"}`:
+   - `index.md`
+   - `graph.json`
+   - `subwikis/<topic>/index.md`
+   - `subwikis/<topic>/pages/*.md`
+5. Write a completion report to `{root / "document_ingest" / "report.md"}`.
+
+If MarkItDown is missing or Python is too old, write a blocker report and stop cleanly.
+"""
+                instruction_path.write_text(task, encoding="utf-8")
+                st.success(f"Task written: `{instruction_path}`")
+                st.code(task, language="markdown")
+
+            doc_cols = st.columns([1, 1, 3])
+            if doc_cols[0].button("Start Document Wiki Agent", disabled=doc_tmux_exists or not tmux_available):
+                if not instruction_path.exists():
+                    st.warning("Build the document wiki task first.")
+                else:
+                    pi_bin = st.session_state.get("pi_binary", "").strip() or "pi"
+                    res = tmux_runner.start_shell(doc_tmux_name, str(ROOT), tmux_bin=tmux_bin)
+                    if not res.get("ok"):
+                        st.error(res.get("error", "Failed to start document wiki agent."))
+                    else:
+                        tmux_runner.send_line(doc_tmux_name, pi_bin, tmux_bin=tmux_bin)
+                        time.sleep(0.8)
+                        tmux_runner.send_line(
+                            doc_tmux_name,
+                            f"Read and execute the full task from this file: {instruction_path}",
+                            tmux_bin=tmux_bin,
+                        )
+                        st.success("Document wiki agent started.")
+            if doc_cols[1].button("Stop Document Agent", disabled=not doc_tmux_exists):
+                res = tmux_runner.kill(doc_tmux_name, tmux_bin=tmux_bin)
+                if not res.get("ok"):
+                    st.error(res.get("error", "Failed to stop document agent."))
+                else:
+                    st.warning("Document agent stopped.")
+                    st.rerun()
+            if not tmux_available:
+                doc_cols[2].warning("tmux is not available. Set tmux path in URL scoring advanced settings.")
+            elif doc_tmux_exists:
+                st.caption("Document agent console")
+                st.code(tmux_runner.capture(doc_tmux_name, lines=220, tmux_bin=tmux_bin), language="text")
+            else:
+                report_path = root / "document_ingest" / "report.md"
+                graph_path = root / "wiki" / "graph.json"
+                if report_path.exists():
+                    st.caption(f"Latest report: `{report_path}`")
+                    st.markdown(report_path.read_text(encoding="utf-8", errors="replace")[:4000])
+                if graph_path.exists():
+                    st.caption(f"Wiki graph: `{graph_path}`")
+                    st.json(read_json(graph_path, {}))
+
         provider_label = st.selectbox(
             "Cleanup provider",
             options=["OpenRouter recommended", "Ollama local"],
@@ -2164,7 +2368,9 @@ with tabs[4]:
                 openrouter_api_key=st.session_state.get("openrouter_api_key", "").strip(),
             )
             st.success("Cleanup resume requested.")
-        auto_refresh_cleanup = st.checkbox("Auto-refresh queue", value=True)
+        auto_refresh_cleanup = st.checkbox("Auto-refresh queue", value=False)
+        if auto_refresh_cleanup and st_autorefresh is None:
+            st.caption("Install `streamlit-autorefresh` to enable this without blocking. Use Refresh for now.")
 
         with st.expander("Reset Cleanup (Start From Scratch)", expanded=False):
             st.warning("This clears cleanup artifacts for the current run only. Scraped source markdown/HTML is kept.")
@@ -2307,11 +2513,12 @@ with tabs[4]:
                 run_id=st.session_state.get("run_id", ""),
             )
 
-        if auto_refresh_cleanup and cleanup_status and cleanup_status.get("state") == "running":
-            import time
-
-            time.sleep(1.5)
-            st.rerun()
+        _schedule_live_refresh(
+            key="cleanup_live_autorefresh_tick",
+            enabled=auto_refresh_cleanup,
+            active=bool(cleanup_status and cleanup_status.get("state") == "running"),
+            interval_seconds=1.5,
+        )
     else:
         st.info("Complete a scrape run first.")
 

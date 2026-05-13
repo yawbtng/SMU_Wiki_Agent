@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
@@ -12,6 +14,7 @@ import requests
 from .content_extract import extract_content
 from .failure_classifier import classify_failure, to_failure_record
 from .models import DiscoveredURL, PageResult
+from .run_persistence import read_page_states, upsert_page_state, write_run_status
 from .state import RunStateStore
 from .storage import ensure_run_dirs, write_json
 
@@ -72,6 +75,88 @@ class ScrapeRunner:
     def cancel(self, site_id: str, run_id: str) -> None:
         self.state.set_cancel(site_id, run_id, True)
 
+    def pause(self, site_id: str, run_id: str) -> None:
+        self.state.set_pause(site_id, run_id, True)
+        status = self.state.get_status(site_id, run_id)
+        if status:
+            if str(status.get("state") or "").lower() not in {"cancelled", "completed", "failed"}:
+                running = int(status.get("running") or 0)
+                status["state"] = "pausing" if running > 0 else "paused"
+                self.state.set_status(site_id, run_id, status)
+        self.state.push_event(
+            site_id,
+            run_id,
+            {"ts": _utc_now_iso(), "event": "run_pause_requested", "status": "pausing", "url": None},
+        )
+
+    def unpause(self, site_id: str, run_id: str) -> None:
+        self.state.set_pause(site_id, run_id, False)
+        status = self.state.get_status(site_id, run_id)
+        if status:
+            if str(status.get("state") or "").lower() in {"paused", "pausing"}:
+                status["state"] = "running"
+                self.state.set_status(site_id, run_id, status)
+        self.state.push_event(
+            site_id,
+            run_id,
+            {"ts": _utc_now_iso(), "event": "run_unpaused", "status": "running", "url": None},
+        )
+
+    def resume(self, site_id: str, run_id: str, concurrency: int = 4) -> bool:
+        key = self._run_key(site_id, run_id)
+        thread = self._threads.get(key)
+        if thread is not None and thread.is_alive():
+            self.unpause(site_id, run_id)
+            return False
+
+        run_root = self.base_data_dir / "sites" / site_id / run_id
+        selected_urls_path = run_root / "selected_urls.json"
+        if not selected_urls_path.exists():
+            self.unpause(site_id, run_id)
+            return False
+        try:
+            raw = json.loads(selected_urls_path.read_text(encoding="utf-8"))
+        except Exception:
+            self.unpause(site_id, run_id)
+            return False
+
+        urls: list[DiscoveredURL] = []
+        for row in raw:
+            if not isinstance(row, dict):
+                continue
+            urls.append(
+                DiscoveredURL(
+                    url=str(row.get("url") or ""),
+                    source_sitemap=str(row.get("source_sitemap") or ""),
+                    lastmod=row.get("lastmod"),
+                    path_category=str(row.get("path_category") or "other"),
+                    content_type_guess=str(row.get("content_type_guess") or "html"),
+                    excluded_reason=row.get("excluded_reason"),
+                    selected=bool(row.get("selected", True)),
+                )
+            )
+
+        if not urls:
+            self.unpause(site_id, run_id)
+            return False
+
+        pages = self.state.get_pages(site_id, run_id) or read_page_states(run_root)
+        pages_by_url = {str(p.get("url") or ""): p for p in pages if isinstance(p, dict)}
+        unfinished = 0
+        for item in urls:
+            page = pages_by_url.get(item.url, {})
+            page_status = str(page.get("status") or "")
+            if page_status != "success":
+                unfinished += 1
+        if unfinished <= 0:
+            self.unpause(site_id, run_id)
+            return False
+
+        self.state.set_cancel(site_id, run_id, False)
+        self.state.set_pause(site_id, run_id, False)
+        self.start(site_id, run_id, urls, concurrency=concurrency)
+        return True
+
     def _fetch_with_mode(self, mode: str, url: str) -> Any:
         if mode == "fetcher" and FetcherSession is not None:
             with FetcherSession(timeout=20, retries=2) as session:
@@ -125,19 +210,45 @@ class ScrapeRunner:
                     current_url = row.get("url")
             status.update(counts)
             status["current_url"] = current_url
+            if str(status.get("state") or "").lower() not in {"cancelled", "completed", "failed"}:
+                if self.state.get_pause(site_id, run_id):
+                    status["state"] = "pausing" if counts["running"] > 0 else "paused"
+                elif str(status.get("state") or "").lower() in {"paused", "pausing", "initializing"}:
+                    status["state"] = "running"
             self.state.set_pages(site_id, run_id, _pages_snapshot_locked())
             self.state.set_status(site_id, run_id, status.copy())
+            write_run_status(run_root, status.copy())
+            for page in _pages_snapshot_locked():
+                upsert_page_state(run_root, page)
 
+        existing_pages = {
+            str(page.get("url") or ""): page
+            for page in (self.state.get_pages(site_id, run_id) or read_page_states(run_root))
+            if isinstance(page, dict) and page.get("url")
+        }
+        initial_queue_urls: list[str] = []
         for item in selected_urls:
-            pages_by_url[item.url] = PageResult(
-                url=item.url,
-                status="queued",
-                fetch_mode="fetcher",
-                worker_id=None,
-                attempt=0,
-                started_at=None,
-                finished_at=None,
-            ).to_dict()
+            existing = existing_pages.get(item.url)
+            if existing and str(existing.get("status") or "").lower() == "success":
+                pages_by_url[item.url] = existing.copy()
+                continue
+            if existing and str(existing.get("status") or "").lower() in {"queued", "cancelled", "failed", "running"}:
+                page = existing.copy()
+                page["status"] = "queued"
+                page["worker_id"] = None
+                page["finished_at"] = None
+                pages_by_url[item.url] = page
+            else:
+                pages_by_url[item.url] = PageResult(
+                    url=item.url,
+                    status="queued",
+                    fetch_mode="fetcher",
+                    worker_id=None,
+                    attempt=0,
+                    started_at=None,
+                    finished_at=None,
+                ).to_dict()
+            initial_queue_urls.append(item.url)
             self.state.push_event(
                 site_id,
                 run_id,
@@ -157,13 +268,19 @@ class ScrapeRunner:
 
         work_queue: Queue[DiscoveredURL] = Queue()
         for item in selected_urls:
-            work_queue.put(item)
+            if item.url in initial_queue_urls:
+                work_queue.put(item)
 
         def _worker(idx: int) -> None:
             worker_id = f"worker-{idx + 1}"
             while True:
                 if self.state.get_cancel(site_id, run_id):
                     break
+                if self.state.get_pause(site_id, run_id):
+                    with status_lock:
+                        _set_state_locked()
+                    time.sleep(0.1)
+                    continue
                 try:
                     item = work_queue.get_nowait()
                 except Empty:
