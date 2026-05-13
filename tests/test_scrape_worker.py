@@ -4,7 +4,7 @@ import threading
 import time
 
 from src.scrape_planner.models import DiscoveredURL
-from src.scrape_planner.scrape_worker import ScrapeRunner
+from src.scrape_planner.scrape_worker import ScrapeRunner, _extract_response_parts
 from src.scrape_planner.state import RunStateStore
 
 
@@ -15,6 +15,13 @@ class _FakeResponse:
         self.headers = {"content-type": content_type}
 
 
+class _FakeScraplingResponse:
+    status = 200
+    text = "None"
+    body = "<html>scrapling body</html>"
+    headers = {"content-type": "text/html; charset=utf-8"}
+
+
 def _make_runner(tmp_path: Path) -> tuple[ScrapeRunner, RunStateStore]:
     state = RunStateStore(redis_url="redis://127.0.0.1:0/0")
     return ScrapeRunner(state=state, base_data_dir=tmp_path), state
@@ -22,6 +29,14 @@ def _make_runner(tmp_path: Path) -> tuple[ScrapeRunner, RunStateStore]:
 
 def _selected_urls(*urls: str) -> list[DiscoveredURL]:
     return [DiscoveredURL(url=url, source_sitemap="https://example.com/sitemap.xml", selected=True) for url in urls]
+
+
+def test_extract_response_parts_supports_scrapling_response_shape():
+    status, content_type, html = _extract_response_parts(_FakeScraplingResponse())
+
+    assert status == 200
+    assert content_type == "text/html; charset=utf-8"
+    assert html == "<html>scrapling body</html>"
 
 
 def test_execute_success_path(monkeypatch, tmp_path: Path):
@@ -139,13 +154,15 @@ def test_cancel_mid_run(monkeypatch, tmp_path: Path):
         "site-a",
         "run-5",
         _selected_urls("https://example.com/1", "https://example.com/2"),
+        concurrency=1,
     )
     status = state.get_status("site-a", "run-5")
     pages = state.get_pages("site-a", "run-5")
 
     assert status["state"] == "cancelled"
     assert status["success"] == 1
-    assert len(pages) == 1
+    assert len(pages) == 2
+    assert [page["status"] for page in pages] == ["success", "cancelled"]
 
 
 def test_pause_then_unpause_blocks_new_queue_items(monkeypatch, tmp_path: Path):

@@ -19,11 +19,11 @@ from .state import RunStateStore
 from .storage import ensure_run_dirs, write_json
 
 try:
-    from scrapling.fetchers import DynamicSession, FetcherSession, StealthySession
+    from scrapling.fetchers import Fetcher, PlayWrightFetcher, StealthyFetcher
 except Exception:  # pragma: no cover - optional import
-    DynamicSession = None
-    FetcherSession = None
-    StealthySession = None
+    Fetcher = None
+    PlayWrightFetcher = None
+    StealthyFetcher = None
 
 
 def _slug_from_url(url: str) -> str:
@@ -44,13 +44,26 @@ def _duration_ms(start_iso: str | None) -> int:
         return 0
 
 
+def _response_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore")
+    text = str(value)
+    return None if text == "None" else text
+
+
 def _extract_response_parts(resp: Any) -> tuple[int | None, str | None, str]:
     status = getattr(resp, "status_code", None)
+    if status is None:
+        status = getattr(resp, "status", None)
     headers = getattr(resp, "headers", None) or {}
     content_type = headers.get("content-type") if isinstance(headers, dict) else None
-    html = getattr(resp, "text", None)
+    html = _response_text(getattr(resp, "text", None))
+    if html is None and hasattr(resp, "body"):
+        html = _response_text(resp.body)
     if html is None and hasattr(resp, "content"):
-        html = resp.content.decode("utf-8", errors="ignore")
+        html = _response_text(resp.content)
     return status, content_type, html or ""
 
 
@@ -158,15 +171,12 @@ class ScrapeRunner:
         return True
 
     def _fetch_with_mode(self, mode: str, url: str) -> Any:
-        if mode == "fetcher" and FetcherSession is not None:
-            with FetcherSession(timeout=20, retries=2) as session:
-                return session.get(url)
-        if mode == "dynamic" and DynamicSession is not None:
-            with DynamicSession(headless=True, timeout=30000) as session:
-                return session.fetch(url)
-        if mode == "stealthy" and StealthySession is not None:
-            with StealthySession(headless=True, timeout=30000) as session:
-                return session.fetch(url)
+        if mode == "fetcher" and Fetcher is not None:
+            return Fetcher.get(url, timeout=20, retries=2)
+        if mode == "dynamic" and PlayWrightFetcher is not None:
+            return PlayWrightFetcher.fetch(url, headless=True, timeout=30000, network_idle=True)
+        if mode == "stealthy" and StealthyFetcher is not None:
+            return StealthyFetcher.fetch(url, headless=True, timeout=30000, network_idle=True)
         return requests.get(url, timeout=20)
 
     def _execute(self, site_id: str, run_id: str, urls: list[DiscoveredURL], concurrency: int = 4) -> None:
