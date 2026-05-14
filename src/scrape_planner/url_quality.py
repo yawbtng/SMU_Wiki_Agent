@@ -7,7 +7,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 
-HIGH_VALUE_PATTERNS = (
+DEFAULT_HIGH_VALUE_TERMS = (
     "admission",
     "academics",
     "catalog",
@@ -42,7 +42,7 @@ HIGH_VALUE_PATTERNS = (
     "undergraduate",
 )
 
-SPAMMY_PATTERNS = (
+DEFAULT_SPAMMY_TERMS = (
     "search",
     "tag/",
     "category/",
@@ -70,7 +70,7 @@ SPAMMY_PATTERNS = (
     "annualreport",
 )
 
-DATED_PATTERNS = (
+DEFAULT_DATED_PATTERNS = (
     r"/20\d{2}/\d{2}/\d{2}/",
     r"/news/\d{4}/\d{2}",
     r"/calendar/\d{4}/\d{2}",
@@ -79,6 +79,82 @@ DATED_PATTERNS = (
     r"/course-schedule/(?:fall|spring)-20\d{2}",
     r"/crime-log/",
 )
+
+
+def _coerce_terms(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
+    if isinstance(value, str):
+        terms = _split_terms(value)
+    elif isinstance(value, (list, tuple)):
+        terms = tuple(str(term).strip().lower() for term in value if str(term).strip())
+    else:
+        terms = ()
+    return terms or default
+
+
+def _coerce_patterns(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
+    if isinstance(value, str):
+        patterns = tuple(line.strip() for line in value.splitlines() if line.strip())
+    elif isinstance(value, (list, tuple)):
+        patterns = tuple(str(pattern).strip() for pattern in value if str(pattern).strip())
+    else:
+        patterns = ()
+    return patterns or default
+
+
+@dataclass(frozen=True)
+class UrlScoringProfile:
+    high_value_terms: tuple[str, ...] = DEFAULT_HIGH_VALUE_TERMS
+    spammy_terms: tuple[str, ...] = DEFAULT_SPAMMY_TERMS
+    dated_patterns: tuple[str, ...] = DEFAULT_DATED_PATTERNS
+    base_student_value: int = 45
+    base_scrape_value: int = 55
+    high_value_student_boost: int = 30
+    high_value_scrape_boost: int = 15
+    spammy_student_penalty: int = 35
+    spammy_scrape_penalty: int = 25
+    dated_student_penalty: int = 25
+    dated_scrape_penalty: int = 20
+    pdf_student_boost: int = 12
+    pdf_scrape_boost: int = 8
+    manual_student_boost: int = 8
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "UrlScoringProfile":
+        data = data if isinstance(data, dict) else {}
+        return cls(
+            high_value_terms=_coerce_terms(data.get("high_value_terms"), DEFAULT_HIGH_VALUE_TERMS),
+            spammy_terms=_coerce_terms(data.get("spammy_terms"), DEFAULT_SPAMMY_TERMS),
+            dated_patterns=_coerce_patterns(data.get("dated_patterns"), DEFAULT_DATED_PATTERNS),
+            base_student_value=int(data.get("base_student_value", 45) or 45),
+            base_scrape_value=int(data.get("base_scrape_value", 55) or 55),
+            high_value_student_boost=int(data.get("high_value_student_boost", 30) or 30),
+            high_value_scrape_boost=int(data.get("high_value_scrape_boost", 15) or 15),
+            spammy_student_penalty=int(data.get("spammy_student_penalty", 35) or 35),
+            spammy_scrape_penalty=int(data.get("spammy_scrape_penalty", 25) or 25),
+            dated_student_penalty=int(data.get("dated_student_penalty", 25) or 25),
+            dated_scrape_penalty=int(data.get("dated_scrape_penalty", 20) or 20),
+            pdf_student_boost=int(data.get("pdf_student_boost", 12) or 12),
+            pdf_scrape_boost=int(data.get("pdf_scrape_boost", 8) or 8),
+            manual_student_boost=int(data.get("manual_student_boost", 8) or 8),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "high_value_terms": list(self.high_value_terms),
+            "spammy_terms": list(self.spammy_terms),
+            "dated_patterns": list(self.dated_patterns),
+            "base_student_value": self.base_student_value,
+            "base_scrape_value": self.base_scrape_value,
+            "high_value_student_boost": self.high_value_student_boost,
+            "high_value_scrape_boost": self.high_value_scrape_boost,
+            "spammy_student_penalty": self.spammy_student_penalty,
+            "spammy_scrape_penalty": self.spammy_scrape_penalty,
+            "dated_student_penalty": self.dated_student_penalty,
+            "dated_scrape_penalty": self.dated_scrape_penalty,
+            "pdf_student_boost": self.pdf_student_boost,
+            "pdf_scrape_boost": self.pdf_scrape_boost,
+            "manual_student_boost": self.manual_student_boost,
+        }
 
 
 @dataclass(frozen=True)
@@ -127,36 +203,42 @@ def _freshness_score(lastmod: Any, target_year: int) -> int:
     return 35
 
 
-def score_url_row(row: dict[str, Any], *, target_year: int | None = None) -> dict[str, Any]:
+def score_url_row(
+    row: dict[str, Any],
+    *,
+    target_year: int | None = None,
+    profile: UrlScoringProfile | None = None,
+) -> dict[str, Any]:
     target_year = target_year or datetime.now(timezone.utc).year
+    profile = profile or UrlScoringProfile()
     url = str(row.get("url") or "")
     blob = _path_blob(url)
     content_guess = str(row.get("content_type_guess") or "").lower()
     is_pdf = urlparse(url).path.lower().endswith(".pdf") or "pdf" in content_guess
 
-    student_value = 45
-    scrape_value = 55
+    student_value = profile.base_student_value
+    scrape_value = profile.base_scrape_value
     source_quality = 80 if ".edu" in host_from_url(url) else 65
     freshness = _freshness_score(row.get("lastmod"), target_year)
     reasons: list[str] = []
 
-    if _contains_any(blob, HIGH_VALUE_PATTERNS):
-        student_value += 30
-        scrape_value += 15
+    if _contains_any(blob, profile.high_value_terms):
+        student_value += profile.high_value_student_boost
+        scrape_value += profile.high_value_scrape_boost
         reasons.append("student info")
     if is_pdf:
-        student_value += 12
-        scrape_value += 8
+        student_value += profile.pdf_student_boost
+        scrape_value += profile.pdf_scrape_boost
         reasons.append("pdf/source document")
-    if _contains_any(blob, SPAMMY_PATTERNS):
-        student_value -= 35
-        scrape_value -= 25
+    if _contains_any(blob, profile.spammy_terms):
+        student_value -= profile.spammy_student_penalty
+        scrape_value -= profile.spammy_scrape_penalty
         reasons.append("spammy/noisy path")
-    if any(re.search(pattern, blob, re.IGNORECASE) for pattern in DATED_PATTERNS):
+    if any(re.search(pattern, blob, re.IGNORECASE) for pattern in profile.dated_patterns):
         years = [int(year) for year in re.findall(r"20\d{2}", blob)]
         if not years or min(years) < target_year - 1:
-            student_value -= 25
-            scrape_value -= 20
+            student_value -= profile.dated_student_penalty
+            scrape_value -= profile.dated_scrape_penalty
             freshness = min(freshness, 35)
             reasons.append("dated archive")
 
@@ -165,7 +247,7 @@ def score_url_row(row: dict[str, Any], *, target_year: int | None = None) -> dic
         scrape_value -= 10
         reasons.append("deep path")
     if row.get("source_sitemap") == "manual":
-        student_value += 8
+        student_value += profile.manual_student_boost
         source_quality += 5
         reasons.append("manual add")
 
@@ -191,7 +273,13 @@ def score_url_row(row: dict[str, Any], *, target_year: int | None = None) -> dic
     }
 
 
-def score_and_filter_rows(rows: list[dict[str, Any]], criteria: UrlCriteria) -> tuple[list[dict[str, Any]], dict[str, int]]:
+def score_and_filter_rows(
+    rows: list[dict[str, Any]],
+    criteria: UrlCriteria,
+    *,
+    profile: UrlScoringProfile | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    profile = profile or UrlScoringProfile()
     include_terms = _split_terms(criteria.include_text)
     exclude_terms = _split_terms(criteria.exclude_text)
     include_hosts = {host.lower() for host in criteria.include_hosts if host}
@@ -202,7 +290,7 @@ def score_and_filter_rows(rows: list[dict[str, Any]], criteria: UrlCriteria) -> 
         if not isinstance(row, dict):
             continue
         counts["total"] += 1
-        quality = score_url_row(row)
+        quality = score_url_row(row, profile=profile)
         blob = _path_blob(quality["url"])
         if include_hosts and quality["host"] not in include_hosts:
             counts["filtered"] += 1

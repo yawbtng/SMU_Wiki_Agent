@@ -47,7 +47,7 @@ from src.scrape_planner.terminal_skill_runner import TerminalSkillRunner
 from src.scrape_planner.tmux_runner import TmuxRunner
 from src.scrape_planner.ui_claude_plan import render_claude_plan_section
 from src.scrape_planner.ui_navigation import WORKFLOW_TABS
-from src.scrape_planner.url_quality import UrlCriteria, score_and_filter_rows
+from src.scrape_planner.url_quality import UrlCriteria, UrlScoringProfile, score_and_filter_rows
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT / "data"
@@ -942,6 +942,8 @@ with tabs[2]:
         pdf_dir = site_root / "sources" / "pdf_uploads"
         pdf_manifest_path = site_root / "sources" / "pdf_manifest.json"
         score_file = site_root / "selected_urls_llm.json"
+        profile_path = site_root / "url_scoring_profile.json"
+        scoring_profile = UrlScoringProfile.from_dict(read_json(profile_path, {}))
         rows = [row for row in st.session_state.get("discovered", []) if isinstance(row, dict)]
 
         st.subheader("Choose URLs")
@@ -1010,6 +1012,53 @@ with tabs[2]:
                 with st.expander("PDF source list", expanded=False):
                     st.dataframe(pd.DataFrame(pdf_manifest), use_container_width=True, hide_index=True)
 
+        with st.expander("Scoring rules for this university", expanded=False):
+            st.caption("Saved per workspace. Tune these terms when a university uses different page names or noisy sections.")
+            with st.form("url_scoring_profile_form"):
+                valuable_terms = st.text_area(
+                    "Valuable URL terms",
+                    value="\n".join(scoring_profile.high_value_terms),
+                    height=150,
+                    help="One term per line or comma-separated. Matching URLs get boosted.",
+                )
+                spammy_terms = st.text_area(
+                    "Spam/noise URL terms",
+                    value="\n".join(scoring_profile.spammy_terms),
+                    height=130,
+                    help="Matching URLs get penalized.",
+                )
+                dated_patterns = st.text_area(
+                    "Dated/archive regex rules",
+                    value="\n".join(scoring_profile.dated_patterns),
+                    height=120,
+                    help="Regex patterns for old archive-style URLs. Older years are penalized.",
+                )
+                w1, w2, w3 = st.columns(3)
+                high_boost = int(w1.number_input("Valuable boost", min_value=0, max_value=80, value=scoring_profile.high_value_student_boost, step=5))
+                spam_penalty = int(w2.number_input("Spam penalty", min_value=0, max_value=80, value=scoring_profile.spammy_student_penalty, step=5))
+                manual_boost = int(w3.number_input("Manual link boost", min_value=0, max_value=40, value=scoring_profile.manual_student_boost, step=2))
+                save_rules, reset_rules = st.columns([1, 1])
+                if save_rules.form_submit_button("Save scoring rules", type="primary", use_container_width=True):
+                    updated_profile = UrlScoringProfile.from_dict(
+                        {
+                            **scoring_profile.to_dict(),
+                            "high_value_terms": valuable_terms,
+                            "spammy_terms": spammy_terms,
+                            "dated_patterns": dated_patterns,
+                            "high_value_student_boost": high_boost,
+                            "spammy_student_penalty": spam_penalty,
+                            "manual_student_boost": manual_boost,
+                        }
+                    )
+                    write_json(profile_path, updated_profile.to_dict())
+                    st.success("Saved URL scoring rules for this workspace.")
+                    st.rerun()
+                if reset_rules.form_submit_button("Reset to defaults", use_container_width=True):
+                    write_json(profile_path, UrlScoringProfile().to_dict())
+                    st.warning("Reset URL scoring rules to defaults.")
+                    st.rerun()
+            scoring_profile = UrlScoringProfile.from_dict(read_json(profile_path, scoring_profile.to_dict()))
+
         if not rows:
             st.info("Discover URLs or add manual links to start selection.")
         else:
@@ -1057,7 +1106,7 @@ with tabs[2]:
                     threshold=threshold,
                     include_pdfs=include_pdfs,
                 )
-                scored_rows, counts = score_and_filter_rows(rows, criteria)
+                scored_rows, counts = score_and_filter_rows(rows, criteria, profile=scoring_profile)
                 scored_df = pd.DataFrame(scored_rows)
                 if scored_df.empty:
                     st.warning("No URLs match the current criteria.")
@@ -1076,6 +1125,7 @@ with tabs[2]:
                             "max_urls": max_urls,
                             "include_pdfs": include_pdfs,
                         },
+                        "scoring_profile": scoring_profile.to_dict(),
                         "scored_urls": scored_df[[col for col in ["url", "score", "reason", "student_value", "freshness", "source_quality", "scrape_value", "host", "is_pdf"] if col in scored_df.columns]].to_dict("records"),
                         "selected_urls": selected_df[[col for col in ["url", "score", "reason"] if col in selected_df.columns]].rename(columns={"score": "priority"}).to_dict("records"),
                     }
