@@ -1049,6 +1049,9 @@ with tabs[2]:
                     st.session_state["choose_include_pdfs"] = include_pdfs
                     apply_now = f4.button("Apply", type="primary", use_container_width=True)
                     f5, f6 = st.columns([1, 1])
+                    if not st.session_state.get("choose_include_text_prefilled"):
+                        st.session_state["choose_include_text"] = ", ".join(scoring_profile.high_value_terms)
+                        st.session_state["choose_include_text_prefilled"] = True
                     include_text = f5.text_input(
                         "Must contain",
                         value=st.session_state.get("choose_include_text", ""),
