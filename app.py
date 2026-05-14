@@ -848,41 +848,6 @@ with tabs[0]:
             _save_app_state()
             st.success(f"Active site updated: {normalized}")
 
-    with st.expander("Manage workspaces", expanded=False):
-        st.caption("Workspace creation/deletion is hidden here so the active workflow stays focused.")
-        with st.form("new_workspace_form_inside_active", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            ws_name = c1.text_input("University Name", placeholder="Southern Methodist University")
-            ws_url = c2.text_input("Website URL", placeholder="https://www.smu.edu")
-            submitted = st.form_submit_button("+ Add Workspace")
-            if submitted and ws_name.strip() and ws_url.strip():
-                normalized = normalize_site_url(ws_url.strip())
-                ws_id = _site_slug(normalized)
-                new_ws = {"id": ws_id, "name": ws_name.strip(), "url": normalized}
-                existing = [w for w in st.session_state["workspaces"] if w.get("id") != ws_id]
-                st.session_state["workspaces"] = [new_ws] + existing
-                (DATA_ROOT / "sites" / ws_id).mkdir(parents=True, exist_ok=True)
-                _save_app_state()
-                st.rerun()
-        for ws in st.session_state.get("workspaces", []):
-            with st.container(border=True):
-                st.markdown(f"**{ws.get('name','Unnamed University')}**")
-                st.caption(ws.get("url", ""))
-                c1, c2 = st.columns(2)
-                is_current = ws.get("id") == st.session_state.get("active_workspace_id")
-                if c1.button("Open Workspace" if not is_current else "Current Workspace", key=f"manage_open_ws_{ws.get('id')}", disabled=is_current):
-                    st.session_state["active_workspace_id"] = ws.get("id", "")
-                    st.session_state["site_url"] = ws.get("url", "")
-                    st.session_state["site_id"] = ws.get("id", "")
-                    st.session_state["run_id"] = st.session_state.get("last_run_by_site", {}).get(ws.get("id", ""), "")
-                    _hydrate_site_workspace(st.session_state["site_id"])
-                    _save_app_state()
-                    st.rerun()
-                if c2.button("Delete Workspace", key=f"manage_del_ws_{ws.get('id')}", disabled=is_current):
-                    st.session_state["workspaces"] = [w for w in st.session_state["workspaces"] if w.get("id") != ws.get("id")]
-                    _save_app_state()
-                    st.rerun()
-
 with tabs[1]:
     discovered_path = _discovered_json_path(st.session_state["site_id"])
     discovered_rows_for_summary = st.session_state.get("discovered") or read_json(discovered_path, [])
@@ -1103,6 +1068,87 @@ with tabs[2]:
                     )
                     st.session_state["choose_hosts"] = selected_hosts
 
+                llm_box = st.container(border=True)
+                with llm_box:
+                    llm_cols = st.columns([1.2, 1.2, 1, 1])
+                    llm_model = llm_cols[0].text_input(
+                        "OpenRouter model",
+                        value=st.session_state.get("default_or_model", "deepseek/deepseek-v4-flash"),
+                        key="choose_llm_model",
+                    )
+                    llm_batch_size = int(
+                        llm_cols[1].number_input(
+                            "Batch size",
+                            min_value=25,
+                            max_value=1000,
+                            value=int(st.session_state.get("default_llm_batch_size", 250)),
+                            step=25,
+                            key="choose_llm_batch_size",
+                        )
+                    )
+                    llm_max_urls = int(
+                        llm_cols[2].number_input(
+                            "LLM max URLs",
+                            min_value=1,
+                            max_value=50000,
+                            value=max_urls,
+                            step=50,
+                            key="choose_llm_max_urls",
+                        )
+                    )
+                    run_llm = llm_cols[3].button("LLM choose", type="primary", use_container_width=True)
+                    st.caption("OpenRouter scores every URL with reasons. Local rules below remain a fallback and quick preview.")
+
+                if run_llm:
+                    api_key = st.session_state.get("openrouter_api_key", "").strip() or loaded_env.get("OPENROUTER_API_KEY", "").strip()
+                    if not api_key:
+                        st.error("OpenRouter API key missing. Add it in Settings first.")
+                    else:
+                        with st.spinner(f"OpenRouter is reasoning over {len(rows):,} URLs..."):
+                            llm_payload = choose_top_urls_with_openrouter(
+                                site_url=st.session_state.get("site_url", ""),
+                                discovered_rows=rows,
+                                out_path=score_file,
+                                max_urls=llm_max_urls,
+                                model=llm_model,
+                                api_key=api_key,
+                                batch_size=llm_batch_size,
+                                sleep_between_batches_sec=float(st.session_state.get("default_llm_sleep_sec", 0.0)),
+                            )
+                        if not llm_payload.get("used_openrouter"):
+                            st.error(f"OpenRouter URL reasoning failed: {llm_payload.get('openrouter_error', 'unknown error')}")
+                        else:
+                            llm_threshold = int(llm_payload.get("default_threshold", threshold) or threshold)
+                            score_lookup = {row.get("url"): row for row in llm_payload.get("scored_urls", []) if isinstance(row, dict) and row.get("url")}
+                            merged_rows = []
+                            for row in rows:
+                                url = row.get("url")
+                                score_row = score_lookup.get(url, {})
+                                score = int(score_row.get("score") or 0)
+                                merged_rows.append(
+                                    {
+                                        **row,
+                                        "score": score,
+                                        "reason": score_row.get("reason", ""),
+                                        "student_value": score_row.get("student_value"),
+                                        "freshness": score_row.get("freshness"),
+                                        "source_quality": score_row.get("source_quality"),
+                                        "scrape_value": score_row.get("scrape_value"),
+                                        "selected": score >= llm_threshold,
+                                        "selection_source": "openrouter",
+                                    }
+                                )
+                            scored_llm_df = pd.DataFrame(merged_rows).sort_values("score", ascending=False)
+                            st.session_state["score_threshold"] = llm_threshold
+                            st.session_state["last_selection_payload"] = llm_payload
+                            st.session_state["discovered"] = scored_llm_df.to_dict("records")
+                            st.session_state["selected_df"] = scored_llm_df
+                            write_json(_discovered_json_path(site_id), scored_llm_df.to_dict("records"))
+                            write_json(score_file, llm_payload)
+                            _save_app_state()
+                            st.success(f"OpenRouter selected {int(scored_llm_df['selected'].sum()):,} URL(s) with reasons.")
+                            st.rerun()
+
                 criteria = UrlCriteria(
                     include_text=include_text,
                     exclude_text=exclude_text,
@@ -1111,8 +1157,18 @@ with tabs[2]:
                     threshold=threshold,
                     include_pdfs=include_pdfs,
                 )
-                scored_rows, counts = score_and_filter_rows(rows, criteria, profile=scoring_profile)
-                scored_df = pd.DataFrame(scored_rows)
+                if rows and all(str(row.get("selection_source") or "") == "openrouter" for row in rows):
+                    scored_df = pd.DataFrame(rows).sort_values("score", ascending=False)
+                    counts = {
+                        "total": len(scored_df),
+                        "filtered": 0,
+                        "selected": int(scored_df.get("selected", pd.Series(dtype=bool)).fillna(False).sum()),
+                        "spammy": int((scored_df.get("score", pd.Series(dtype=int)).fillna(0).astype(int) < int(threshold)).sum()),
+                        "pdfs": int(scored_df.get("is_pdf", pd.Series(dtype=bool)).fillna(False).sum()) if "is_pdf" in scored_df.columns else 0,
+                    }
+                else:
+                    scored_rows, counts = score_and_filter_rows(rows, criteria, profile=scoring_profile)
+                    scored_df = pd.DataFrame(scored_rows)
                 if scored_df.empty:
                     st.warning("No URLs match the current criteria.")
                 else:
@@ -1121,7 +1177,7 @@ with tabs[2]:
                     selected_df = scored_df[scored_df["selected"] == True].copy()  # noqa: E712
                     spammy_df = scored_df[(scored_df.get("spammy", False) == True) | (scored_df["selected"] == False)].copy()  # noqa: E712
                     payload = {
-                        "selection_method": "local_rules_choose_urls",
+                        "selection_method": "openrouter_scored" if "selection_source" in scored_df.columns and (scored_df["selection_source"] == "openrouter").any() else "local_rules_choose_urls",
                         "default_threshold": threshold,
                         "criteria": {
                             "include_text": include_text,
