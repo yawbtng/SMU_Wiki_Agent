@@ -47,7 +47,7 @@ from src.scrape_planner.terminal_skill_runner import TerminalSkillRunner
 from src.scrape_planner.tmux_runner import TmuxRunner
 from src.scrape_planner.ui_claude_plan import render_claude_plan_section
 from src.scrape_planner.ui_navigation import WORKFLOW_TABS
-from src.scrape_planner.url_quality import UrlCriteria, UrlScoringProfile, score_and_filter_rows
+from src.scrape_planner.url_quality import UrlCriteria, UrlScoringProfile, score_and_filter_rows, suggest_scoring_profile_from_rows
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT / "data"
@@ -1013,7 +1013,17 @@ with tabs[2]:
                     st.dataframe(pd.DataFrame(pdf_manifest), use_container_width=True, hide_index=True)
 
         with st.expander("Scoring rules for this university", expanded=False):
-            st.caption("Saved per workspace. Tune these terms when a university uses different page names or noisy sections.")
+            st.caption("Saved per workspace. Generate from this university's discovered URLs, then edit as needed.")
+            rule_actions = st.columns([1, 1, 2])
+            if rule_actions[0].button("Generate from sitemap", use_container_width=True, disabled=not rows):
+                generated_profile = suggest_scoring_profile_from_rows(rows, base_profile=scoring_profile)
+                write_json(profile_path, generated_profile.to_dict())
+                st.success("Generated scoring rules from discovered URLs for this workspace.")
+                st.rerun()
+            if rule_actions[1].button("Reset defaults", use_container_width=True):
+                write_json(profile_path, UrlScoringProfile().to_dict())
+                st.warning("Reset URL scoring rules to defaults.")
+                st.rerun()
             with st.form("url_scoring_profile_form"):
                 valuable_terms = st.text_area(
                     "Valuable URL terms",
@@ -1037,8 +1047,7 @@ with tabs[2]:
                 high_boost = int(w1.number_input("Valuable boost", min_value=0, max_value=80, value=scoring_profile.high_value_student_boost, step=5))
                 spam_penalty = int(w2.number_input("Spam penalty", min_value=0, max_value=80, value=scoring_profile.spammy_student_penalty, step=5))
                 manual_boost = int(w3.number_input("Manual link boost", min_value=0, max_value=40, value=scoring_profile.manual_student_boost, step=2))
-                save_rules, reset_rules = st.columns([1, 1])
-                if save_rules.form_submit_button("Save scoring rules", type="primary", use_container_width=True):
+                if st.form_submit_button("Save scoring rules", type="primary", use_container_width=True):
                     updated_profile = UrlScoringProfile.from_dict(
                         {
                             **scoring_profile.to_dict(),
@@ -1052,10 +1061,6 @@ with tabs[2]:
                     )
                     write_json(profile_path, updated_profile.to_dict())
                     st.success("Saved URL scoring rules for this workspace.")
-                    st.rerun()
-                if reset_rules.form_submit_button("Reset to defaults", use_container_width=True):
-                    write_json(profile_path, UrlScoringProfile().to_dict())
-                    st.warning("Reset URL scoring rules to defaults.")
                     st.rerun()
             scoring_profile = UrlScoringProfile.from_dict(read_json(profile_path, scoring_profile.to_dict()))
 
@@ -1086,7 +1091,7 @@ with tabs[2]:
                     )
                     exclude_text = f6.text_input(
                         "Exclude contains",
-                        value=st.session_state.get("choose_exclude_text", "search, login, tag, archive, alumni, giving"),
+                        value=st.session_state.get("choose_exclude_text", ""),
                     )
                     st.session_state["choose_include_text"] = include_text
                     st.session_state["choose_exclude_text"] = exclude_text

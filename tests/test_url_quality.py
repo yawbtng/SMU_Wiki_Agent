@@ -1,4 +1,4 @@
-from src.scrape_planner.url_quality import UrlCriteria, UrlScoringProfile, score_and_filter_rows, score_url_row
+from src.scrape_planner.url_quality import UrlCriteria, UrlScoringProfile, score_and_filter_rows, score_url_row, suggest_scoring_profile_from_rows
 
 
 def test_student_pages_score_above_spammy_archives():
@@ -63,3 +63,26 @@ def test_score_and_filter_uses_custom_profile():
 
     assert counts["selected"] == 1
     assert [row["url"] for row in scored if row["selected"]] == ["https://example.edu/bursar/payment-plans"]
+
+
+def test_suggest_profile_uses_terms_seen_in_discovered_urls():
+    rows = [
+        {"url": "https://college.example.edu/student-accounts/payment-plans"},
+        {"url": "https://college.example.edu/search?q=tuition"},
+        {"url": "https://college.example.edu/tag/scholarships"},
+    ]
+
+    profile = suggest_scoring_profile_from_rows(rows, base_profile=UrlScoringProfile.from_dict({"high_value_terms": ["student-accounts"], "spammy_terms": []}))
+
+    assert "student-accounts" in profile.high_value_terms
+    assert "search" in profile.spammy_terms
+    assert "tag/" in profile.spammy_terms
+
+
+def test_suggest_profile_does_not_force_unseen_default_noise_terms():
+    rows = [{"url": "https://college.example.edu/student-accounts/payment-plans"}]
+
+    profile = suggest_scoring_profile_from_rows(rows, base_profile=UrlScoringProfile.from_dict({"spammy_terms": ["search", "alumni"]}))
+
+    assert "search" not in profile.spammy_terms
+    assert "alumni" not in profile.spammy_terms

@@ -81,14 +81,16 @@ DEFAULT_DATED_PATTERNS = (
 )
 
 
-def _coerce_terms(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
+def _coerce_terms(value: Any, default: tuple[str, ...], *, allow_empty: bool = False) -> tuple[str, ...]:
     if isinstance(value, str):
         terms = _split_terms(value)
     elif isinstance(value, (list, tuple)):
         terms = tuple(str(term).strip().lower() for term in value if str(term).strip())
     else:
         terms = ()
-    return terms or default
+    if terms or allow_empty:
+        return terms
+    return default
 
 
 def _coerce_patterns(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -122,8 +124,8 @@ class UrlScoringProfile:
     def from_dict(cls, data: dict[str, Any] | None) -> "UrlScoringProfile":
         data = data if isinstance(data, dict) else {}
         return cls(
-            high_value_terms=_coerce_terms(data.get("high_value_terms"), DEFAULT_HIGH_VALUE_TERMS),
-            spammy_terms=_coerce_terms(data.get("spammy_terms"), DEFAULT_SPAMMY_TERMS),
+            high_value_terms=_coerce_terms(data.get("high_value_terms"), DEFAULT_HIGH_VALUE_TERMS, allow_empty="high_value_terms" in data),
+            spammy_terms=_coerce_terms(data.get("spammy_terms"), DEFAULT_SPAMMY_TERMS, allow_empty="spammy_terms" in data),
             dated_patterns=_coerce_patterns(data.get("dated_patterns"), DEFAULT_DATED_PATTERNS),
             base_student_value=int(data.get("base_student_value", 45) or 45),
             base_scrape_value=int(data.get("base_scrape_value", 55) or 55),
@@ -182,6 +184,72 @@ def _contains_any(blob: str, terms: tuple[str, ...]) -> bool:
 
 def _split_terms(value: str) -> tuple[str, ...]:
     return tuple(term.strip().lower() for term in re.split(r"[,\n]", value or "") if term.strip())
+
+
+def _path_segments(url: str) -> list[str]:
+    parsed = urlparse(str(url or ""))
+    segments: list[str] = []
+    for raw in parsed.path.split("/"):
+        part = raw.strip().lower()
+        if not part:
+            continue
+        for token in re.split(r"[^a-z0-9-]+", part):
+            token = token.strip("-")
+            if len(token) >= 3:
+                segments.append(token)
+    return segments
+
+
+def _term_seen(rows: list[dict[str, Any]], term: str) -> bool:
+    needle = term.lower().strip()
+    if not needle:
+        return False
+    normalized = needle.strip("/")
+    for row in rows:
+        blob = _path_blob(str(row.get("url") or ""))
+        if needle in blob or normalized in blob:
+            return True
+    return False
+
+
+def suggest_scoring_profile_from_rows(
+    rows: list[dict[str, Any]],
+    *,
+    base_profile: UrlScoringProfile | None = None,
+) -> UrlScoringProfile:
+    base_profile = base_profile or UrlScoringProfile()
+    valid_rows = [row for row in rows if isinstance(row, dict) and row.get("url")]
+    if not valid_rows:
+        return base_profile
+
+    high_terms = [term for term in DEFAULT_HIGH_VALUE_TERMS if _term_seen(valid_rows, term)]
+    spammy_terms = [term for term in DEFAULT_SPAMMY_TERMS if _term_seen(valid_rows, term)]
+
+    segment_counts: dict[str, int] = {}
+    for row in valid_rows:
+        for segment in set(_path_segments(str(row.get("url") or ""))):
+            segment_counts[segment] = segment_counts.get(segment, 0) + 1
+
+    deny_segments = {term.strip("/").lower() for term in DEFAULT_SPAMMY_TERMS}
+    deny_segments.update({"www", "edu", "html", "index", "page", "pages"})
+    inferred_noise = [
+        segment
+        for segment, count in sorted(segment_counts.items(), key=lambda item: (-item[1], item[0]))
+        if count >= max(3, len(valid_rows) // 200) and segment in deny_segments and segment not in spammy_terms
+    ]
+    spammy_terms.extend(inferred_noise)
+
+    # Keep the editor useful: observed terms first, then preserve any custom terms the user already saved.
+    high_terms = list(dict.fromkeys(high_terms + list(base_profile.high_value_terms)))
+    spammy_terms = list(dict.fromkeys(spammy_terms + [term for term in base_profile.spammy_terms if _term_seen(valid_rows, term)]))
+
+    return UrlScoringProfile.from_dict(
+        {
+            **base_profile.to_dict(),
+            "high_value_terms": high_terms or list(base_profile.high_value_terms),
+            "spammy_terms": spammy_terms,
+        }
+    )
 
 
 def _freshness_score(lastmod: Any, target_year: int) -> int:
