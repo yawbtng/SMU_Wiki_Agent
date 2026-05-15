@@ -5,6 +5,12 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from .tracer_dependencies import (
+    StaleEvaluationResult,
+    TracerMaintenanceJobPacket,
+    serialize_job_packet,
+)
+
 _LOCK = Lock()
 
 
@@ -19,7 +25,10 @@ def _write_json_atomic(path: Path, payload: Any) -> None:
 
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(payload, ensure_ascii=True) + "\n"
+    try:
+        line = json.dumps(payload, ensure_ascii=True) + "\n"
+    except TypeError as exc:
+        raise ValueError(f"jsonl payload is not serializable for {path}: {exc}") from exc
     with _LOCK:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
@@ -81,3 +90,62 @@ def read_page_states(run_root: Path) -> list[dict[str, Any]]:
             continue
         pages_by_url[url] = row
     return list(pages_by_url.values())
+
+
+def persist_stale_artifacts_and_packet(
+    run_root: Path,
+    run_id: str,
+    result: StaleEvaluationResult,
+    packet: TracerMaintenanceJobPacket | None,
+) -> dict[str, Any]:
+    stale_snapshot_path = run_root / "stale_dependencies.json"
+    stale_events_path = run_root / "stale_dependencies.jsonl"
+
+    snapshot = {
+        "run_id": run_id,
+        "stale_page_ids": result.stale_page_ids,
+        "stale_count": len(result.stale_page_ids),
+        "transition_count": len(result.transitions),
+        "transitions": [
+            {
+                "source_id": t.source_id,
+                "old_hash": t.old_hash,
+                "new_hash": t.new_hash,
+                "affected_pages": t.affected_pages,
+                "reason": t.reason,
+            }
+            for t in result.transitions
+        ],
+        "errors": [{"code": e.code, "detail": e.detail} for e in result.errors],
+    }
+    _write_json_atomic(stale_snapshot_path, snapshot)
+
+    for transition in result.transitions:
+        _append_jsonl(
+            stale_events_path,
+            {
+                "run_id": run_id,
+                "source_id": transition.source_id,
+                "old_hash": transition.old_hash,
+                "new_hash": transition.new_hash,
+                "affected_pages": transition.affected_pages,
+                "reason": transition.reason,
+            },
+        )
+
+    packet_dir: Path | None = None
+    manifest_path: Path | None = None
+    if packet is not None and packet.stale_page_ids:
+        packet_dir = run_root / "packets" / run_id
+        packet_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = packet_dir / "packet_manifest.json"
+        _write_json_atomic(manifest_path, serialize_job_packet(packet))
+
+    return {
+        "stale_snapshot_path": str(stale_snapshot_path),
+        "stale_events_path": str(stale_events_path),
+        "stale_count": len(result.stale_page_ids),
+        "transition_count": len(result.transitions),
+        "packet_path": str(packet_dir) if packet_dir else None,
+        "packet_manifest_path": str(manifest_path) if manifest_path else None,
+    }

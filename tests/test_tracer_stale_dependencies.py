@@ -96,9 +96,10 @@ def test_job_packet_contract_shape() -> None:
     reverse = {"src_a": ["page-1"]}
 
     result = evaluate_stale_dependencies(previous, current, reverse)
-    packet = build_tracer_maintenance_job_packet(result)
+    packet = build_tracer_maintenance_job_packet("run-legacy", result)
 
     assert packet.packet_type == "tracer_maintenance"
+    assert packet.run_id == "run-legacy"
     assert packet.stale_page_ids == ["page-1"]
     assert len(packet.transitions) == 1
 

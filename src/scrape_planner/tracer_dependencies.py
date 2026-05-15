@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 
@@ -23,10 +24,30 @@ class StaleTransitionRecord:
 
 
 @dataclass(frozen=True)
+class TracerMaintenanceEvidenceRef:
+    source_id: str
+    chunk_id: str
+    path: str
+
+
+@dataclass(frozen=True)
+class TracerMaintenanceTarget:
+    page_id: str
+    reasons: list[Literal["source_hash_changed"]]
+    source_ids: list[str]
+
+
+@dataclass(frozen=True)
 class TracerMaintenanceJobPacket:
     packet_type: Literal["tracer_maintenance"]
+    run_id: str
     stale_page_ids: list[str]
     transitions: list[StaleTransitionRecord]
+    evidence_status: Literal["ok", "missing"]
+    evidence_refs: list[TracerMaintenanceEvidenceRef]
+    targets: list[TracerMaintenanceTarget]
+    instructions: dict[str, Any]
+    expected_outputs: list[str]
 
 
 @dataclass(frozen=True)
@@ -145,9 +166,59 @@ def evaluate_stale_dependencies(
     )
 
 
-def build_tracer_maintenance_job_packet(result: StaleEvaluationResult) -> TracerMaintenanceJobPacket:
+def build_tracer_maintenance_job_packet(
+    run_id: str,
+    result: StaleEvaluationResult,
+    evidence_rows: list[dict[str, Any]] | None = None,
+) -> TracerMaintenanceJobPacket:
+    if not run_id.strip():
+        raise ValueError("run_id is required")
+
+    target_map: dict[str, set[str]] = {page_id: set() for page_id in result.stale_page_ids}
+    for transition in result.transitions:
+        for page_id in transition.affected_pages:
+            if page_id in target_map:
+                target_map[page_id].add(transition.source_id)
+
+    targets = [
+        TracerMaintenanceTarget(
+            page_id=page_id,
+            reasons=[STALE_REASON_SOURCE_HASH_CHANGED],
+            source_ids=sorted(target_map.get(page_id, set())),
+        )
+        for page_id in result.stale_page_ids
+    ]
+
+    evidence_refs: list[TracerMaintenanceEvidenceRef] = []
+    if evidence_rows:
+        for idx, row in enumerate(evidence_rows):
+            source_id = str(row.get("source_id") or "").strip()
+            chunk_id = str(row.get("chunk_id") or "").strip()
+            path = str(row.get("path") or "").strip()
+            if not source_id or not chunk_id or not path:
+                raise ValueError(f"evidence_rows[{idx}] missing required keys: source_id, chunk_id, path")
+            evidence_refs.append(TracerMaintenanceEvidenceRef(source_id=source_id, chunk_id=chunk_id, path=path))
+
     return TracerMaintenanceJobPacket(
         packet_type="tracer_maintenance",
+        run_id=run_id,
         stale_page_ids=result.stale_page_ids,
         transitions=result.transitions,
+        evidence_status="ok" if evidence_refs else "missing",
+        evidence_refs=evidence_refs,
+        targets=targets,
+        instructions={
+            "executor": "agent_or_skill",
+            "action": "refresh_tracer_pages",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        expected_outputs=[
+            "tracer_pages_refreshed",
+            "source_hashes_synced",
+            "run_summary_written",
+        ],
     )
+
+
+def serialize_job_packet(packet: TracerMaintenanceJobPacket) -> dict[str, Any]:
+    return asdict(packet)
