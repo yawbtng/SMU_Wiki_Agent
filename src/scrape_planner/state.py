@@ -5,7 +5,10 @@ import threading
 from collections import defaultdict
 from typing import Any
 
-import redis
+try:
+    import redis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    redis = None
 
 
 class _MemoryStore:
@@ -42,8 +45,10 @@ class _MemoryStore:
 class RunStateStore:
     def __init__(self, redis_url: str = "redis://localhost:6379/0") -> None:
         self._mem = _MemoryStore()
-        self._client: redis.Redis | None = None
+        self._client: "redis.Redis | None" = None
         try:
+            if redis is None:
+                raise RuntimeError("redis dependency unavailable")
             client = redis.Redis.from_url(redis_url, decode_responses=True)
             client.ping()
             self._client = client
