@@ -1,42 +1,70 @@
 # S06: Simple V1 configuration and proof command — UAT
 
 **Milestone:** M001
-**Written:** 2026-05-15T19:07:48.208Z
+**Written:** 2026-05-15T21:34:34.225Z
 
-# UAT — S06 Simple V1 Configuration and Proof Command
+# S06: Simple V1 configuration and proof command — UAT
+
+**Milestone:** M001
+**Written:** 2026-05-15
 
 ## UAT Type
-Integration readiness / contract verification (artifact + command behavior)
+
+- UAT mode: artifact-driven
+- Why this mode is sufficient: S06 is a contract-validation slice whose primary behavior is deterministic inspection of generated artifacts and exit/report semantics.
 
 ## Preconditions
-1. Repository has S01–S05 fixture artifacts available in the expected run-root layout.
-2. `configs/m001_v1.json` exists with explicit maintenance/retrieval/PDF/Zvec options.
-3. Proof entrypoint is available at `scripts/m001_proof.py` and writes JSON + markdown outputs.
 
-## Steps
-1. Run config tests:
-   - `python3 -m unittest tests.test_m001_config_v1 -v`
-2. Run proof command tests:
-   - `python3 -m unittest tests.test_m001_proof_command -v`
-3. Run proof command against pass fixture:
-   - `python3 scripts/m001_proof.py --config configs/m001_v1.json --run-root tests/fixtures/m001_proof/pass_fixture --output-dir tmp/m001-proof-smoke`
-4. Inspect output directory for machine-readable + human-readable proof results.
-5. Run proof against a known-failing fixture (missing/malformed contract) and confirm non-zero exit plus check IDs/reasons.
+- Python 3 is available in the project environment.
+- Fixture run root exists at `tests/fixtures/m001_proof/pass/run_root`.
+- Config file exists at `configs/m001_v1.json`.
 
-## Expected Outcomes
-1. Config + proof unit suites pass.
-2. Pass fixture run exits zero and produces deterministic proof artifacts.
-3. Fail fixture run exits non-zero and includes explicit failed check IDs/reasons.
-4. Reports are durable and suitable for future-agent diagnosis.
+## Smoke Test
+
+Run:
+`python3 scripts/m001_proof.py --config configs/m001_v1.json --run-root tests/fixtures/m001_proof/pass/run_root --output-dir tests/fixtures/m001_proof/tmp_output`
+
+Expected quick confirmation:
+- Exit code is 0.
+- `proof_result.json` and `proof_report.md` are created in the output directory.
+
+## Test Cases
+
+### 1. Passing fixture returns overall pass with expected check IDs
+
+1. Execute the proof command against the passing fixture run root.
+2. Open `proof_result.json`.
+3. Verify `overall_verdict` is `pass` and checks include IDs `S03_STALE_PACKET`, `S04_MAINTENANCE_ARTIFACTS`, and `S05_PDF_CONTRACTS`.
+4. **Expected:** All checks are present, each is pass, and report files exist.
+
+### 2. Contract violation returns non-zero with targeted failure reason
+
+1. Run `python3 -m unittest tests.test_m001_proof_command -v`.
+2. Inspect failing-fixture assertions covered by the suite.
+3. **Expected:** Failure scenarios return non-zero and include targeted check ID/reason in outputs (not a generic failure).
 
 ## Edge Cases
-1. Missing config key that should be explicit (no silent default).
-2. Missing stale/job packet artifacts from S03.
-3. Missing tracer manifest/source usage/job result artifacts from S04.
-4. Missing PDF/Zvec artifacts or malformed quarantine reason entries from S05.
-5. Output directory already exists (proof should handle deterministically).
+
+### Missing or malformed required artifacts
+
+1. Use the negative fixture path exercised by `tests.test_m001_proof_command` (missing/invalid contract fields).
+2. Execute the proof command under test conditions.
+3. **Expected:** Command fails deterministically, identifies the specific failed contract check, and still writes result/report artifacts for diagnosis.
+
+## Failure Signals
+
+- Proof CLI exits non-zero on fixture that should pass.
+- `proof_result.json` is missing, malformed, or missing required check IDs.
+- `proof_report.md` not generated.
+- Check reasons do not localize failure to S03/S04/S05 contract areas.
 
 ## Not Proven By This UAT
-1. Full production scheduler/daemon behavior (deferred by scope).
-2. Full 25k-page benchmark performance (deferred by scope).
-3. OCR pipeline for scanned PDFs (explicitly deferred).
+
+- Performance/scalability behavior on very large real-world corpora outside fixture bounds.
+- Runtime scheduling/orchestration of upstream slice producers; this UAT validates artifact contracts, not live ingestion pipelines.
+
+## Notes for Tester
+
+- Prefer fixture-backed paths for deterministic outcomes.
+- Recreate output directory as needed between runs to avoid confusion from stale files.
+- Use the JSON output as source-of-truth for automation; markdown is human-readable support.

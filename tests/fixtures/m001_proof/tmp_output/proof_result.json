@@ -1,0 +1,47 @@
+{
+  "checks": [
+    {
+      "check_id": "S03_STALE_PACKET",
+      "details": {
+        "evidence_count": 2,
+        "path": "tests/fixtures/m001_proof/pass/run_root/s03/stale_packet.json"
+      },
+      "reason": "source_hash_changed",
+      "status": "pass",
+      "timestamp": "2026-05-15T21:33:59Z"
+    },
+    {
+      "check_id": "S04_MAINTENANCE_ARTIFACTS",
+      "details": {
+        "artifacts": [
+          "page.md",
+          "manifest.json",
+          "source_map.json",
+          "source_usage.json",
+          "events.jsonl",
+          "result.json",
+          "handoff.md"
+        ],
+        "job_root": "tests/fixtures/m001_proof/pass/run_root/s04/maintenance/job-001"
+      },
+      "reason": "all_artifacts_present",
+      "status": "pass",
+      "timestamp": "2026-05-15T21:33:59Z"
+    },
+    {
+      "check_id": "S05_PDF_CONTRACTS",
+      "details": {
+        "chunk_count": 1,
+        "chunks_path": "tests/fixtures/m001_proof/pass/run_root/s05/pdf_chunks.jsonl",
+        "quarantine_count": 1,
+        "quarantine_path": "tests/fixtures/m001_proof/pass/run_root/s05/pdf_quarantine.jsonl"
+      },
+      "reason": "pdf_contracts_valid",
+      "status": "pass",
+      "timestamp": "2026-05-15T21:33:59Z"
+    }
+  ],
+  "generated_at": "2026-05-15T21:33:59Z",
+  "overall_verdict": "pass",
+  "run_root": "tests/fixtures/m001_proof/pass/run_root"
+}

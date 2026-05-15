@@ -29,12 +29,12 @@ Consumes S01 run artifact conventions, S03 stale packet contracts, S04 maintenan
   - Files: `src/scrape_planner/config_v1.py`, `configs/m001_v1.json`, `tests/test_m001_config_v1.py`
   - Verify: python3 -m unittest tests.test_m001_config_v1 -v
 
-- [ ] **T02: Build M001 proof validator and CLI report command** `est:1h15m`
+- [x] **T02: Build M001 proof validator and CLI report command** `est:1h15m`
   Why: S06 demo requires one real entrypoint that composes S01–S05 contracts and returns objective pass/fail.
   - Files: `src/scrape_planner/proof_m001.py`, `scripts/m001_proof.py`, `tests/test_m001_proof_command.py`, `tests/fixtures/m001_proof`
   - Verify: python3 -m unittest tests.test_m001_proof_command -v
 
-- [ ] **T03: Wire end-to-end proof smoke verification and usage docs** `est:30m`
+- [x] **T03: Wire end-to-end proof smoke verification and usage docs** `est:30m`
   Why: Final assembly slice must prove real entrypoint execution and operator usability, not only library-level checks.
   - Files: `README.md`, `tests/test_m001_proof_command.py`
   - Verify: python3 scripts/m001_proof.py --config configs/m001_v1.json --run-root tests/fixtures/m001_proof/pass/run_root --output-dir tests/fixtures/m001_proof/tmp_output

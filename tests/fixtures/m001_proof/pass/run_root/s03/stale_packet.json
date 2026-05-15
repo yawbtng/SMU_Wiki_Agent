@@ -1,0 +1,7 @@
+{
+  "reason": "source_hash_changed",
+  "evidence_refs": [
+    "artifact://source-monitor/ledger/123",
+    "artifact://source-monitor/ledger/124"
+  ]
+}

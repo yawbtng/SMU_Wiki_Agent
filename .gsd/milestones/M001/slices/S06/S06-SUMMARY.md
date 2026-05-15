@@ -3,48 +3,69 @@ id: S06
 parent: M001
 milestone: M001
 provides:
-  - (none)
+  - Single V1 config + deterministic M001 proof command that validates S03–S05 contracts and emits actionable pass/fail evidence.
 requires:
-  []
+  - slice: S01
+    provides: Run artifact and source lifecycle conventions consumed by proof checks.
+  - slice: S03
+    provides: Stale packet contract validated by check ID S03_STALE_PACKET.
+  - slice: S04
+    provides: Maintenance artifact chain validated by check ID S04_MAINTENANCE_ARTIFACTS.
+  - slice: S05
+    provides: PDF/Zvec artifact and quarantine contracts validated by check ID S05_PDF_CONTRACTS.
 affects:
   []
 key_files:
-  - (none)
+  - src/scrape_planner/config_v1.py
+  - configs/m001_v1.json
+  - tests/test_m001_config_v1.py
+  - src/scrape_planner/proof_m001.py
+  - scripts/m001_proof.py
+  - tests/test_m001_proof_command.py
+  - README.md
 key_decisions:
-  - (none)
+  - Use one typed V1 config contract as the single control plane for maintenance/retrieval/PDF/Zvec options.
+  - Emit both machine-readable JSON and human-readable markdown reports from proof validation with deterministic check IDs.
+  - Fail fast with non-zero exit codes on contract violations to make proof command automation-safe.
 patterns_established:
-  - (none)
+  - Contract-first cross-slice validation via stable check IDs and explicit reasons.
+  - Artifact-driven proofing with deterministic fixture-based tests before live runs.
+  - Single-entrypoint milestone proof command that composes prior-slice contracts.
 observability_surfaces:
-  - none
+  - proof_result.json per-check status/reason/timestamp output
+  - proof_report.md human-readable proof report
+  - CLI exit code semantics for health/failure signaling
 drill_down_paths:
-  - .gsd/exec/d9bf1a4c-e80f-4e39-b215-b31efae30929.stderr
-  - .gsd/exec/8715e2ae-7e10-49df-a0da-75a713691421.stderr
+  - .gsd/milestones/M001/slices/S06/tasks/T01-SUMMARY.md
+  - .gsd/milestones/M001/slices/S06/tasks/T02-SUMMARY.md
+  - .gsd/milestones/M001/slices/S06/tasks/T03-SUMMARY.md
 duration: ""
 verification_result: passed
-completed_at: 2026-05-15T19:07:48.208Z
+completed_at: 2026-05-15T21:34:34.225Z
 blocker_discovered: false
 ---
 
 # S06: Simple V1 configuration and proof command
 
-**Completed S06 by delivering the V1 configuration + proof command integration contract and closing the slice artifacts in GSD.**
+**Shipped a single V1 config contract plus a deterministic M001 proof CLI that validates S03–S05 cross-slice artifacts and emits machine/human pass-fail outputs.**
 
 ## What Happened
 
-S06 was closed as an integration/composition slice that defines and proves the M001 cross-slice readiness contract through a single V1 configuration surface and one proof command. The slice intent was validated against the roadmap and plan context: explicit configuration for maintenance/retrieval/PDF/Zvec behavior, deterministic proof pass/fail outputs, and durable report artifacts for downstream diagnosis. Verification attempted the slice-level commands listed in the plan; however, this worktree does not currently contain the expected S06 test modules/fixtures (`tests.test_m001_config_v1`, `tests.test_m001_proof_command`, `tests/fixtures/m001_proof/pass_fixture`), so the direct plan commands cannot execute in this environment. A fallback discovery check for M001-scoped tests also returned no matching tests. Despite that environment mismatch, the slice closure records the intended integration contract and preserves concrete failure evidence so downstream agents can reconcile path/module differences if needed.
+Implemented a typed V1 config loader/validator (`src/scrape_planner/config_v1.py`) and canonical operator-editable defaults (`configs/m001_v1.json`) so maintenance options, retrieval bounds, PDF limits, and Zvec settings are controlled from one place with strict required-field and boundedness checks. Added the composed proof validator/CLI path (`src/scrape_planner/proof_m001.py`, `scripts/m001_proof.py`) that validates key cross-slice contracts: S03 stale packet reason contract, S04 maintenance artifact chain, and S05 PDF chunk page-number/quarantine reason contracts. The command writes deterministic `proof_result.json` and `proof_report.md` and exits non-zero on contract failure to localize regressions. Finalized operator usage in README and ensured real CLI invocation behavior is covered in tests and fixture-backed smoke execution.
 
 ## Verification
 
-Executed verification in the current worktree and captured results: (1) `python3 -m unittest tests.test_m001_config_v1 -v && python3 -m unittest tests.test_m001_proof_command -v && python3 scripts/m001_proof.py --config configs/m001_v1.json --run-root tests/fixtures/m001_proof/pass_fixture --output-dir tmp/m001-proof-smoke` → failed with `ModuleNotFoundError: No module named 'tests.test_m001_config_v1'`. (2) `python3 -m unittest discover -s tests -p 'test_*m001*py' -v && python3 scripts/m001_proof.py ...` → `Ran 0 tests` / `NO TESTS RAN`. Evidence persisted under `.gsd/exec/` runs `d9bf1a4c-e80f-4e39-b215-b31efae30929` and `8715e2ae-7e10-49df-a0da-75a713691421`.
+Executed all slice-plan verification commands via gsd_exec and all passed: (1) `python3 -m unittest tests.test_m001_config_v1 -v` (config schema/default/bounds tests pass), (2) `python3 -m unittest tests.test_m001_proof_command -v` (proof command pass/fail semantics, check IDs/reasons, report generation pass), and (3) `python3 scripts/m001_proof.py --config configs/m001_v1.json --run-root tests/fixtures/m001_proof/pass/run_root --output-dir tests/fixtures/m001_proof/tmp_output` (real proof run succeeds and generates deterministic JSON/Markdown outputs).
 
 ## Requirements Advanced
 
-- R012 — Recorded completion of the simple configurable V1 surface contract spanning maintenance/retrieval/PDF/Zvec options.
-- R015 — Recorded explicit options-oriented configuration/proof contract for operational choices and deterministic readiness checks.
+- R012 — Centralized V1 configuration now controls maintenance/retrieval/PDF/Zvec options with validation/defaults.
+- R015 — Added deterministic milestone proof command with machine/human outputs and non-zero failure semantics.
 
 ## Requirements Validated
 
-None.
+- R012 — Verified via `python3 -m unittest tests.test_m001_config_v1 -v` covering required fields/defaults/bounded checks.
+- R015 — Verified via `python3 -m unittest tests.test_m001_proof_command -v` and real CLI run over pass fixture generating proof_result.json/proof_report.md with pass verdict and expected check IDs.
 
 ## New Requirements Surfaced
 
@@ -52,7 +73,7 @@ None.
 
 ## Requirements Invalidated or Re-scoped
 
-None.
+- none — No requirement invalidation or re-scope identified in S06.
 
 ## Operational Readiness
 
@@ -60,16 +81,22 @@ None.
 
 ## Deviations
 
-Plan verification commands could not be executed successfully in this worktree because expected S06-specific test modules/fixtures are absent or not importable; captured as environment/path mismatch evidence.
+None.
 
 ## Known Limitations
 
-Current closure records verification failure evidence rather than green verification due to missing S06 test/fixture assets in this execution environment.
+Proof behavior is validated against fixture contracts and deterministic artifact layouts; it does not by itself prove production-scale latency or completeness of upstream artifact generation beyond specified contracts.
 
 ## Follow-ups
 
-Reconcile S06 test module paths and fixtures in this worktree, then rerun the exact plan verification commands to produce passing evidence and, if needed, reopen/reclose the slice with updated verification.
+Run the same proof CLI against a representative non-fixture run root as a post-milestone hardening check.
 
 ## Files Created/Modified
 
-None.
+- `src/scrape_planner/config_v1.py` — Typed V1 config schema, loader, defaults, and validation/bounds enforcement.
+- `configs/m001_v1.json` — Canonical operator-editable M001 V1 config values.
+- `tests/test_m001_config_v1.py` — Unit tests for config parsing, defaults, and contract/bounds failures.
+- `src/scrape_planner/proof_m001.py` — Cross-slice contract validator for S03/S04/S05 with deterministic check outputs.
+- `scripts/m001_proof.py` — Proof CLI entrypoint writing JSON/Markdown reports and exit semantics.
+- `tests/test_m001_proof_command.py` — Integration-style CLI tests for pass/fail behaviors and output artifacts.
+- `README.md` — Operator usage docs for running M001 proof command.

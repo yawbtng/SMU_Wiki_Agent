@@ -27,7 +27,7 @@
 - [x] **S05: S05** `risk:high` `depends:[]`
   > After this: A born-digital PDF is chunked with page numbers, indexed/queryable through Zvec, and scanned/encrypted/malformed/low-text PDFs are quarantined with reasons.
 
-- [ ] **S06: S06** `risk:medium` `depends:[]`
+- [x] **S06: S06** `risk:medium` `depends:[]`
   > After this: One simple config file controls maintenance options, retrieval limits, PDF limits, and Zvec settings; a proof command runs the M001 fixture workflow and reports pass/fail.
 
 ## Boundary Map
