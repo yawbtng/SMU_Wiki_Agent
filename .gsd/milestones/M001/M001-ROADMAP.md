@@ -1,4 +1,4 @@
-# M001: Raw Source Monitor, Run Logs, Retrieval, Tracer Maintenance Job, and PDF/Zvec Proof
+# M001: M001: Raw Source Monitor, Run Logs, Retrieval, Tracer Maintenance Job, and PDF/Zvec Proof
 
 **Vision:** Prove the simplest useful raw-first maintenance substrate for a pi-agent-maintained university wiki: source changes are detected, runs are logged, retrieval is bounded, one tracer wiki update is source-grounded, internal PDFs work through Zvec with page citations, and V1 configuration exposes operational choices.
 
@@ -12,7 +12,7 @@
 
 ## Slices
 
-- [ ] **S01: Source ledger and run log foundation** `risk:high` `depends:[]`
+- [ ] **S01: S01** `risk:high` `depends:[]`
   > After this: Given fixture source records, the system writes a run directory with run.json, events.jsonl, source_diff.jsonl, and a report showing new/changed/unchanged/failed/deleted-candidate sources.
 
 - [ ] **S02: Index-first raw retrieval** `risk:high` `depends:[S01]`
@@ -29,6 +29,8 @@
 
 - [ ] **S06: Simple V1 configuration and proof command** `risk:medium` `depends:[S01,S02,S03,S04,S05]`
   > After this: One simple config file controls maintenance options, retrieval limits, PDF limits, and Zvec settings; a proof command runs the M001 fixture workflow and reports pass/fail.
+
+## Boundary Map
 
 ## Boundary Map
 
