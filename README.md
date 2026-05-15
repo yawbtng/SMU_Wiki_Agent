@@ -77,6 +77,27 @@ Optional local semantic query path after scrape + clean + wiki build:
 
 The MCP exposes `query_smu_wiki` and `zvec_index_info` for Claude, Codex, or any MCP client.
 
+## M001 readiness proof
+
+Run the single proof command to validate M001 cross-slice contracts (S03 stale packet, S04 maintenance artifacts, S05 PDF contracts):
+
+```bash
+python3 scripts/m001_proof.py --config configs/m001_v1.json --run-root tests/fixtures/m001_proof/pass/run_root --output-dir tests/fixtures/m001_proof/tmp_output
+```
+
+Required inputs:
+- `--config`: V1 contract file (example: `configs/m001_v1.json`)
+- `--run-root`: run artifact root containing `s03/`, `s04/`, `s05/`
+- `--output-dir`: destination for deterministic proof outputs
+
+Output artifacts:
+- `<output-dir>/proof_result.json` — machine-readable per-check results with `check_id`, `status`, `reason`, and timestamps
+- `<output-dir>/proof_report.md` — operator-readable markdown summary
+
+Exit code semantics:
+- `0`: overall pass (all checks pass)
+- `1`: overall fail (one or more checks fail; inspect `proof_result.json` for failing `check_id` and `reason`)
+
 ## Raw markdown retrieval proof
 
 For fixture-level proof of index-first bounded retrieval behavior:
