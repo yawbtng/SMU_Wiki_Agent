@@ -1,0 +1,18 @@
+{
+  "maintenance": {
+    "enabled": true,
+    "max_stale_pages": 100
+  },
+  "retrieval": {
+    "top_k": 5,
+    "max_evidence_items": 8
+  },
+  "pdf": {
+    "max_pages_per_pdf": 50,
+    "max_pdf_mb": 20
+  },
+  "zvec": {
+    "enabled": true,
+    "max_results": 5
+  }
+}

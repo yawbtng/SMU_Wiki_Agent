@@ -2,8 +2,16 @@
   "schemaVersion": 1,
   "milestoneId": "M001",
   "sliceId": "S06",
-  "timestamp": 1778871922903,
-  "status": "pass",
+  "timestamp": 1778878305935,
+  "status": "fail",
   "durationMs": 1,
-  "checks": []
+  "checks": [
+    {
+      "category": "file",
+      "target": "tests/fixtures/m001_proof/pass/run_root",
+      "passed": false,
+      "message": "Task T03 references 'tests/fixtures/m001_proof/pass/run_root' which doesn't exist and isn't created by prior or same-task outputs",
+      "blocking": true
+    }
+  ]
 }

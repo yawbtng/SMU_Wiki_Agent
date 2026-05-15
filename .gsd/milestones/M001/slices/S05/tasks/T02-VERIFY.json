@@ -2,14 +2,14 @@
   "schemaVersion": 1,
   "taskId": "T02",
   "unitId": "M001/S05/T02",
-  "timestamp": 1778871756745,
+  "timestamp": 1778878259830,
   "passed": false,
-  "discoverySource": "preference",
+  "discoverySource": "task-plan",
   "checks": [
     {
-      "command": "pytest",
-      "exitCode": 127,
-      "durationMs": 5,
+      "command": "python3 -m pytest tests/test_pdf_zvec_proof.py -q",
+      "exitCode": 1,
+      "durationMs": 18,
       "verdict": "fail"
     }
   ],

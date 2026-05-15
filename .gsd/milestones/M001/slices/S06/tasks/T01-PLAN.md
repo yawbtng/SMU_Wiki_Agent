@@ -1,35 +1,29 @@
 ---
-estimated_steps: 15
+estimated_steps: 9
 estimated_files: 3
 skills_used: []
 ---
 
-# T01: Add simple V1 config contract for maintenance/retrieval/pdf/zvec options
+# T01: Implement V1 config schema and defaults for proof orchestration
 
-Why: S06 must satisfy R012/R015 by exposing explicit, minimal operational options instead of implicit behavior.
-
-Files:
-- `src/scrape_planner/config_v1.py`
-- `configs/m001_v1.json`
-- `tests/test_m001_config_v1.py`
+Why: S06 needs a single operator-editable config contract (R012/R015) before proof wiring can be deterministic.
 
 Do:
-1) Implement `config_v1.py` dataclass-based loader/validator from JSON with explicit sections: maintenance, retrieval, pdf, zvec.
-2) Enforce boundedness and type checks (e.g., positive ints, top_k/evidence caps, max_pdf_mb, quarantine toggles, zvec limits) with deterministic validation errors.
-3) Add a repository-shipped default config file `configs/m001_v1.json` with simple V1-safe defaults.
-4) Add unittest coverage for: valid load, missing required sections/keys, out-of-range limits, and deterministic error messages.
-5) Keep config scope minimal (no scheduler/UI abstractions) per R002.
+1. Add `src/scrape_planner/config_v1.py` with typed loader/validator for maintenance, retrieval, pdf, and zvec sections.
+2. Enforce bounded constraints needed by milestone promises (e.g., positive limits, max evidence/page bounds) and return clear validation errors.
+3. Add canonical config file `configs/m001_v1.json` with minimal defaults used by proof command.
+4. Add unit tests for valid config, missing required sections/keys, and invalid bounds.
+5. Keep implementation independent from `.gsd/` paths and legacy cleanup-manifest-first assumptions.
 
-Done when:
-- Config loader returns a normalized strongly-typed object for valid config.
-- Invalid configurations fail fast with clear messages.
-- Tests prove bounds and required-option behavior.
+Done when: config load/validation is deterministic, boundedness rules are enforced by tests, and canonical config file exists for downstream proof command consumption.
+
+Expected executor skills: write-docs, verify-before-complete
 
 ## Inputs
 
-- `src/scrape_planner/models.py`
 - `src/scrape_planner/run_persistence.py`
-- `src/scrape_planner/observability.py`
+- `src/scrape_planner/models.py`
+- `.gsd/milestones/M001/slices/S06/S06-RESEARCH.md`
 
 ## Expected Output
 
@@ -43,4 +37,4 @@ python3 -m unittest tests.test_m001_config_v1 -v
 
 ## Observability Impact
 
-Validation errors become explicit and test-covered so bad operational settings fail before proof execution.
+Validation errors include field path + reason to make config failures diagnosable before proof execution.

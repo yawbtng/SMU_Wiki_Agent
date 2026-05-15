@@ -24,10 +24,10 @@
 - [x] **S04: S04** `risk:medium` `depends:[]`
   > After this: A pi-agent/skill-style job updates or creates one cited tracer wiki page with manifest, source map, source usage, events, and handoff/result artifacts.
 
-- [ ] **S05: S05** `risk:high` `depends:[]`
+- [x] **S05: S05** `risk:high` `depends:[]`
   > After this: A born-digital PDF is chunked with page numbers, indexed/queryable through Zvec, and scanned/encrypted/malformed/low-text PDFs are quarantined with reasons.
 
-- [ ] **S06: Simple V1 configuration and proof command** `risk:medium` `depends:[S01,S02,S03,S04,S05]`
+- [ ] **S06: S06** `risk:medium` `depends:[]`
   > After this: One simple config file controls maintenance options, retrieval limits, PDF limits, and Zvec settings; a proof command runs the M001 fixture workflow and reports pass/fail.
 
 ## Boundary Map
