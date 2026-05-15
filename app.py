@@ -4,8 +4,10 @@ import json
 import os
 import re
 import shutil
-import time
+import subprocess
+import sys
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
@@ -13,6 +15,7 @@ from urllib.parse import quote, unquote, urlparse
 import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
@@ -20,15 +23,31 @@ except Exception:
 
 from src.scrape_planner.failure_classifier import classify_failure
 from src.scrape_planner.llm_orchestrator import (
+    choose_top_urls_with_ollama,
     choose_top_urls_with_openrouter,
-    explain_url_selection_with_openrouter,
-    fetch_ollama_models,
-    fetch_openrouter_models,
-    pull_ollama_model,
 )
 from src.scrape_planner.local_cleanup import CleanupRunner, ollama_available
+from src.scrape_planner.markdown_graph import (
+    answer_context as graph_answer_context,
+    build_graph as build_markdown_graph,
+    get_unit_pages as graph_get_unit_pages,
+    graph_stats as load_graph_stats,
+    knowledge_graph_dir,
+    list_units as graph_list_units,
+    load_edges as load_graph_edges,
+    load_page_nodes as load_graph_page_nodes,
+    load_tags as load_graph_tags,
+    orphan_pages as load_graph_orphan_pages,
+    pages_without_unit_tags as load_pages_without_unit_tags,
+    rebuild_query_index as rebuild_graph_query_index,
+    run_graphify_enrichment_for_unit,
+    search_pages as graph_search_pages,
+    shortest_path as graph_shortest_path,
+    traverse_from_page as graph_traverse_from_page,
+    unit_distribution as load_unit_distribution,
+)
 from src.scrape_planner.models import DiscoveredURL
-from src.scrape_planner.observability import append_event, load_events, summarize_events
+from src.scrape_planner.observability import load_events
 from src.scrape_planner.run_persistence import read_page_states, read_run_events, read_run_status
 from src.scrape_planner.run_analytics import (
     build_completion_timeseries,
@@ -45,9 +64,8 @@ from src.scrape_planner.storage import persist_discovered, read_json, write_json
 from src.scrape_planner.tavily_retry import retry_failed_with_tavily
 from src.scrape_planner.terminal_skill_runner import TerminalSkillRunner
 from src.scrape_planner.tmux_runner import TmuxRunner
-from src.scrape_planner.ui_claude_plan import render_claude_plan_section
 from src.scrape_planner.ui_navigation import WORKFLOW_TABS
-from src.scrape_planner.url_quality import UrlCriteria, UrlScoringProfile, score_and_filter_rows, suggest_scoring_profile_from_rows
+from src.scrape_planner.url_quality import UrlCriteria, UrlScoringProfile, score_and_filter_rows
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT / "data"
@@ -57,6 +75,7 @@ ENV_PATH = ROOT / ".env"
 APP_STATE_PATH = DATA_ROOT / "app_state.json"
 PI_PROMPT_TEMPLATE_PATH = ROOT / "prompts" / "pi_url_selection_prompt.md"
 DOCUMENT_WIKI_SKILL_PATH = ROOT / ".pi" / "skills" / "document-wiki-ingest" / "SKILL.md"
+GRAPHIFY_DEFAULT_BIN = "/private/tmp/graphify-venv/bin/graphify"
 
 
 def _site_slug(url: str) -> str:
@@ -123,6 +142,19 @@ def _init_state() -> None:
         "default_llm_cap": 150,
         "default_llm_batch_size": 250,
         "default_llm_sleep_sec": 0.0,
+        "url_reasoning_provider": "openrouter",
+        "url_reasoning_openrouter_model": "deepseek/deepseek-v4-flash",
+        "url_reasoning_ollama_model": "qwen2.5:3b",
+        "graph_enrichment_provider": "ollama",
+        "graph_answer_provider": "openrouter",
+        "scrape_concurrency": 4,
+        "embedding_enabled": True,
+        "embedding_model": "nomic-embed-text:latest",
+        "zvec_enabled": True,
+        "zvec_index_path": "",
+        "zvec_collection": "university_wiki",
+        "use_tavily_for_map": False,
+        "use_tavily_for_retry": False,
         "tavily_cost_per_call_usd": 0.0,
         "ollama_input_per_m_usd": 0.0,
         "ollama_output_per_m_usd": 0.0,
@@ -130,6 +162,16 @@ def _init_state() -> None:
         "last_selection_payload": {},
         "pi_binary": "",
         "tmux_binary": "",
+        "graphify_binary": "",
+        "graphify_provider": "openrouter",
+        "graphify_model": "openai/gpt-4.1-mini",
+        "graphify_max_files": 0,
+        "graphify_token_budget": 60000,
+        "graphify_timeout_sec": 900,
+        "graphify_query": "",
+        "graphify_path_from": "",
+        "graphify_path_to": "",
+        "graphify_explain": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -167,6 +209,332 @@ def _get_tmux_runner() -> TmuxRunner:
 
 def _run_root(site_id: str, run_id: str) -> Path:
     return DATA_ROOT / "sites" / site_id / run_id
+
+
+def _detect_graphify_binary() -> str:
+    configured = os.getenv("GRAPHIFY_BIN", "").strip()
+    if configured:
+        return configured
+    if Path(GRAPHIFY_DEFAULT_BIN).exists():
+        return GRAPHIFY_DEFAULT_BIN
+    found = shutil.which("graphify")
+    return found or GRAPHIFY_DEFAULT_BIN
+
+
+def _safe_graph_input_name(url: str, fallback: str) -> str:
+    parsed = urlparse(url or "")
+    raw = parsed.path.strip("/") or parsed.netloc or fallback
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-").lower()
+    return f"{slug or fallback}.md"
+
+
+def _raw_markdown_files(run_root: Path) -> list[Path]:
+    raw_dir = run_root / "markdown"
+    if not raw_dir.exists():
+        return []
+    return sorted([p for p in raw_dir.glob("*.md") if p.is_file()])
+
+
+def _graph_is_real_scrape_run(run_name: str) -> bool:
+    if run_name.startswith("pi_url_"):
+        return False
+    run_dir = DATA_ROOT / "sites" / st.session_state.get("site_id", "") / run_name
+    scrape_markers = [
+        "selected_urls.json",
+        "scrape_manifest.json",
+        "run_status.json",
+        "pages.jsonl",
+        "events.jsonl",
+        "failures.json",
+    ]
+    return (run_dir / "markdown").exists() and any((run_dir / marker).exists() for marker in scrape_markers)
+
+
+def _run_human_timestamp(run_name: str) -> str:
+    match = re.match(r"^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z", run_name)
+    if not match:
+        return run_name
+    year, month, day, hour, minute, second = match.groups()
+    return f"{year}-{month}-{day} {hour}:{minute}:{second} UTC"
+
+
+def _prepare_graphify_raw_input(
+    run_root: Path,
+    graph_root: Path,
+    max_files: int,
+) -> tuple[Path | None, str | None, int]:
+    raw_files = _raw_markdown_files(run_root)
+    if not raw_files:
+        return None, "No raw markdown files found for this run.", 0
+
+    if max_files <= 0 or max_files >= len(raw_files):
+        return run_root / "markdown", None, len(raw_files)
+
+    selected = sorted(raw_files)[:max_files]
+    input_dir = graph_root / "raw-input"
+    if input_dir.exists():
+        shutil.rmtree(input_dir)
+    input_dir.mkdir(parents=True, exist_ok=True)
+
+    used_names: set[str] = set()
+    for idx, src in enumerate(selected, start=1):
+        base_name = src.name
+        if base_name in used_names:
+            base_name = f"{Path(base_name).stem}-{idx}.md"
+        used_names.add(base_name)
+        (input_dir / base_name).symlink_to(src.resolve())
+
+    return input_dir, None, len(selected)
+
+
+def _run_graphify_for_raw_markdown(
+    *,
+    run_root: Path,
+    graphify_bin: str,
+    provider: str,
+    model: str,
+    max_files: int,
+    token_budget: int,
+    max_output_tokens: int,
+    timeout_sec: int,
+) -> dict:
+    graphify_bin = graphify_bin.strip() or _detect_graphify_binary()
+    graph_root = run_root / "graphify-raw"
+    input_dir, prep_error, selected_count = _prepare_graphify_raw_input(
+        run_root,
+        graph_root,
+        max_files,
+    )
+    if prep_error or input_dir is None:
+        return {"ok": False, "error": prep_error or "Unable to prepare Graphify input."}
+
+    env = os.environ.copy()
+    backend = "ollama"
+    provider = (provider or "ollama").strip().lower()
+    if provider == "openrouter":
+        backend = "openai"
+        openrouter_key = st.session_state.get("openrouter_api_key") or env.get("OPENROUTER_API_KEY", "")
+        if not openrouter_key:
+            return {"ok": False, "error": "OPENROUTER_API_KEY is missing. Save it in Settings first."}
+        env["OPENAI_API_KEY"] = str(openrouter_key).strip()
+        env["GRAPHIFY_OPENAI_BASE_URL"] = "https://openrouter.ai/api/v1"
+        env["OPENAI_BASE_URL"] = "https://openrouter.ai/api/v1"
+        env["GRAPHIFY_OPENAI_MODEL"] = model
+    else:
+        env["OLLAMA_MODEL"] = model
+        env.setdefault("OLLAMA_API_KEY", "local")
+    env["GRAPHIFY_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
+
+    extract_cmd = [
+        graphify_bin,
+        "extract",
+        str(input_dir),
+        "--backend",
+        backend,
+        "--model",
+        model,
+        "--token-budget",
+        str(token_budget),
+        "--max-concurrency",
+        "1",
+        "--api-timeout",
+        str(timeout_sec),
+        "--out",
+        str(graph_root),
+    ]
+    try:
+        extract_result = subprocess.run(
+            extract_cmd,
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except FileNotFoundError:
+        return {"ok": False, "error": f"Graphify binary not found: {graphify_bin}"}
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": f"Graphify timed out after {timeout_sec} seconds.",
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "",
+        }
+
+    if extract_result.returncode != 0:
+        return {
+            "ok": False,
+            "error": "Graphify extraction failed.",
+            "stdout": extract_result.stdout,
+            "stderr": extract_result.stderr,
+        }
+
+    cluster_cmd = [graphify_bin, "cluster-only", str(graph_root)]
+    cluster_result = subprocess.run(cluster_cmd, cwd=str(ROOT), env=env, capture_output=True, text=True)
+    if cluster_result.returncode != 0:
+        return {
+            "ok": False,
+            "error": "Graphify graph render failed.",
+            "stdout": extract_result.stdout + "\n" + cluster_result.stdout,
+            "stderr": extract_result.stderr + "\n" + cluster_result.stderr,
+        }
+
+    label_result = _label_graphify_communities(graphify_bin, graph_root, input_dir)
+    graph_out = graph_root / "graphify-out"
+    return {
+        "ok": True,
+        "selected_count": selected_count,
+        "graph_root": str(graph_root),
+        "graph_html": str(graph_out / "graph.html"),
+        "graph_json": str(graph_out / "graph.json"),
+        "graph_report": str(graph_out / "GRAPH_REPORT.md"),
+        "stdout": extract_result.stdout + "\n" + cluster_result.stdout + "\n" + str(label_result.get("stdout") or ""),
+        "stderr": extract_result.stderr + "\n" + cluster_result.stderr + "\n" + str(label_result.get("stderr") or ""),
+    }
+
+
+def _run_graphify_lookup(graphify_bin: str, mode: str, args: list[str], graph_json: Path, budget: int = 2000) -> dict:
+    graphify_bin = graphify_bin.strip() or _detect_graphify_binary()
+    if not graph_json.exists():
+        return {"ok": False, "error": f"Graph JSON not found: {graph_json}"}
+    cmd = [graphify_bin, mode, *args, "--graph", str(graph_json)]
+    if mode == "query":
+        cmd.extend(["--budget", str(budget)])
+    try:
+        result = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=120)
+    except FileNotFoundError:
+        return {"ok": False, "error": f"Graphify binary not found: {graphify_bin}"}
+    except subprocess.TimeoutExpired as exc:
+        return {"ok": False, "error": "Graphify lookup timed out.", "stdout": exc.stdout or "", "stderr": exc.stderr or ""}
+    return {
+        "ok": result.returncode == 0,
+        "error": "" if result.returncode == 0 else f"Graphify {mode} failed.",
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def _label_graphify_communities(graphify_bin: str, graph_root: Path, input_path: Path) -> dict:
+    graphify_bin = graphify_bin.strip() or _detect_graphify_binary()
+    graphify_python = Path(graphify_bin).with_name("python")
+    if not graphify_python.exists():
+        graphify_python = Path(sys.executable)
+    script = r'''
+import json
+import re
+from collections import Counter
+from pathlib import Path
+
+from graphify.analyze import suggest_questions
+from graphify.build import build_from_json
+from graphify.cluster import score_all
+from graphify.export import to_html
+from graphify.report import generate
+
+graph_root = Path(__import__("sys").argv[1])
+input_path = __import__("sys").argv[2]
+graph_out = graph_root / "graphify-out"
+graph_json = graph_out / "graph.json"
+analysis_path = graph_out / ".graphify_analysis.json"
+
+graph_data = json.loads(graph_json.read_text(encoding="utf-8"))
+analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+G = build_from_json(graph_data)
+communities = {int(k): v for k, v in analysis.get("communities", {}).items()}
+cohesion = {int(k): v for k, v in analysis.get("cohesion", {}).items()}
+
+node_data = {node_id: data for node_id, data in G.nodes(data=True)}
+stop = {
+    "and", "the", "for", "with", "from", "into", "this", "that", "page", "pages",
+    "program", "programs", "office", "services", "service", "student", "students",
+    "smu", "southern", "methodist", "university", "document", "documents", "pdf",
+    "www", "edu", "html", "https", "http", "department", "departments", "academic",
+    "academics", "school", "college", "center", "centers", "information", "resources",
+    "resource", "about", "home", "menu", "item", "redirect",
+}
+
+def words(text):
+    out = []
+    for w in re.findall(r"[A-Za-z][A-Za-z0-9]+", str(text).lower()):
+        digit_ratio = sum(ch.isdigit() for ch in w) / max(len(w), 1)
+        if len(w) > 2 and w not in stop and digit_ratio < 0.25:
+            out.append(w)
+    return out
+
+def title_from_tokens(tokens):
+    cleaned = []
+    for token, _count in tokens:
+        if token not in cleaned:
+            cleaned.append(token)
+        if len(cleaned) >= 4:
+            break
+    if not cleaned:
+        return ""
+    return " ".join(t.upper() if len(t) <= 4 else t.title() for t in cleaned)
+
+labels = {}
+for cid, members in communities.items():
+    counter = Counter()
+    first_label = ""
+    for node_id in members:
+        data = node_data.get(node_id, {})
+        label = str(data.get("label") or node_id)
+        if not first_label and label:
+            first_label = label
+        source_url = str(data.get("source_url") or "")
+        counter.update(words(label))
+        counter.update(words(source_url.replace("/", " ")))
+    label = title_from_tokens(counter.most_common(12))
+    if not label:
+        label = first_label[:60] if first_label else f"Community {cid}"
+    labels[cid] = label
+
+(graph_out / ".graphify_labels.json").write_text(
+    json.dumps({str(k): v for k, v in labels.items()}, indent=2, ensure_ascii=False),
+    encoding="utf-8",
+)
+
+detection = {}
+detect_path = graph_out / ".graphify_detect.json"
+if detect_path.exists():
+    detection = json.loads(detect_path.read_text(encoding="utf-8"))
+detection.setdefault("total_files", len({str(data.get("source_file") or "") for _node_id, data in G.nodes(data=True) if data.get("source_file")}))
+detection.setdefault("total_words", 0)
+detection.setdefault("files", {})
+tokens = analysis.get("tokens", {})
+questions = suggest_questions(G, communities, labels)
+report = generate(
+    G,
+    communities,
+    cohesion or score_all(G, communities),
+    labels,
+    analysis.get("gods", []),
+    analysis.get("surprises", []),
+    detection,
+    {"input": tokens.get("input", 0), "output": tokens.get("output", 0)},
+    input_path,
+    suggested_questions=questions,
+)
+(graph_out / "GRAPH_REPORT.md").write_text(report, encoding="utf-8")
+to_html(G, communities, str(graph_out / "graph.html"), community_labels=labels)
+print(json.dumps({"labels": {str(k): v for k, v in labels.items()}}, ensure_ascii=False))
+'''
+    try:
+        result = subprocess.run(
+            [str(graphify_python), "-c", script, str(graph_root), str(input_path)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": result.returncode == 0,
+        "error": "" if result.returncode == 0 else "Community labeling failed.",
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
 
 
 def _load_scrape_runtime(site_id: str, run_id: str, max_events: int = 1500) -> tuple[dict, list[dict], list[dict]]:
@@ -711,6 +1079,17 @@ if not st.session_state.get("workspaces"):
     st.session_state["workspaces"] = loaded_app_state.get("workspaces", [])
 if not st.session_state.get("active_workspace_id"):
     st.session_state["active_workspace_id"] = loaded_app_state.get("active_workspace_id", "")
+if not st.session_state.get("active_workspace_id") and len(st.session_state.get("workspaces", [])) == 1:
+    st.session_state["active_workspace_id"] = st.session_state["workspaces"][0].get("id", "")
+active_workspace_for_recovery = next(
+    (w for w in st.session_state.get("workspaces", []) if w.get("id") == st.session_state.get("active_workspace_id")),
+    None,
+)
+if active_workspace_for_recovery:
+    if not st.session_state.get("site_id"):
+        st.session_state["site_id"] = active_workspace_for_recovery.get("id", "")
+    if not st.session_state.get("site_url"):
+        st.session_state["site_url"] = active_workspace_for_recovery.get("url", "")
 if "last_run_by_site" not in st.session_state:
     st.session_state["last_run_by_site"] = loaded_app_state.get("last_run_by_site", {})
 if not st.session_state.get("run_id"):
@@ -737,7 +1116,7 @@ terminal_skill_runner = _get_terminal_skill_runner()
 tmux_runner = _get_tmux_runner()
 
 st.title("Scrape Pipeline")
-st.caption("Setup -> Discover -> Choose URLs -> Scrape -> Clean -> Review.")
+st.caption("Setup -> Discover -> Choose URLs -> Scrape -> Graph.")
 
 if not st.session_state.get("active_workspace_id"):
     st.subheader("Workspaces")
@@ -797,56 +1176,28 @@ with tabs[0]:
     st.subheader("Setup")
     if active_ws:
         discovered_count = len(st.session_state.get("discovered") or read_json(_discovered_json_path(st.session_state["site_id"]), []))
+        selected_df_for_setup = st.session_state.get("selected_df", pd.DataFrame())
+        selected_count = 0
+        if isinstance(selected_df_for_setup, pd.DataFrame) and not selected_df_for_setup.empty:
+            selected_count = int(selected_df_for_setup["selected"].fillna(False).sum()) if "selected" in selected_df_for_setup.columns else len(selected_df_for_setup)
         next_hint = "Refresh sitemap URLs"
-        if discovered_count:
-            next_hint = "Choose important URLs"
-        if st.session_state.get("run_id"):
-            next_hint = "Continue scrape, clean, or review this run"
-        s1, s2 = st.columns([1, 2])
+        if discovered_count and not selected_count:
+            next_hint = "Run LLM Choose URLs"
+        elif selected_count and not st.session_state.get("run_id"):
+            next_hint = "Start Scrape"
+        elif st.session_state.get("run_id"):
+            next_hint = "Clean or Review latest run"
+
+        s1, s2, s3, s4 = st.columns([1.1, 1.8, 1, 1])
         s1.metric("Workspace", active_ws.get("name", "Workspace"))
-        s2.metric("Site URL", active_ws.get("url") or st.session_state.get("site_url") or "not set")
-        d1, d2 = st.columns(2)
-        d1.metric("Active Run ID", st.session_state.get("run_id") or "none")
-        d2.info(f"Next step: {next_hint}.")
-        with st.expander("Recent sites", expanded=False):
-            if st.session_state["site_history"]:
-                st.dataframe(pd.DataFrame({"site_url": st.session_state["site_history"]}), use_container_width=True, hide_index=True)
-            else:
-                st.info("No recent sites saved yet.")
-        with st.expander("Workspace details", expanded=False):
-            d1, d2, d3 = st.columns(3)
-            d1.metric("Workspace ID", st.session_state.get("site_id") or "not_set")
-            d2.metric("Discovered URLs", f"{discovered_count:,}")
-            d3.metric("Workspace Count", f"{len(st.session_state.get('workspaces', [])):,}")
+        s2.metric("Site", active_ws.get("url") or st.session_state.get("site_url") or "not set")
+        s3.metric("Discovered", f"{discovered_count:,}")
+        s4.metric("Selected", f"{selected_count:,}")
+        st.info(f"Next: {next_hint}")
+        if st.session_state.get("run_id"):
+            st.caption(f"Active run: `{st.session_state['run_id']}`")
     else:
         st.warning("No active workspace selected. Go back to the workspace list and open one.")
-
-    with st.expander("Advanced: change active site URL", expanded=False):
-        st.warning("Only use this if you intentionally want this workspace to point at a different root URL.")
-        if st.session_state["site_history"]:
-            options = [""] + st.session_state["site_history"]
-            current_url = st.session_state.get("site_url", "")
-            idx = options.index(current_url) if current_url in options else 0
-            recent = st.selectbox("Recent Sites", options=options, index=idx)
-            if recent and recent != st.session_state.get("site_url", ""):
-                st.session_state["site_url"] = recent
-                st.session_state["site_id"] = _site_slug(recent)
-                st.session_state["run_id"] = st.session_state["last_run_by_site"].get(st.session_state["site_id"], "")
-                _hydrate_site_workspace(st.session_state["site_id"])
-                _save_app_state()
-                st.rerun()
-        site_input = st.text_input("Website root URL", value=st.session_state["site_url"], placeholder="https://example.com")
-        if st.button("Update Active Site", type="secondary"):
-            normalized = normalize_site_url(site_input)
-            st.session_state["site_url"] = normalized
-            st.session_state["site_id"] = _site_slug(normalized)
-            st.session_state["run_id"] = st.session_state["last_run_by_site"].get(st.session_state["site_id"], "")
-            _hydrate_site_workspace(st.session_state["site_id"])
-            st.session_state["site_history"] = [normalized] + [u for u in st.session_state["site_history"] if u != normalized]
-            st.session_state["site_history"] = st.session_state["site_history"][:50]
-            (DATA_ROOT / "sites" / st.session_state["site_id"]).mkdir(parents=True, exist_ok=True)
-            _save_app_state()
-            st.success(f"Active site updated: {normalized}")
 
 with tabs[1]:
     discovered_path = _discovered_json_path(st.session_state["site_id"])
@@ -874,22 +1225,32 @@ with tabs[1]:
     d2.metric("Sitemap Sources", f"{source_count:,}")
     d3.metric("Last Refreshed", last_refreshed)
 
-    with st.expander("Advanced discovery inputs and raw URLs", expanded=False):
-        st.write("Manual URL add (one per line)")
-        st.session_state["manual_urls"] = st.text_area("Manual URLs", value=st.session_state["manual_urls"], height=120)
+    st.write("Add URLs")
+    st.session_state["manual_urls"] = st.text_area("Paste official links", value=st.session_state["manual_urls"], height=110, placeholder="https://admissions.example.edu/...\n/registrar/...")
+    _save_app_state()
+    if st.button("Add URLs", type="secondary"):
+        items = apply_manual_urls(st.session_state["site_url"], st.session_state["manual_urls"].splitlines())
+        merged = {row.get("url"): row for row in st.session_state.get("discovered", []) if isinstance(row, dict) and row.get("url")}
+        accepted = 0
+        excluded = 0
+        for item in items:
+            row = item.to_dict()
+            if row.get("excluded_reason"):
+                excluded += 1
+            else:
+                accepted += 1
+            merged[item.url] = row
+        st.session_state["discovered"] = list(merged.values())
+        st.session_state["selected_df"] = pd.DataFrame(st.session_state["discovered"])
+        write_json(_discovered_json_path(st.session_state["site_id"]), st.session_state["discovered"])
         _save_app_state()
-        if st.button("Add Manual URLs"):
-            items = apply_manual_urls(st.session_state["site_url"], st.session_state["manual_urls"].splitlines())
-            merged = {row["url"]: row for row in st.session_state["discovered"]}
-            for item in items:
-                merged[item.url] = item.to_dict()
-            st.session_state["discovered"] = list(merged.values())
-            st.session_state["selected_df"] = pd.DataFrame(st.session_state["discovered"])
-            _save_app_state()
-        if st.session_state["discovered"]:
-            st.dataframe(pd.DataFrame(st.session_state["discovered"]), use_container_width=True)
-        else:
-            st.info("No raw URL rows yet.")
+        st.success(f"Accepted {accepted:,} URL(s). Excluded {excluded:,} off-domain URL(s).")
+
+    if discovered_rows_for_summary:
+        host_counts = pd.Series([urlparse(str(row.get("url") or "")).netloc.lower() for row in discovered_rows_for_summary if isinstance(row, dict)]).value_counts().head(12)
+        if not host_counts.empty:
+            st.caption("Top hosts")
+            st.dataframe(host_counts.rename_axis("host").reset_index(name="urls"), use_container_width=True, hide_index=True)
 
 with tabs[2]:
     site_id = st.session_state.get("site_id", "")
@@ -974,60 +1335,9 @@ with tabs[2]:
                 st.success(f"Saved {len(uploaded_pdfs):,} PDF(s).")
             st.metric("PDF Sources", f"{len(pdf_manifest):,}")
             if pdf_manifest:
-                with st.expander("PDF source list", expanded=False):
-                    st.dataframe(pd.DataFrame(pdf_manifest), use_container_width=True, hide_index=True)
+                st.caption("PDFs are included as first-class wiki sources.")
 
-        with st.expander("Scoring rules for this university", expanded=False):
-            st.caption("Saved per workspace. Generate from this university's discovered URLs, then edit as needed.")
-            rule_actions = st.columns([1, 1, 2])
-            if rule_actions[0].button("Generate from sitemap", use_container_width=True, disabled=not rows):
-                generated_profile = suggest_scoring_profile_from_rows(rows, base_profile=scoring_profile)
-                write_json(profile_path, generated_profile.to_dict())
-                st.success("Generated scoring rules from discovered URLs for this workspace.")
-                st.rerun()
-            if rule_actions[1].button("Reset defaults", use_container_width=True):
-                write_json(profile_path, UrlScoringProfile().to_dict())
-                st.warning("Reset URL scoring rules to defaults.")
-                st.rerun()
-            with st.form("url_scoring_profile_form"):
-                valuable_terms = st.text_area(
-                    "Valuable URL terms",
-                    value="\n".join(scoring_profile.high_value_terms),
-                    height=150,
-                    help="One term per line or comma-separated. Matching URLs get boosted.",
-                )
-                spammy_terms = st.text_area(
-                    "Spam/noise URL terms",
-                    value="\n".join(scoring_profile.spammy_terms),
-                    height=130,
-                    help="Matching URLs get penalized.",
-                )
-                dated_patterns = st.text_area(
-                    "Dated/archive regex rules",
-                    value="\n".join(scoring_profile.dated_patterns),
-                    height=120,
-                    help="Regex patterns for old archive-style URLs. Older years are penalized.",
-                )
-                w1, w2, w3 = st.columns(3)
-                high_boost = int(w1.number_input("Valuable boost", min_value=0, max_value=80, value=scoring_profile.high_value_student_boost, step=5))
-                spam_penalty = int(w2.number_input("Spam penalty", min_value=0, max_value=80, value=scoring_profile.spammy_student_penalty, step=5))
-                manual_boost = int(w3.number_input("Manual link boost", min_value=0, max_value=40, value=scoring_profile.manual_student_boost, step=2))
-                if st.form_submit_button("Save scoring rules", type="primary", use_container_width=True):
-                    updated_profile = UrlScoringProfile.from_dict(
-                        {
-                            **scoring_profile.to_dict(),
-                            "high_value_terms": valuable_terms,
-                            "spammy_terms": spammy_terms,
-                            "dated_patterns": dated_patterns,
-                            "high_value_student_boost": high_boost,
-                            "spammy_student_penalty": spam_penalty,
-                            "manual_student_boost": manual_boost,
-                        }
-                    )
-                    write_json(profile_path, updated_profile.to_dict())
-                    st.success("Saved URL scoring rules for this workspace.")
-                    st.rerun()
-            scoring_profile = UrlScoringProfile.from_dict(read_json(profile_path, scoring_profile.to_dict()))
+        # Local scoring profile stays as a fallback only when OpenRouter is unavailable.
 
         if not rows:
             st.info("Discover URLs or add manual links to start selection.")
@@ -1073,53 +1383,51 @@ with tabs[2]:
 
                 llm_box = st.container(border=True)
                 with llm_box:
-                    llm_cols = st.columns([1.2, 1.2, 1, 1])
-                    llm_model = llm_cols[0].text_input(
-                        "OpenRouter model",
-                        value=st.session_state.get("default_or_model", "deepseek/deepseek-v4-flash"),
-                        key="choose_llm_model",
-                    )
-                    llm_batch_size = int(
-                        llm_cols[1].number_input(
-                            "Batch size",
-                            min_value=25,
-                            max_value=1000,
-                            value=int(st.session_state.get("default_llm_batch_size", 250)),
-                            step=25,
-                            key="choose_llm_batch_size",
-                        )
-                    )
-                    llm_max_urls = int(
-                        llm_cols[2].number_input(
-                            "LLM max URLs",
-                            min_value=1,
-                            max_value=50000,
-                            value=max_urls,
-                            step=50,
-                            key="choose_llm_max_urls",
-                        )
-                    )
-                    run_llm = llm_cols[3].button("LLM choose", type="primary", use_container_width=True)
-                    st.caption("OpenRouter scores every URL with reasons. Local rules below remain a fallback and quick preview.")
+                    llm_cols = st.columns([2, 1])
+                    url_reasoning_provider = st.session_state.get("url_reasoning_provider", "openrouter")
+                    if url_reasoning_provider == "ollama":
+                        llm_model = st.session_state.get("url_reasoning_ollama_model") or st.session_state.get("ollama_model") or "qwen2.5:3b"
+                    else:
+                        llm_model = st.session_state.get("url_reasoning_openrouter_model") or st.session_state.get("default_or_model", "deepseek/deepseek-v4-flash")
+                    llm_batch_size = int(st.session_state.get("default_llm_batch_size", 250))
+                    llm_max_urls = max_urls
+                    llm_cols[0].metric(f"{url_reasoning_provider.title()} URL reasoning", llm_model)
+                    run_llm = llm_cols[1].button("LLM Choose URLs", type="primary", use_container_width=True)
+                    st.caption("The LLM scores URLs with reasons, then the threshold below controls what gets scraped.")
 
                 if run_llm:
                     api_key = st.session_state.get("openrouter_api_key", "").strip() or loaded_env.get("OPENROUTER_API_KEY", "").strip()
-                    if not api_key:
+                    if url_reasoning_provider == "openrouter" and not api_key:
                         st.error("OpenRouter API key missing. Add it in Settings first.")
                     else:
-                        with st.spinner(f"OpenRouter is reasoning over {len(rows):,} URLs..."):
-                            llm_payload = choose_top_urls_with_openrouter(
-                                site_url=st.session_state.get("site_url", ""),
-                                discovered_rows=rows,
-                                out_path=score_file,
-                                max_urls=llm_max_urls,
-                                model=llm_model,
-                                api_key=api_key,
-                                batch_size=llm_batch_size,
-                                sleep_between_batches_sec=float(st.session_state.get("default_llm_sleep_sec", 0.0)),
+                        with st.spinner(f"{url_reasoning_provider.title()} is reasoning over {len(rows):,} URLs..."):
+                            if url_reasoning_provider == "ollama":
+                                llm_payload = choose_top_urls_with_ollama(
+                                    site_url=st.session_state.get("site_url", ""),
+                                    discovered_rows=rows,
+                                    out_path=score_file,
+                                    max_urls=llm_max_urls,
+                                    model=llm_model,
+                                    base_url=st.session_state.get("ollama_base_url", OLLAMA_BASE_URL),
+                                    batch_size=llm_batch_size,
+                                    sleep_between_batches_sec=float(st.session_state.get("default_llm_sleep_sec", 0.0)),
+                                )
+                            else:
+                                llm_payload = choose_top_urls_with_openrouter(
+                                    site_url=st.session_state.get("site_url", ""),
+                                    discovered_rows=rows,
+                                    out_path=score_file,
+                                    max_urls=llm_max_urls,
+                                    model=llm_model,
+                                    api_key=api_key,
+                                    batch_size=llm_batch_size,
+                                    sleep_between_batches_sec=float(st.session_state.get("default_llm_sleep_sec", 0.0)),
+                                )
+                        if not (llm_payload.get("used_openrouter") or llm_payload.get("used_ollama")):
+                            st.error(
+                                f"{url_reasoning_provider.title()} URL reasoning failed: "
+                                f"{llm_payload.get('openrouter_error') or llm_payload.get('ollama_error') or 'unknown error'}"
                             )
-                        if not llm_payload.get("used_openrouter"):
-                            st.error(f"OpenRouter URL reasoning failed: {llm_payload.get('openrouter_error', 'unknown error')}")
                         else:
                             llm_threshold = int(llm_payload.get("default_threshold", threshold) or threshold)
                             score_lookup = {row.get("url"): row for row in llm_payload.get("scored_urls", []) if isinstance(row, dict) and row.get("url")}
@@ -1138,7 +1446,7 @@ with tabs[2]:
                                         "source_quality": score_row.get("source_quality"),
                                         "scrape_value": score_row.get("scrape_value"),
                                         "selected": score >= llm_threshold,
-                                        "selection_source": "openrouter",
+                                        "selection_source": url_reasoning_provider,
                                     }
                                 )
                             scored_llm_df = pd.DataFrame(merged_rows).sort_values("score", ascending=False)
@@ -1149,7 +1457,7 @@ with tabs[2]:
                             write_json(_discovered_json_path(site_id), scored_llm_df.to_dict("records"))
                             write_json(score_file, llm_payload)
                             _save_app_state()
-                            st.success(f"OpenRouter selected {int(scored_llm_df['selected'].sum()):,} URL(s) with reasons.")
+                            st.success(f"{url_reasoning_provider.title()} selected {int(scored_llm_df['selected'].sum()):,} URL(s) with reasons.")
                             st.rerun()
 
                 criteria = UrlCriteria(
@@ -1180,7 +1488,7 @@ with tabs[2]:
                     selected_df = scored_df[scored_df["selected"] == True].copy()  # noqa: E712
                     spammy_df = scored_df[(scored_df.get("spammy", False) == True) | (scored_df["selected"] == False)].copy()  # noqa: E712
                     payload = {
-                        "selection_method": "openrouter_scored" if "selection_source" in scored_df.columns and (scored_df["selection_source"] == "openrouter").any() else "local_rules_choose_urls",
+                        "selection_method": "llm_scored" if "selection_source" in scored_df.columns and scored_df["selection_source"].isin(["openrouter", "ollama"]).any() else "local_rules_choose_urls",
                         "default_threshold": threshold,
                         "criteria": {
                             "include_text": include_text,
@@ -1213,39 +1521,14 @@ with tabs[2]:
                         use_container_width=True,
                         hide_index=True,
                     )
-                    with st.expander("Excluded / spammy URLs", expanded=False):
+                    if not spammy_df.empty:
+                        st.caption("Excluded summary")
                         excluded_cols = [col for col in ["score", "url", "host", "reason"] if col in spammy_df.columns]
-                        _render_paginated_df(spammy_df.sort_values("score", ascending=True)[excluded_cols], key_prefix="choose_spammy_urls", default_page_size=100)
-
-        with st.expander("Advanced: Pi scoring import and raw discovered rows", expanded=False):
-            st.caption("Legacy agent scoring is still available as an import path. The normal scrape path uses the selected rows above.")
-            scored_out_path = DATA_ROOT / "sites" / site_id / "selected_urls_llm.json"
-            uploaded_score = st.file_uploader("Import scored URL JSON", type=["json"], key="choose_import_score_json")
-            if uploaded_score is not None:
-                try:
-                    imported_payload = json.loads(uploaded_score.getvalue().decode("utf-8"))
-                    scored = imported_payload.get("scored_urls", []) if isinstance(imported_payload, dict) else imported_payload
-                    if not isinstance(scored, list):
-                        raise ValueError("Expected a list or an object with scored_urls.")
-                    by_url = {str(row.get("url")): row for row in scored if isinstance(row, dict) and row.get("url")}
-                    merged_rows = []
-                    for row in st.session_state.get("discovered", []):
-                        url = str(row.get("url") or "")
-                        score_row = by_url.get(url, {})
-                        merged_rows.append({**row, **score_row, "selected": int(score_row.get("score") or 0) >= int(st.session_state.get("score_threshold", 70))})
-                    st.session_state["discovered"] = merged_rows
-                    st.session_state["selected_df"] = pd.DataFrame(merged_rows)
-                    st.session_state["last_selection_payload"] = imported_payload if isinstance(imported_payload, dict) else {"scored_urls": scored}
-                    write_json(scored_out_path, st.session_state["last_selection_payload"])
-                    _save_app_state()
-                    st.success(f"Imported {len(scored):,} scored URL rows.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Could not import scores: {exc}")
-            if st.session_state.get("discovered"):
-                _render_paginated_df(pd.DataFrame(st.session_state["discovered"]), key_prefix="choose_raw_discovered", default_page_size=100)
-            else:
-                st.info("No discovered rows yet.")
+                        st.dataframe(
+                            spammy_df.sort_values("score", ascending=True)[excluded_cols].head(25),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
 with tabs[3]:
     if not st.session_state["site_id"]:
@@ -1381,10 +1664,7 @@ with tabs[3]:
             if not failed_urls_current:
                 st.info("No failed URLs yet. When failures appear, retry actions will show up here immediately.")
             else:
-                st.caption(
-                    f"{len(failed_urls_current):,} failed URL(s) in this run. "
-                    "Use Quick Retry for immediate reruns or Advanced Triage below for filtered/selected retries."
-                )
+                st.caption(f"{len(failed_urls_current):,} failed URL(s) in this run. Use quick retry for immediate reruns.")
                 quick_retry_cols = st.columns([1.3, 1.3, 2.4])
 
                 def _start_quick_retry(urls_for_retry: list[str], reason_scope: str) -> None:
@@ -1457,7 +1737,7 @@ with tabs[3]:
                 if tavily_quick_disabled:
                     quick_retry_cols[2].info("Set `TAVILY_API_KEY` in Settings to enable quick Tavily retry.")
                 else:
-                    quick_retry_cols[2].caption("Advanced, filtered, and selected retries are available in `Advanced Failure Triage` below.")
+                    quick_retry_cols[2].caption("Tavily retry is available from Settings-enabled recovery.")
 
             st.subheader("Running Pages")
             if pages_df.empty:
@@ -1535,530 +1815,7 @@ with tabs[3]:
                     if waiting_for_first:
                         st.caption("Waiting for first page completion. Queue and worker activity are live.")
 
-            with st.expander("Advanced events, page inspector, and failure triage", expanded=False):
-                st.subheader("Live Event Timeline")
-                log_controls = st.columns([2, 2, 2])
-                show_latest = int(
-                    log_controls[0].number_input("Show latest events", min_value=20, max_value=1500, value=200, step=20)
-                )
-                event_filter = log_controls[1].text_input("Filter event name", value="", key="event_name_filter")
-                only_current = log_controls[2].checkbox("Current URL only", value=False, key="event_current_only")
-                events_df = pd.DataFrame(events or [])
-                if events_df.empty:
-                    st.info("No events yet. Run initializing.")
-                else:
-                    if event_filter.strip() and "event" in events_df.columns:
-                        events_df = events_df[
-                            events_df["event"].astype(str).str.contains(event_filter.strip(), case=False, na=False)
-                        ]
-                    if only_current and status.get("current_url") and "url" in events_df.columns:
-                        events_df = events_df[events_df["url"] == status.get("current_url")]
-                    if "ts" in events_df.columns:
-                        events_df["ts_dt"] = pd.to_datetime(events_df["ts"], errors="coerce", utc=True)
-                        events_df = events_df.sort_values("ts_dt", ascending=False, na_position="last")
-                        events_df["ts_readable"] = events_df["ts_dt"].dt.strftime("%Y-%m-%d %H:%M:%S UTC").fillna("n/a")
-                    else:
-                        events_df["ts_readable"] = "n/a"
-                    events_df = events_df.head(show_latest)
-                    for _, row in events_df.iterrows():
-                        with st.container(border=True):
-                            line = (
-                                f"`{row.get('ts_readable', 'n/a')}` "
-                                f"`{row.get('event', 'event')}` "
-                                f"`{row.get('status') or row.get('state') or ''}`"
-                            )
-                            st.markdown(line)
-                            detail_bits = []
-                            if row.get("url"):
-                                detail_bits.append(f"url: {row.get('url')}")
-                            if row.get("worker_id"):
-                                detail_bits.append(f"worker: {row.get('worker_id')}")
-                            if row.get("fetch_mode"):
-                                detail_bits.append(f"mode: {row.get('fetch_mode')}")
-                            if row.get("http_status") is not None:
-                                detail_bits.append(f"http: {row.get('http_status')}")
-                            reason = row.get("failure_reason") or row.get("error")
-                            if reason:
-                                detail_bits.append(f"reason: {str(reason)[:160]}")
-                            if detail_bits:
-                                st.caption(" | ".join(detail_bits))
-                    with st.expander("Raw events"):
-                        st.dataframe(events_df, use_container_width=True)
-
-                st.subheader("Page Inspector")
-                available_urls = list(page_rows_by_url.keys())
-                inspector_url = str(st.session_state.get("scrape_inspector_url") or "")
-                inspector_manual = bool(st.session_state.get("scrape_inspector_manual", False))
-                running_candidates = [
-                    str(row.get("url") or "").strip()
-                    for row in page_rows_by_url.values()
-                    if str(row.get("status") or "").lower() == "running" and str(row.get("url") or "").strip()
-                ]
-                running_url = running_candidates[0] if running_candidates else ""
-                if not inspector_manual and running_url:
-                    inspector_url = running_url
-                if inspector_url not in available_urls:
-                    inspector_manual = False
-                    if running_url:
-                        inspector_url = running_url
-                    else:
-                        sorted_candidates = sorted(
-                            page_rows_by_url.values(),
-                            key=lambda row: (
-                                0 if str(row.get("status") or "").lower() == "running" else 1,
-                                pd.to_datetime(
-                                    row.get("finished_at") or row.get("started_at"),
-                                    errors="coerce",
-                                    utc=True,
-                                ).value
-                                if pd.notna(pd.to_datetime(row.get("finished_at") or row.get("started_at"), errors="coerce", utc=True))
-                                else -1,
-                            ),
-                            reverse=True,
-                        )
-                        inspector_url = str(sorted_candidates[0].get("url") or "") if sorted_candidates else (available_urls[0] if available_urls else "")
-                st.session_state["scrape_inspector_url"] = inspector_url
-                st.session_state["scrape_inspector_manual"] = inspector_manual
-
-                selector_cols = st.columns([3, 1.3, 1.3, 2])
-                selected_inspector_url = selector_cols[0].selectbox(
-                    "Inspect URL",
-                    options=available_urls,
-                    index=available_urls.index(inspector_url) if inspector_url in available_urls else 0,
-                    key="scrape_inspector_url_selector",
-                )
-                if selected_inspector_url != st.session_state.get("scrape_inspector_url"):
-                    st.session_state["scrape_inspector_manual"] = True
-                    st.session_state["scrape_inspector_url"] = selected_inspector_url
-                if selector_cols[1].button("Follow Running", use_container_width=True):
-                    st.session_state["scrape_inspector_manual"] = False
-                    if running_url:
-                        st.session_state["scrape_inspector_url"] = running_url
-                    st.rerun()
-                if selector_cols[2].button("Reset Auto", use_container_width=True):
-                    st.session_state["scrape_inspector_manual"] = False
-                    st.rerun()
-                selector_cols[3].caption(
-                    f"Mode: `{'manual' if st.session_state.get('scrape_inspector_manual') else 'auto-follow'}`"
-                )
-
-                selected_url = str(st.session_state.get("scrape_inspector_url") or "")
-                selected_page = dict(page_rows_by_url.get(selected_url) or {})
-                page_events = []
-                for event in events or []:
-                    if not isinstance(event, dict):
-                        continue
-                    if str(event.get("url") or "").strip() == selected_url:
-                        page_events.append(event)
-                page_events = sorted(
-                    page_events,
-                    key=lambda e: pd.to_datetime(e.get("ts"), errors="coerce", utc=True).value
-                    if pd.notna(pd.to_datetime(e.get("ts"), errors="coerce", utc=True))
-                    else 0,
-                )
-                retry_event_count = len(
-                    [
-                        e
-                        for e in page_events
-                        if str(e.get("event") or "") in {"fetch_retrying_next_mode", "fetch_exception"}
-                    ]
-                )
-                preview_tabs = st.tabs(["Preview", "Markdown", "Raw HTML", "Metadata", "Events", "Failure"])
-
-                with preview_tabs[0]:
-                    c_a, c_b, c_c, c_d = st.columns(4)
-                    c_a.metric("Status", str(selected_page.get("status") or "queued"))
-                    c_b.metric("Fetch Mode", str(selected_page.get("fetch_mode") or "n/a"))
-                    c_c.metric("HTTP", str(selected_page.get("http_status") if selected_page.get("http_status") is not None else "n/a"))
-                    c_d.metric("Duration (s)", f"{float(selected_page.get('duration_ms') or 0)/1000.0:.2f}")
-                    p1, p2, p3, p4 = st.columns(4)
-                    markdown_text, markdown_path, markdown_size, markdown_err = _safe_read_text(
-                        selected_page.get("markdown_path"),
-                        limit_chars=8000,
-                    )
-                    raw_text, raw_path, raw_size, raw_err = _safe_read_text(
-                        selected_page.get("raw_html_path"),
-                        limit_chars=8000,
-                    )
-                    text_len = len(markdown_text or "")
-                    link_count = (raw_text or "").count("href=")
-                    raw_len = max(len(raw_text or ""), 1)
-                    link_density = (link_count / raw_len) * 1000.0
-                    p1.metric("Markdown chars", f"{text_len:,}")
-                    p2.metric("Raw chars", f"{len(raw_text or ''):,}")
-                    p3.metric("Links (raw)", f"{link_count:,}")
-                    p4.metric("Link density", f"{link_density:.2f}/1k chars")
-                    st.caption(f"URL: `{selected_url}`")
-                    st.caption(f"markdown_path: `{selected_page.get('markdown_path') or 'n/a'}`")
-                    st.caption(f"raw_html_path: `{selected_page.get('raw_html_path') or 'n/a'}`")
-                    st.caption(f"metadata_path: `{selected_page.get('metadata_path') or 'n/a'}`")
-                    if markdown_text:
-                        st.markdown(markdown_text[:4000])
-                    elif raw_text:
-                        st.code(raw_text[:3000], language="html")
-                    else:
-                        st.info("No preview artifact yet. Page may still be queued/running.")
-                        if page_events:
-                            st.caption(f"Recent events for this URL: {len(page_events)}")
-                        if markdown_err:
-                            st.caption(f"Markdown: {markdown_err}")
-                        if raw_err:
-                            st.caption(f"Raw HTML: {raw_err}")
-
-                with preview_tabs[1]:
-                    md_len = st.selectbox("Preview length", options=[2000, 8000, 20000, -1], index=1, format_func=lambda v: "full" if v == -1 else f"{v:,} chars")
-                    md_text, md_path, md_size, md_err = _safe_read_text(
-                        selected_page.get("markdown_path"),
-                        limit_chars=None if md_len == -1 else int(md_len),
-                    )
-                    if md_path:
-                        st.caption(f"Path: `{md_path}`")
-                    if md_size is not None:
-                        st.caption(f"Size: `{md_size/1024.0:.1f} KB`")
-                    if md_err:
-                        st.warning(md_err)
-                    elif md_text is not None:
-                        st.code(md_text, language="markdown")
-                    else:
-                        st.info("Markdown not available yet.")
-
-                with preview_tabs[2]:
-                    raw_len_choice = st.selectbox("Preview length (raw)", options=[2000, 8000, 20000, -1], index=1, format_func=lambda v: "full" if v == -1 else f"{v:,} chars")
-                    html_text, html_path, html_size, html_err = _safe_read_text(
-                        selected_page.get("raw_html_path"),
-                        limit_chars=None if raw_len_choice == -1 else int(raw_len_choice),
-                    )
-                    if html_path:
-                        st.caption(f"Path: `{html_path}`")
-                    if html_size is not None:
-                        st.caption(f"Size: `{html_size/1024.0:.1f} KB`")
-                    if html_err:
-                        st.warning(html_err)
-                    elif html_text is not None:
-                        st.code(html_text, language="html")
-                    else:
-                        st.info("Raw HTML not available yet.")
-
-                with preview_tabs[3]:
-                    merged_metadata = dict(selected_page)
-                    metadata_payload, metadata_path, metadata_err = _safe_read_json(selected_page.get("metadata_path"))
-                    if metadata_path:
-                        st.caption(f"Metadata file: `{metadata_path}`")
-                    if metadata_err:
-                        st.caption(metadata_err)
-                    st.write("Page row")
-                    st.json(selected_page)
-                    if metadata_payload is not None:
-                        st.write("Metadata file payload")
-                        st.json(metadata_payload)
-                        if isinstance(metadata_payload, dict):
-                            for key, val in metadata_payload.items():
-                                merged_metadata.setdefault(f"metadata.{key}", val)
-                    st.write("Merged view")
-                    st.json(merged_metadata)
-
-                with preview_tabs[4]:
-                    if not page_events:
-                        st.info("No events captured for this URL yet.")
-                    else:
-                        timeline_df = pd.DataFrame(page_events)
-                        if "ts" in timeline_df.columns:
-                            timeline_df["ts_dt"] = pd.to_datetime(timeline_df["ts"], errors="coerce", utc=True)
-                            timeline_df["ts_readable"] = timeline_df["ts_dt"].dt.strftime("%Y-%m-%d %H:%M:%S UTC").fillna("n/a")
-                        important = [
-                            "page_started",
-                            "fetch_attempt",
-                            "fetch_retrying_next_mode",
-                            "fetch_exception",
-                            "artifacts_saved",
-                            "page_done",
-                        ]
-                        timeline_df = timeline_df[
-                            timeline_df["event"].astype(str).isin(important)
-                        ] if "event" in timeline_df.columns else timeline_df
-                        _render_paginated_df(
-                            timeline_df[
-                                [
-                                    c
-                                    for c in [
-                                        "ts_readable",
-                                        "event",
-                                        "status",
-                                        "worker_id",
-                                        "attempt",
-                                        "fetch_mode",
-                                        "http_status",
-                                        "failure_reason",
-                                        "error",
-                                    ]
-                                    if c in timeline_df.columns
-                                ]
-                            ],
-                            key_prefix="scrape_inspector_events",
-                            default_page_size=25,
-                        )
-
-                with preview_tabs[5]:
-                    failure_reason = selected_page.get("failure_reason") or selected_page.get("error")
-                    failed_status = str(selected_page.get("status") or "").lower() == "failed"
-                    if not failed_status and not failure_reason:
-                        st.info("No failure recorded for this URL.")
-                    else:
-                        st.error(str(failure_reason or "Failure recorded without reason"))
-                        st.caption(f"HTTP status: `{selected_page.get('http_status')}`")
-                        st.caption(f"Fetch mode: `{selected_page.get('fetch_mode') or 'n/a'}`")
-                        st.caption(f"Attempt: `{selected_page.get('attempt') or 0}`")
-                        st.caption(f"Retry-related events: `{retry_event_count}`")
-                        st.write("Recommended next action")
-                        st.info("Retry this URL with fallback fetch mode and inspect raw HTML artifact for partial content.")
-
-                st.subheader("Advanced Failure Triage")
-                failed_pages = [
-                    dict(row)
-                    for row in page_rows_by_url.values()
-                    if str(row.get("status") or "").lower() == "failed"
-                ]
-                if not failed_pages:
-                    st.info("No failed pages for this run yet.")
-                else:
-                    failed_df = pd.DataFrame(failed_pages)
-                    failed_df["normalized_reason"] = failed_df.apply(
-                        lambda row: _normalize_failure_reason(row.to_dict() if hasattr(row, "to_dict") else dict(row)),
-                        axis=1,
-                    )
-                    http_status_series = (
-                        failed_df["http_status"] if "http_status" in failed_df.columns else pd.Series(pd.NA, index=failed_df.index)
-                    )
-                    failed_df["http_status"] = pd.to_numeric(http_status_series, errors="coerce").astype("Int64")
-                    failed_attempt_series = (
-                        failed_df["attempt"] if "attempt" in failed_df.columns else pd.Series(0, index=failed_df.index)
-                    )
-                    failed_df["attempt"] = pd.to_numeric(failed_attempt_series, errors="coerce").fillna(0).astype(int)
-                    failed_df["last_event_ts"] = pd.to_datetime(
-                        failed_df.get("finished_at").fillna(failed_df.get("started_at")),
-                        errors="coerce",
-                        utc=True,
-                    ).dt.strftime("%Y-%m-%d %H:%M:%S UTC").fillna("n/a")
-                    failed_df["duration_sec"] = (
-                        (
-                            pd.to_datetime(failed_df.get("finished_at"), errors="coerce", utc=True)
-                            - pd.to_datetime(failed_df.get("started_at"), errors="coerce", utc=True)
-                        )
-                        .dt.total_seconds()
-                        .round(2)
-                        .fillna(0.0)
-                    )
-                    failed_df["error"] = failed_df.get("error", pd.Series(dtype=str)).fillna("").astype(str)
-                    failed_df["selected"] = True
-
-                    reason_counts = failed_df["normalized_reason"].value_counts(dropna=False).to_dict()
-                    fsum1, fsum2, fsum3, fsum4 = st.columns(4)
-                    fsum1.metric("Failed URLs", f"{len(failed_df):,}")
-                    fsum2.metric("Failure Types", f"{len(reason_counts):,}")
-                    top_reason = max(reason_counts, key=reason_counts.get) if reason_counts else "n/a"
-                    fsum3.metric("Top Reason", str(top_reason))
-                    fsum4.metric("Max Attempts", f"{int(failed_df['attempt'].max()) if not failed_df.empty else 0}")
-
-                    st.caption("Failure groups")
-                    grp_df = pd.DataFrame(
-                        [{"reason": key, "count": int(val)} for key, val in sorted(reason_counts.items(), key=lambda x: (-x[1], x[0]))]
-                    )
-                    st.dataframe(grp_df, use_container_width=True, hide_index=True)
-
-                    ff1, ff2, ff3, ff4 = st.columns([2, 2, 3, 2])
-                    reason_options = sorted(failed_df["normalized_reason"].dropna().astype(str).unique().tolist())
-                    selected_reasons = ff1.multiselect(
-                        "Failure reason",
-                        options=reason_options,
-                        default=reason_options,
-                        key="triage_reason_filter",
-                    )
-                    http_options = sorted(
-                        [int(x) for x in failed_df["http_status"].dropna().astype(int).unique().tolist()]
-                    )
-                    selected_http = ff2.multiselect(
-                        "HTTP status",
-                        options=http_options,
-                        default=http_options,
-                        key="triage_http_filter",
-                    )
-                    url_filter = ff3.text_input("URL contains", value="", key="triage_url_filter")
-                    mode_options = sorted(failed_df.get("fetch_mode", pd.Series(dtype=str)).fillna("unknown").astype(str).unique().tolist())
-                    selected_modes = ff4.multiselect(
-                        "Fetch mode",
-                        options=mode_options,
-                        default=mode_options,
-                        key="triage_mode_filter",
-                    )
-
-                    triage_df = failed_df.copy()
-                    if selected_reasons:
-                        triage_df = triage_df[triage_df["normalized_reason"].isin(selected_reasons)]
-                    if selected_http:
-                        triage_df = triage_df[triage_df["http_status"].isin(selected_http)]
-                    if url_filter.strip():
-                        triage_df = triage_df[triage_df["url"].astype(str).str.contains(url_filter.strip(), case=False, na=False)]
-                    if selected_modes:
-                        triage_df = triage_df[triage_df.get("fetch_mode", pd.Series(dtype=str)).fillna("unknown").astype(str).isin(selected_modes)]
-
-                    triage_df = triage_df.sort_values(["normalized_reason", "attempt", "url"], ascending=[True, False, True])
-                    if triage_df.empty:
-                        st.info("No failed pages match current triage filters.")
-                    else:
-                        st.caption("Failed pages")
-                        editable_df = triage_df[
-                            [
-                                "selected",
-                                "url",
-                                "normalized_reason",
-                                "failure_reason",
-                                "http_status",
-                                "fetch_mode",
-                                "attempt",
-                                "duration_sec",
-                                "error",
-                                "last_event_ts",
-                            ]
-                        ].copy()
-                        edited = st.data_editor(
-                            editable_df,
-                            use_container_width=True,
-                            hide_index=True,
-                            key="triage_failed_editor",
-                            column_config={"selected": st.column_config.CheckboxColumn("selected", default=True)},
-                            disabled=[
-                                "url",
-                                "normalized_reason",
-                                "failure_reason",
-                                "http_status",
-                                "fetch_mode",
-                                "attempt",
-                                "duration_sec",
-                                "error",
-                                "last_event_ts",
-                            ],
-                        )
-                        selected_urls = edited[edited["selected"] == True]["url"].astype(str).tolist()  # noqa: E712
-                        selected_reason_for_group = st.selectbox(
-                            "Retry by failure type",
-                            options=reason_options,
-                            index=0 if reason_options else None,
-                            key="triage_retry_reason",
-                        )
-                        retry_cols = st.columns([1.2, 1.2, 1.2, 1.2, 2.2])
-                        tavily_enabled = bool(st.session_state.get("tavily_api_key"))
-                        tavily_depth = retry_cols[4].selectbox("Tavily depth", options=["basic", "advanced"], index=0, key="triage_tavily_depth")
-                        tavily_fmt = retry_cols[4].selectbox("Tavily format", options=["markdown", "text"], index=0, key="triage_tavily_fmt")
-
-                        def _start_retry_run(urls_for_retry: list[str], *, reason_scope: str) -> None:
-                            if not urls_for_retry:
-                                st.warning("No URLs selected for retry.")
-                                return
-                            retry_run_id = _next_retry_run_id(st.session_state["run_id"], st.session_state["site_id"])
-                            retry_urls = [
-                                DiscoveredURL(
-                                    url=url,
-                                    source_sitemap="retry",
-                                    path_category="retry",
-                                    selected=True,
-                                )
-                                for url in urls_for_retry
-                            ]
-                            retry_root = _run_root(st.session_state["site_id"], retry_run_id)
-                            write_json(
-                                retry_root / "retry_source.json",
-                                {
-                                    "source_run_id": st.session_state["run_id"],
-                                    "source_site_id": st.session_state["site_id"],
-                                    "retry_reason_scope": reason_scope,
-                                    "urls": urls_for_retry,
-                                    "created_at": datetime.now(timezone.utc).isoformat(),
-                                },
-                            )
-                            runner.start(
-                                st.session_state["site_id"],
-                                retry_run_id,
-                                retry_urls,
-                                concurrency=int(concurrency),
-                            )
-                            st.session_state["run_id"] = retry_run_id
-                            st.session_state["last_run_by_site"][st.session_state["site_id"]] = retry_run_id
-                            _save_app_state()
-                            st.success(f"Started retry run `{retry_run_id}` with {len(urls_for_retry):,} URL(s).")
-                            st.rerun()
-
-                        if retry_cols[0].button("Retry selected", use_container_width=True):
-                            _start_retry_run(selected_urls, reason_scope="selected")
-                        if retry_cols[1].button("Retry all failed", use_container_width=True):
-                            _start_retry_run(failed_df["url"].astype(str).tolist(), reason_scope="all_failed")
-                        if retry_cols[2].button("Retry by type", use_container_width=True):
-                            urls_for_type = failed_df[failed_df["normalized_reason"] == selected_reason_for_group]["url"].astype(str).tolist()
-                            _start_retry_run(urls_for_type, reason_scope=f"type:{selected_reason_for_group}")
-
-                        tavily_call_count = len(selected_urls)
-                        tavily_unit_cost = float(st.session_state.get("tavily_cost_per_call_usd", 0.0))
-                        est_cost = tavily_call_count * tavily_unit_cost
-                        st.caption(
-                            f"Tavily fallback: selected `{tavily_call_count}` URL(s), "
-                            f"estimated cost `${est_cost:.4f}` @ `${tavily_unit_cost:.4f}`/call."
-                        )
-                        if retry_cols[3].button(
-                            "Retry with Tavily fallback",
-                            disabled=(not tavily_enabled) or tavily_call_count == 0,
-                            use_container_width=True,
-                        ):
-                            run_root = _run_root(st.session_state["site_id"], st.session_state["run_id"])
-                            updated_pages, summary = retry_failed_with_tavily(
-                                run_root=run_root,
-                                pages=list(page_rows_by_url.values()),
-                                tavily_api_key=st.session_state["tavily_api_key"],
-                                extract_depth=tavily_depth,
-                                fmt=tavily_fmt,
-                                target_urls=selected_urls,
-                                source_run_id=st.session_state["run_id"],
-                            )
-                            store.set_pages(st.session_state["site_id"], st.session_state["run_id"], updated_pages)
-                            store.set_status(
-                                st.session_state["site_id"],
-                                st.session_state["run_id"],
-                                {
-                                    **status,
-                                    "success": sum(1 for p in updated_pages if str(p.get("status") or "").lower() == "success"),
-                                    "failed": sum(1 for p in updated_pages if str(p.get("status") or "").lower() == "failed"),
-                                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                                },
-                            )
-                            st.success("Tavily fallback retry completed.")
-                            st.json(summary)
-                            st.rerun()
-                        if not tavily_enabled:
-                            st.info("Set `TAVILY_API_KEY` in Settings to enable Tavily fallback retries.")
-
-                        export_urls_txt = "\n".join(triage_df["url"].astype(str).tolist()) + "\n"
-                        export_csv = triage_df.to_csv(index=False)
-                        export_json = triage_df.to_json(orient="records", indent=2)
-                        e1, e2, e3 = st.columns(3)
-                        e1.download_button(
-                            "Export failed URLs TXT",
-                            data=export_urls_txt,
-                            file_name=f"{st.session_state['run_id']}-failed-urls.txt",
-                            mime="text/plain",
-                            use_container_width=True,
-                        )
-                        e2.download_button(
-                            "Export failed pages CSV",
-                            data=export_csv,
-                            file_name=f"{st.session_state['run_id']}-failed-pages.csv",
-                            mime="text/csv",
-                            use_container_width=True,
-                        )
-                        e3.download_button(
-                            "Export failures JSON",
-                            data=export_json,
-                            file_name=f"{st.session_state['run_id']}-failures.json",
-                            mime="application/json",
-                            use_container_width=True,
-                        )
+            # V1 keeps scrape focused on progress, current URL, counts, and quick retry.
 
             _schedule_live_refresh(
                 key="scrape_live_autorefresh_tick",
@@ -2077,22 +1834,12 @@ with tabs[3]:
                 "No run yet. Select URLs and click Start Run to begin live scraping. "
                 "This cockpit will show queue, activity, and timeline immediately."
             )
-            st.subheader("Queue / Activity")
             if selected_url_strings:
-                ready_df = pd.DataFrame({"status": ["queued"] * len(selected_url_strings), "url": selected_url_strings})
-                _render_paginated_df(
-                    ready_df,
-                    key_prefix="scrape_ready_pages",
-                    default_page_size=100,
-                )
+                st.caption(f"Ready to scrape {len(selected_url_strings):,} selected URL(s).")
             else:
                 st.info("No selected URLs yet.")
-            st.subheader("Live Event Timeline")
-            st.info("No events yet.")
-            st.subheader("Inspector Preview")
-            st.info("Start a run to populate preview-ready page activity.")
 
-with tabs[4]:
+if st.session_state.get("_show_legacy_cleanup_ui", False):
     cleanup_site_id = st.session_state.get("site_id", "")
     cleanup_run_id = _resolve_active_run_id(cleanup_site_id, st.session_state.get("run_id", ""))
     if cleanup_run_id and cleanup_run_id != st.session_state.get("run_id", ""):
@@ -2102,193 +1849,18 @@ with tabs[4]:
     if cleanup_site_id and cleanup_run_id:
         root = _run_root(cleanup_site_id, cleanup_run_id)
         st.subheader("Clean")
-        with st.expander("PDF Documents and Graph Wiki Agent", expanded=False):
-            st.caption("Upload university PDFs, convert with Microsoft MarkItDown through Pi, then build graph-style wiki indexes.")
-            doc_topic_hint = st.text_input(
-                "Document topic hint",
-                value=st.session_state.get("document_topic_hint", "registrar schedules catalog finance admissions"),
-                key="document_topic_hint_input",
-            )
-            st.session_state["document_topic_hint"] = doc_topic_hint
-            uploaded_docs = st.file_uploader(
-                "Upload PDFs or office documents",
-                type=["pdf", "docx", "pptx", "xlsx", "xls", "html", "txt", "csv", "json", "xml"],
-                accept_multiple_files=True,
-                key="document_wiki_uploads",
-            )
-            upload_dir = root / "sources" / "pdf_uploads"
-            saved_paths: list[str] = []
-            if uploaded_docs:
-                upload_dir.mkdir(parents=True, exist_ok=True)
-                for uploaded in uploaded_docs:
-                    target = upload_dir / _safe_uploaded_filename(uploaded.name)
-                    target.write_bytes(uploaded.getbuffer())
-                    saved_paths.append(str(target))
-                st.success(f"Saved {len(saved_paths)} uploaded document(s) to `{upload_dir}`.")
+        st.caption("Clean scraped content into wiki-ready markdown. Provider settings live in Settings.")
 
-            if not st.session_state.get("tmux_binary"):
-                st.session_state["tmux_binary"] = _detect_tmux_binary()
-            if not st.session_state.get("pi_binary"):
-                st.session_state["pi_binary"] = _detect_pi_binary()
-            doc_tmux_name = st.text_input(
-                "Document agent tmux session",
-                value=st.session_state.get("document_wiki_tmux_session", "pi-document-wiki"),
-                key="document_wiki_tmux_session_input",
-            )
-            st.session_state["document_wiki_tmux_session"] = doc_tmux_name
-            tmux_bin = st.session_state.get("tmux_binary", "").strip() or None
-            tmux_available = tmux_runner.available(tmux_bin=tmux_bin)
-            doc_tmux_exists = tmux_available and tmux_runner.session_exists(doc_tmux_name, tmux_bin=tmux_bin)
-            instruction_path = root / "document_wiki_agent_task.md"
-            if st.button("Build Document Wiki Agent Task"):
-                source_dir = upload_dir
-                task = f"""# Document Wiki Ingest Task
-
-Use the Pi skill at:
-`{DOCUMENT_WIKI_SKILL_PATH}`
-
-## Inputs
-
-- run_root: `{root}`
-- source_dir: `{source_dir}`
-- site_url: `{st.session_state.get("site_url", "")}`
-- run_id: `{cleanup_run_id}`
-- topic_hint: `{doc_topic_hint}`
-
-## Required work
-
-1. Read the skill file exactly.
-2. Use Microsoft MarkItDown to convert every supported document in `source_dir` to markdown.
-3. Write converted markdown and metadata under `{root / "document_ingest"}`.
-4. Build or update graph-style wiki artifacts under `{root / "wiki"}`:
-   - `index.md`
-   - `graph.json`
-   - `subwikis/<topic>/index.md`
-   - `subwikis/<topic>/pages/*.md`
-5. Write a completion report to `{root / "document_ingest" / "report.md"}`.
-
-If MarkItDown is missing or Python is too old, write a blocker report and stop cleanly.
-"""
-                instruction_path.write_text(task, encoding="utf-8")
-                st.success(f"Task written: `{instruction_path}`")
-                st.code(task, language="markdown")
-
-            doc_cols = st.columns([1, 1, 3])
-            if doc_cols[0].button("Start Document Wiki Agent", disabled=doc_tmux_exists or not tmux_available):
-                if not instruction_path.exists():
-                    st.warning("Build the document wiki task first.")
-                else:
-                    pi_bin = st.session_state.get("pi_binary", "").strip() or "pi"
-                    res = tmux_runner.start_shell(doc_tmux_name, str(ROOT), tmux_bin=tmux_bin)
-                    if not res.get("ok"):
-                        st.error(res.get("error", "Failed to start document wiki agent."))
-                    else:
-                        tmux_runner.send_line(doc_tmux_name, pi_bin, tmux_bin=tmux_bin)
-                        time.sleep(0.8)
-                        tmux_runner.send_line(
-                            doc_tmux_name,
-                            f"Read and execute the full task from this file: {instruction_path}",
-                            tmux_bin=tmux_bin,
-                        )
-                        st.success("Document wiki agent started.")
-            if doc_cols[1].button("Stop Document Agent", disabled=not doc_tmux_exists):
-                res = tmux_runner.kill(doc_tmux_name, tmux_bin=tmux_bin)
-                if not res.get("ok"):
-                    st.error(res.get("error", "Failed to stop document agent."))
-                else:
-                    st.warning("Document agent stopped.")
-                    st.rerun()
-            if not tmux_available:
-                doc_cols[2].warning("tmux is not available. Set tmux path in URL scoring advanced settings.")
-            elif doc_tmux_exists:
-                st.caption("Document agent console")
-                st.code(tmux_runner.capture(doc_tmux_name, lines=220, tmux_bin=tmux_bin), language="text")
-            else:
-                report_path = root / "document_ingest" / "report.md"
-                graph_path = root / "wiki" / "graph.json"
-                if report_path.exists():
-                    st.caption(f"Latest report: `{report_path}`")
-                    st.markdown(report_path.read_text(encoding="utf-8", errors="replace")[:4000])
-                if graph_path.exists():
-                    st.caption(f"Wiki graph: `{graph_path}`")
-                    st.json(read_json(graph_path, {}))
-
-        provider_label = st.selectbox(
-            "Cleanup provider",
-            options=["OpenRouter recommended", "Ollama local"],
-            index=0 if st.session_state.get("cleanup_provider", "openrouter") == "openrouter" else 1,
-        )
-        cleanup_provider = "openrouter" if provider_label.startswith("OpenRouter") else "ollama"
-        st.session_state["cleanup_provider"] = cleanup_provider
-        model_row1, model_row2 = st.columns([1, 2])
-        if cleanup_provider == "ollama" and model_row1.button("Fetch models from Ollama API", key="cleanup_fetch_ollama_models"):
-            try:
-                st.session_state["ollama_models"] = fetch_ollama_models(
-                    _normalize_ollama_base_url(st.session_state.get("ollama_base_url", OLLAMA_BASE_URL))
-                )
-                st.success(f"Loaded {len(st.session_state.get('ollama_models', []))} models from Ollama.")
-            except Exception as exc:
-                st.error(f"Could not fetch models: {exc}")
-        if cleanup_provider == "openrouter" and model_row1.button("Fetch OpenRouter models", key="cleanup_fetch_openrouter_models"):
-            try:
-                st.session_state["openrouter_models"] = fetch_openrouter_models(st.session_state.get("openrouter_api_key", "").strip())
-                st.success(f"Loaded {len(st.session_state.get('openrouter_models', []))} OpenRouter models.")
-            except Exception as exc:
-                st.error(f"Could not fetch models: {exc}")
-        ollama_model_options = [
-            str(m.get("id") or "").strip()
-            for m in st.session_state.get("ollama_models", [])
-            if str(m.get("id") or "").strip()
-        ]
-        openrouter_model_options = [
-            str(m.get("id") or "").strip()
-            for m in st.session_state.get("openrouter_models", [])
-            if str(m.get("id") or "").strip()
-        ]
-        if cleanup_provider == "openrouter" and openrouter_model_options:
-            current_model = str(st.session_state.get("default_or_model") or "deepseek/deepseek-v4-flash").strip()
-            model_idx = openrouter_model_options.index(current_model) if current_model in openrouter_model_options else 0
-            cleanup_model = model_row2.selectbox("OpenRouter model", options=openrouter_model_options, index=model_idx)
-            st.session_state["default_or_model"] = cleanup_model
-        elif cleanup_provider == "openrouter":
-            cleanup_model = model_row2.text_input("OpenRouter model", value=st.session_state.get("default_or_model", "deepseek/deepseek-v4-flash"))
-            st.session_state["default_or_model"] = cleanup_model
-        elif ollama_model_options:
-            current_ollama_model = str(st.session_state.get("ollama_model") or "").strip()
-            model_idx = ollama_model_options.index(current_ollama_model) if current_ollama_model in ollama_model_options else 0
-            st.session_state["ollama_model"] = model_row2.selectbox(
-                "Ollama model name",
-                options=ollama_model_options,
-                index=model_idx,
-                help="Live model list from Ollama /api/tags.",
-            )
-        else:
-            st.session_state["ollama_model"] = model_row2.text_input(
-                "Ollama model name",
-                value=st.session_state["ollama_model"] or "qwen2.5:1.5b",
-                help="Example: qwen2.5:1.5b, llama3.2:1b, qwen2.5:3b",
-            )
-        with st.expander("Advanced cleanup model settings", expanded=False):
-            st.session_state["ollama_base_url"] = st.text_input(
-                "Ollama base URL", value=st.session_state.get("ollama_base_url", OLLAMA_BASE_URL)
-            )
-        st.session_state["ollama_base_url"] = _normalize_ollama_base_url(st.session_state["ollama_base_url"])
+        cleanup_provider = st.session_state.get("cleanup_provider", "openrouter")
+        provider_label = "OpenRouter" if cleanup_provider == "openrouter" else "Ollama"
+        cleanup_model = st.session_state.get("default_or_model", "deepseek/deepseek-v4-flash") if cleanup_provider == "openrouter" else st.session_state.get("ollama_model", "qwen2.5:1.5b")
+        st.metric("Cleanup Provider", f"{provider_label} / {cleanup_model}")
+        st.session_state["ollama_base_url"] = _normalize_ollama_base_url(st.session_state.get("ollama_base_url", OLLAMA_BASE_URL))
         ollama_url = st.session_state["ollama_base_url"]
-        max_tokens = st.number_input("Max tokens per page cleanup", min_value=256, max_value=8192, value=2048, step=256)
-        think_enabled = st.checkbox(
-            "Enable thinking mode (slower, deeper reasoning)",
-            value=False,
-            help="OFF uses `think: false` with `/api/chat` for faster cleanup calls.",
-        )
-        concurrency = st.slider("Cleanup concurrency limit", min_value=1, max_value=8, value=1, step=1)
+        max_tokens = 2048
+        think_enabled = False
+        concurrency = int(st.session_state.get("cleanup_concurrency", 1))
         available = bool(st.session_state.get("openrouter_api_key")) if cleanup_provider == "openrouter" else ollama_available(ollama_url)
-        if cleanup_provider == "ollama" and not available:
-            if st.button("Auto-detect Ollama URL", key="cleanup_detect_ollama_url"):
-                detected = _detect_reachable_ollama_url(ollama_url)
-                st.session_state["ollama_base_url"] = detected
-                _save_app_state()
-                st.info(f"Updated Ollama base URL to `{detected}`")
-                st.rerun()
         cleanup_active = cleanup_runner.is_active(cleanup_site_id, cleanup_run_id)
         c1, c2, c3 = st.columns(3)
         if cleanup_provider == "openrouter" and not available:
@@ -2328,19 +1900,6 @@ If MarkItDown is missing or Python is too old, write a blocker report and stop c
         if auto_refresh_cleanup and st_autorefresh is None:
             st.caption("Install `streamlit-autorefresh` to enable this without blocking. Use Refresh for now.")
 
-        with st.expander("Reset Cleanup (Start From Scratch)", expanded=False):
-            st.warning("This clears cleanup artifacts for the current run only. Scraped source markdown/HTML is kept.")
-            hard_reset = st.checkbox("I understand this will delete previous cleaned outputs for this run", value=False)
-            if st.button("Start Fresh Cleanup", disabled=(not hard_reset) or cleanup_active):
-                cleaned_dir = root / "cleaned_markdown"
-                if cleaned_dir.exists():
-                    shutil.rmtree(cleaned_dir, ignore_errors=True)
-                for p in [root / "cleanup_manifest.json", root / "cleanup_status.json", root / "cleanup_events.jsonl"]:
-                    if p.exists():
-                        p.unlink(missing_ok=True)
-                store.clear_cleanup_run(cleanup_site_id, cleanup_run_id)
-                st.success("Cleanup state reset for this run. Click `Start Cleanup Queue` to run from scratch.")
-                st.rerun()
 
         cleanup_status = store.get_cleanup_status(cleanup_site_id, cleanup_run_id)
         cleanup_items = store.get_cleanup_items(cleanup_site_id, cleanup_run_id)
@@ -2385,13 +1944,7 @@ If MarkItDown is missing or Python is too old, write a blocker report and stop c
             k2.metric("Running", int((qdf["status"] == "running").sum()))
             k3.metric("Cleaned", int((qdf["status"] == "cleaned").sum()))
             k4.metric("Skipped / Failed", int((qdf["status"] == "skipped").sum()) + int((qdf["status"] == "failed").sum()))
-            with st.expander("Advanced full cleanup queue", expanded=False):
-                st.dataframe(qdf, use_container_width=True, hide_index=True)
-                if cleanup_status:
-                    st.json(cleanup_status)
-        if cleanup_events:
-            with st.expander("Advanced cleanup events", expanded=False):
-                st.dataframe(pd.DataFrame(cleanup_events), use_container_width=True)
+        # Full cleanup queue and raw events are intentionally omitted from the V1 UI.
 
         cleanup_manifest = read_json(root / "cleanup_manifest.json", cleanup_items)
         cleaned_rows = [r for r in cleanup_manifest if r.get("status") == "cleaned" and r.get("cleaned_markdown_path")]
@@ -2425,49 +1978,7 @@ If MarkItDown is missing or Python is too old, write a blocker report and stop c
                 "No cleanup output yet for this run. Click `Start Cleanup Queue` (or `Resume Cleanup Queue`) to generate cleaned markdown files."
             )
 
-        st.subheader("Retry Failed URLs with Tavily")
-        with st.expander("Tavily Settings", expanded=False):
-            tavily_key = st.text_input(
-                "TAVILY_API_KEY",
-                value=st.session_state.get("tavily_api_key", ""),
-                type="password",
-                help="Saved locally to .env in this project.",
-            )
-            t1, t2 = st.columns(2)
-            if t1.button("Save Tavily Key to .env"):
-                _save_env_key(ENV_PATH, "TAVILY_API_KEY", tavily_key.strip())
-                st.session_state["tavily_api_key"] = tavily_key.strip()
-                _save_app_state()
-                st.success("Saved TAVILY_API_KEY")
-            if t2.button("Reload Tavily Key from .env"):
-                fresh = _load_env_file(ENV_PATH).get("TAVILY_API_KEY", "")
-                st.session_state["tavily_api_key"] = fresh
-                st.info("Reloaded TAVILY_API_KEY from .env")
-
-        pages_current = store.get_pages(cleanup_site_id, cleanup_run_id)
-        failed_count = sum(1 for p in pages_current if p.get("status") == "failed")
-        st.caption(f"Failed URLs available for Tavily retry: {failed_count}")
-        td1, td2 = st.columns(2)
-        tavily_depth = td1.selectbox("Tavily extract depth", options=["basic", "advanced"], index=0)
-        tavily_fmt = td2.selectbox("Tavily format", options=["markdown", "text"], index=0)
-        if st.button("Retry Failed with Tavily", disabled=failed_count == 0 or not st.session_state.get("tavily_api_key")):
-            updated_pages, summary = retry_failed_with_tavily(
-                run_root=root,
-                pages=pages_current,
-                tavily_api_key=st.session_state["tavily_api_key"],
-                extract_depth=tavily_depth,
-                fmt=tavily_fmt,
-            )
-            store.set_pages(cleanup_site_id, cleanup_run_id, updated_pages)
-            st.success("Tavily retry completed.")
-            st.json(summary)
-            st.rerun()
-        with st.expander("Claude Plan", expanded=False):
-            render_claude_plan_section(
-                run_root=root,
-                site_url=st.session_state.get("site_url", ""),
-                run_id=st.session_state.get("run_id", ""),
-            )
+        # Tavily retry and Claude plan controls are omitted from V1.
 
         _schedule_live_refresh(
             key="cleanup_live_autorefresh_tick",
@@ -2478,7 +1989,7 @@ If MarkItDown is missing or Python is too old, write a blocker report and stop c
     else:
         st.info("Complete a scrape run first.")
 
-with tabs[5]:
+if st.session_state.get("_show_legacy_review_ui", False):
     st.subheader("Review")
     if not st.session_state.get("site_id"):
         st.info("Select or create a site first.")
@@ -2926,145 +2437,303 @@ with tabs[5]:
                                 use_container_width=True,
                             )
 
-                    with st.expander("Raw Events"):
-                        st.dataframe(trace_df, use_container_width=True)
                 else:
                     st.info("No trace events for this run yet.")
 
-with tabs[6]:
+with tabs[4]:
+    st.subheader("Knowledge Graph")
+    if not st.session_state.get("site_id"):
+        st.info("Select or create a site first.")
+    else:
+        site_root = DATA_ROOT / "sites" / st.session_state["site_id"]
+        graph_run_choices = sorted([d.name for d in site_root.iterdir() if d.is_dir() and d.name != "meta"]) if site_root.exists() else []
+        graph_real_runs = [name for name in graph_run_choices if _graph_is_real_scrape_run(name)]
+        if not graph_real_runs:
+            st.info("No raw markdown run is available yet. Scrape pages first, then build the graph.")
+        else:
+            latest_graph_run = graph_real_runs[-1]
+            current_graph_run = st.session_state.get("graph_run", "")
+            selected_graph_run = current_graph_run if current_graph_run in graph_real_runs else latest_graph_run
+            selected_graph_index = graph_real_runs.index(selected_graph_run)
+            graph_run = st.selectbox(
+                "Run",
+                options=graph_real_runs,
+                index=selected_graph_index,
+                key="graph_run",
+                format_func=lambda run_name: f"Run {_run_human_timestamp(run_name)}",
+            )
+            graph_run_root = site_root / graph_run
+            graph_dir = knowledge_graph_dir(graph_run_root)
+            stats = load_graph_stats(graph_run_root)
+            raw_files = _raw_markdown_files(graph_run_root)
+            raw_count = len(raw_files)
+            page_count = int(stats.get("page_nodes") or 0)
+            unit_count = int(stats.get("unit_nodes") or 0)
+            edge_count = int(stats.get("edges") or 0)
+            status_label = "ready" if stats.get("status") == "ready" else "missing"
+            if stats.get("counts_match") is False:
+                status_label = "count mismatch"
+
+            g1, g2, g3, g4, g5 = st.columns([1, 1, 1, 1, 1.4])
+            g1.metric("Raw Files", f"{raw_count:,}")
+            g2.metric("Page Nodes", f"{page_count:,}")
+            g3.metric("Units", f"{unit_count:,}")
+            g4.metric("Edges", f"{edge_count:,}")
+            g5.metric("Graph Status", status_label)
+            st.caption(f"Primary retrieval graph: `{graph_dir / 'graph.json'}`")
+
+            b1, b2, b3, b4 = st.columns([1.4, 1.6, 1.2, 2.8])
+            if b1.button("Build Deterministic Graph", type="primary", key="build_deterministic_kg"):
+                try:
+                    graph = build_markdown_graph(graph_run_root, st.session_state["site_id"], graph_run)
+                    st.success(
+                        f"Built graph with {graph['counts']['page_nodes']:,} page nodes and {graph['counts']['edges']:,} edges."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Graph build failed: {exc}")
+
+            selected_unit_for_enrich = b2.selectbox(
+                "Semantic enrichment unit",
+                options=[row.get("unit_key") for row in graph_list_units(graph_run_root) if row.get("page_count", 0) > 0] or [""],
+                help="Optional bounded enrichment merged into knowledge_graph/graph.json. Deterministic graph does not require it.",
+                key="semantic_enrichment_unit",
+            )
+            if b3.button("Rebuild Query Index", disabled=stats.get("status") != "ready", key="rebuild_kg_query_index"):
+                try:
+                    st.json(rebuild_graph_query_index(graph_run_root))
+                except Exception as exc:
+                    st.error(f"Query index rebuild failed: {exc}")
+            b4.caption(
+                "Use Build Deterministic Graph for the real retrieval graph. The old Graphify runner is no longer the primary graph path."
+            )
+            if st.button(
+                "Run Semantic Enrichment for Selected Unit",
+                disabled=stats.get("status") != "ready" or not selected_unit_for_enrich,
+                key="run_semantic_enrichment_unit",
+            ):
+                try:
+                    st.json(run_graphify_enrichment_for_unit(graph_run_root, str(selected_unit_for_enrich)))
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Semantic enrichment failed: {exc}")
+
+            if stats.get("status") != "ready":
+                st.info("Build the deterministic graph to enable inspection and retrieval controls.")
+            else:
+                dist = load_unit_distribution(graph_run_root)
+                no_unit = load_pages_without_unit_tags(graph_run_root)
+                orphaned = load_graph_orphan_pages(graph_run_root)
+                tags = load_graph_tags(graph_run_root)
+                edges = load_graph_edges(graph_run_root)
+                pages = load_graph_page_nodes(graph_run_root)
+
+                st.caption("Coverage")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Tagged Pages", f"{len({t.get('page_id') for t in tags}):,}")
+                c2.metric("Pages Without Unit", f"{len(no_unit):,}")
+                c3.metric("Orphan Pages", f"{len(orphaned):,}")
+                c4.metric("Graph Count Match", "yes" if stats.get("counts_match") else "no")
+
+                left, right = st.columns([1.2, 1])
+                with left:
+                    st.caption("Unit Distribution")
+                    if dist:
+                        st.dataframe(pd.DataFrame(dist), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No unit tags found.")
+                with right:
+                    st.caption("Edge Types")
+                    edge_counts = pd.DataFrame(
+                        [{"type": key, "count": val} for key, val in Counter([edge.get("type") for edge in edges]).items()]
+                    ).sort_values("count", ascending=False)
+                    st.dataframe(edge_counts, use_container_width=True, hide_index=True)
+
+                with st.expander("Pages without unit tags", expanded=False):
+                    if no_unit:
+                        st.dataframe(
+                            pd.DataFrame(no_unit)[[c for c in ["id", "title", "source_url", "path"] if c in no_unit[0]]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.success("Every page has at least one unit tag.")
+                with st.expander("Orphan pages and isolated nodes", expanded=False):
+                    if orphaned:
+                        st.dataframe(
+                            pd.DataFrame(orphaned)[[c for c in ["id", "title", "source_url", "path"] if c in orphaned[0]]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.success("No orphan pages.")
+
+                inspect_tabs = st.tabs(["Query", "Path", "Explain", "Knowledge Graph HTML"])
+                with inspect_tabs[0]:
+                    st.markdown("#### Ask the markdown graph")
+                    unit_options = [""] + [str(row.get("unit_key")) for row in graph_list_units(graph_run_root) if row.get("page_count", 0) > 0]
+                    graph_query = st.text_area(
+                        "Ask a question",
+                        value="I-20 international students",
+                        height=90,
+                        key="kg_query",
+                        help="This queries the deterministic raw-markdown graph and returns source markdown evidence for the LLM.",
+                    )
+                    q1, q2, q3 = st.columns([1.6, 1, 1])
+                    graph_unit = q1.selectbox("Unit filter", options=unit_options, index=0, key="kg_query_unit")
+                    graph_limit = int(q2.number_input("Page result limit", min_value=1, max_value=50, value=10, key="kg_query_limit"))
+                    context_budget = int(q3.number_input("Evidence budget", min_value=1000, max_value=50000, value=12000, step=1000, key="kg_context_budget"))
+                    ask_col, search_col = st.columns([1, 1])
+                    ask_clicked = ask_col.button("Ask Graph / Get Evidence", type="primary", key="kg_build_context")
+                    search_clicked = search_col.button("Search Matching Pages", key="kg_search_pages")
+                    if ask_clicked:
+                        context = graph_answer_context(graph_run_root, graph_query, unit=graph_unit or None, budget_chars=context_budget)
+                        st.success(f"Found {len(context.get('evidence', []))} evidence item(s), {context.get('used_chars', 0)} chars.")
+                        for item in context.get("evidence", []):
+                            with st.container(border=True):
+                                st.markdown(f"**{item.get('title') or item.get('page_id')}**")
+                                st.caption(f"{item.get('source_url')} | `{item.get('path')}`")
+                                st.code(item.get("markdown_excerpt", ""), language="markdown")
+                        with st.expander("Raw MCP-style answer_context payload", expanded=False):
+                            st.json({k: v for k, v in context.items() if k != "evidence"})
+                    if search_clicked:
+                        results = graph_search_pages(graph_run_root, graph_query, unit=graph_unit or None, limit=graph_limit)
+                        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+                with inspect_tabs[1]:
+                    page_options = [page.get("id") for page in pages]
+                    p1, p2, p3 = st.columns([1.5, 1.5, 1])
+                    from_page = p1.selectbox("From page", options=page_options, index=0 if page_options else None, key="kg_path_from")
+                    to_page = p2.selectbox("To page", options=page_options, index=min(1, len(page_options) - 1) if page_options else None, key="kg_path_to")
+                    depth = int(p3.number_input("Depth", min_value=1, max_value=4, value=1, key="kg_traverse_depth"))
+                    if st.button("Traverse From Page", disabled=not from_page, key="kg_traverse"):
+                        st.json(graph_traverse_from_page(graph_run_root, str(from_page), depth=depth))
+                    if st.button("Shortest Path", disabled=not from_page or not to_page, key="kg_shortest_path"):
+                        st.json(graph_shortest_path(graph_run_root, str(from_page), str(to_page)))
+                with inspect_tabs[2]:
+                    selected_unit = st.selectbox("Unit pages", options=unit_options, key="kg_explain_unit")
+                    if selected_unit:
+                        rows = graph_get_unit_pages(graph_run_root, selected_unit, limit=200)
+                        st.dataframe(
+                            pd.DataFrame(rows)[[c for c in ["id", "title", "source_url", "path"] if rows and c in rows[0]]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    with st.expander("Build status JSON", expanded=False):
+                        st.json(read_json(graph_dir / "build_status.json", {}))
+                with inspect_tabs[3]:
+                    graph_html = graph_dir / "graph.html"
+                    if graph_html.exists():
+                        st.caption(f"Rendered from `{graph_html}`. This is the deterministic knowledge graph summary.")
+                        components.html(graph_html.read_text(encoding="utf-8", errors="replace"), height=650, scrolling=True)
+                    else:
+                        st.info("HTML graph view will appear after build.")
+with tabs[5]:
     st.subheader("Settings")
-    st.caption("Choose the default LLM provider and model for scoring/selection workflows.")
-    with st.expander("Provider Credentials", expanded=False):
-        or1, or2 = st.columns(2)
-        openrouter_key = or1.text_input(
-            "OPENROUTER_API_KEY",
-            value=st.session_state.get("openrouter_api_key", ""),
-            type="password",
-            help="Saved locally to .env in this project.",
-        )
-        if or1.button("Save OpenRouter Key to .env"):
-            _save_env_key(ENV_PATH, "OPENROUTER_API_KEY", openrouter_key.strip())
-            st.session_state["openrouter_api_key"] = openrouter_key.strip()
-            os.environ["OPENROUTER_API_KEY"] = openrouter_key.strip()
-            _save_app_state()
-            st.success("Saved OPENROUTER_API_KEY")
-        if or2.button("Reload OpenRouter Key from .env"):
-            fresh = _load_env_file(ENV_PATH).get("OPENROUTER_API_KEY", "")
-            st.session_state["openrouter_api_key"] = fresh
-            if fresh:
-                os.environ["OPENROUTER_API_KEY"] = fresh
-            st.info("Reloaded OPENROUTER_API_KEY from .env")
+    st.caption("One place for keys, providers, models, embeddings, and vector search.")
 
-    pcol1, pcol2 = st.columns([1, 2])
-    st.session_state["llm_provider"] = pcol1.selectbox(
-        "Default LLM provider",
-        options=["openrouter", "ollama"],
-        index=0 if st.session_state.get("llm_provider", "openrouter") == "openrouter" else 1,
+    st.write("Providers")
+    or1, or2 = st.columns([2, 1])
+    openrouter_key = or1.text_input(
+        "OPENROUTER_API_KEY",
+        value=st.session_state.get("openrouter_api_key", ""),
+        type="password",
+        help="Saved locally to .env in this project.",
     )
-    st.session_state["ollama_base_url"] = pcol2.text_input(
-        "Ollama base URL",
-        value=st.session_state.get("ollama_base_url", OLLAMA_BASE_URL),
-        help="Ollama API base, e.g. http://localhost:11434",
-    )
-    st.session_state["ollama_base_url"] = _normalize_ollama_base_url(st.session_state["ollama_base_url"])
-
-    model_options: list[str] = []
-    model_help = ""
-    if st.session_state["llm_provider"] == "openrouter":
-        model_options = [
-            str(m.get("id") or "").strip()
-            for m in st.session_state.get("openrouter_models", [])
-            if str(m.get("id") or "").strip()
-        ]
-        model_help = "Uses OpenRouter model IDs from the latest refresh."
-    else:
-        model_options = [
-            str(m.get("id") or "").strip()
-            for m in st.session_state.get("ollama_models", [])
-            if str(m.get("id") or "").strip()
-        ]
-        model_help = "Uses locally available models returned by Ollama /api/tags."
-
-    current_model = str(st.session_state.get("default_or_model", "deepseek/deepseek-v4-flash")).strip()
-    if model_options:
-        model_index = model_options.index(current_model) if current_model in model_options else 0
-        st.session_state["default_or_model"] = st.selectbox(
-            "Default model",
-            options=model_options,
-            index=model_index,
-            help=model_help,
-        )
-    else:
-        st.session_state["default_or_model"] = st.text_input(
-            "Default model",
-            value=current_model,
-            help=f"{model_help} If cache is empty, enter model manually or refresh models below.",
-        )
-
-    s1, s2 = st.columns(2)
-    st.session_state["default_llm_cap"] = int(
-        s2.number_input("Default max URLs", min_value=10, max_value=5000, value=int(st.session_state.get("default_llm_cap", 150)))
-    )
-    st.session_state["default_llm_batch_size"] = int(
-        s2.number_input("Default LLM batch size", min_value=50, max_value=600, value=int(st.session_state.get("default_llm_batch_size", 250)), step=25)
-    )
-    st.session_state["default_llm_sleep_sec"] = float(
-        s2.number_input("Default sleep between batches (sec)", min_value=0.0, max_value=30.0, value=float(st.session_state.get("default_llm_sleep_sec", 0.0)), step=0.5)
-    )
-
-    with st.expander("Advanced Pricing", expanded=False):
-        st.caption("OpenRouter cost uses model pricing from the OpenRouter model list.")
-        rp1, rp2, rp3 = st.columns([1, 1, 2])
-        if rp1.button("Refresh OpenRouter Models"):
-            try:
-                st.session_state["openrouter_models"] = fetch_openrouter_models(st.session_state.get("openrouter_api_key", "").strip())
-                st.success(f"Loaded {len(st.session_state['openrouter_models'])} OpenRouter models.")
-            except Exception as exc:
-                st.error(f"Model refresh failed: {exc}")
-        if rp2.button("Refresh Ollama Models"):
-            try:
-                st.session_state["ollama_models"] = fetch_ollama_models(
-                    st.session_state.get("ollama_base_url", OLLAMA_BASE_URL).strip()
-                )
-                st.success(f"Loaded {len(st.session_state['ollama_models'])} Ollama models.")
-            except Exception as exc:
-                st.error(f"Ollama model refresh failed: {exc}")
-        rp3.caption(
-            f"Cached: OpenRouter `{len(st.session_state.get('openrouter_models', []))}` | "
-            f"Ollama `{len(st.session_state.get('ollama_models', []))}`"
-        )
-
-        ollama_pull_model = st.text_input(
-            "Pull model to Ollama",
-            value="",
-            placeholder="e.g. qwen2.5:3b",
-            help="Calls Ollama /api/pull and then refreshes local model list.",
-        )
-        if st.button("Pull Model via Ollama API", disabled=not ollama_pull_model.strip()):
-            try:
-                pull_result = pull_ollama_model(
-                    st.session_state.get("ollama_base_url", OLLAMA_BASE_URL).strip(),
-                    ollama_pull_model.strip(),
-                    stream=False,
-                )
-                st.session_state["ollama_models"] = fetch_ollama_models(
-                    st.session_state.get("ollama_base_url", OLLAMA_BASE_URL).strip()
-                )
-                st.success(f"Pulled `{ollama_pull_model.strip()}`")
-                st.json(pull_result)
-            except Exception as exc:
-                st.error(f"Ollama pull failed: {exc}")
-
-        p1, p2, p3 = st.columns(3)
-        st.session_state["tavily_cost_per_call_usd"] = float(
-            p1.number_input("Tavily cost per call (USD)", min_value=0.0, value=float(st.session_state.get("tavily_cost_per_call_usd", 0.0)), step=0.001, format="%.6f")
-        )
-        st.session_state["ollama_input_per_m_usd"] = float(
-            p2.number_input("Ollama input /1M tok (USD)", min_value=0.0, value=float(st.session_state.get("ollama_input_per_m_usd", 0.0)), step=0.01, format="%.6f")
-        )
-        st.session_state["ollama_output_per_m_usd"] = float(
-            p3.number_input("Ollama output /1M tok (USD)", min_value=0.0, value=float(st.session_state.get("ollama_output_per_m_usd", 0.0)), step=0.01, format="%.6f")
-        )
-    if st.button("Save Defaults"):
+    if or2.button("Save OpenRouter Key", use_container_width=True):
+        _save_env_key(ENV_PATH, "OPENROUTER_API_KEY", openrouter_key.strip())
+        st.session_state["openrouter_api_key"] = openrouter_key.strip()
+        os.environ["OPENROUTER_API_KEY"] = openrouter_key.strip()
         _save_app_state()
-        st.success("Defaults saved.")
+        st.success("Saved OpenRouter key")
+
+    tav1, tav2 = st.columns([2, 1])
+    tavily_key = tav1.text_input(
+        "TAVILY_API_KEY",
+        value=st.session_state.get("tavily_api_key", ""),
+        type="password",
+        help="Optional. Used for university map research and failed-source recovery when enabled.",
+    )
+    if tav2.button("Save Tavily Key", use_container_width=True):
+        _save_env_key(ENV_PATH, "TAVILY_API_KEY", tavily_key.strip())
+        st.session_state["tavily_api_key"] = tavily_key.strip()
+        _save_app_state()
+        st.success("Saved Tavily key")
+
+    st.write("Task Providers")
+    tr1, tr2, tr3 = st.columns([1, 1.5, 1.5])
+    current_url_provider = st.session_state.get("url_reasoning_provider", "openrouter")
+    st.session_state["url_reasoning_provider"] = tr1.selectbox(
+        "URL reasoning",
+        options=["openrouter", "ollama"],
+        index=["openrouter", "ollama"].index(current_url_provider) if current_url_provider in {"openrouter", "ollama"} else 0,
+    )
+    st.session_state["url_reasoning_openrouter_model"] = tr2.text_input(
+        "URL OpenRouter model",
+        value=st.session_state.get("url_reasoning_openrouter_model")
+        or st.session_state.get("url_reasoning_model")
+        or st.session_state.get("default_or_model", "deepseek/deepseek-v4-flash"),
+    )
+    st.session_state["url_reasoning_ollama_model"] = tr3.text_input(
+        "URL Ollama model",
+        value=st.session_state.get("url_reasoning_ollama_model") or st.session_state.get("ollama_model") or "qwen2.5:3b",
+    )
+
+    tg1, tg2, tg3 = st.columns([1, 1.5, 1.5])
+    current_graph_provider = st.session_state.get("graph_enrichment_provider", "ollama")
+    st.session_state["graph_enrichment_provider"] = tg1.selectbox(
+        "Graph enrichment",
+        options=["deterministic", "openrouter", "ollama"],
+        index=["deterministic", "openrouter", "ollama"].index(current_graph_provider)
+        if current_graph_provider in {"deterministic", "openrouter", "ollama"}
+        else 2,
+        help="Deterministic graph is the primary path. Provider applies only to optional semantic enrichment.",
+    )
+    st.session_state["graph_enrichment_openrouter_model"] = tg2.text_input(
+        "Graph OpenRouter model",
+        value=st.session_state.get("graph_enrichment_openrouter_model") or st.session_state.get("graphify_model", "openai/gpt-4.1-mini"),
+    )
+    st.session_state["graph_enrichment_ollama_model"] = tg3.text_input(
+        "Graph Ollama model",
+        value=st.session_state.get("graph_enrichment_ollama_model") or st.session_state.get("ollama_model") or "qwen2.5:3b",
+    )
+
+    ta1, ta2, ta3 = st.columns([1, 1.5, 1.5])
+    current_answer_provider = st.session_state.get("graph_answer_provider", "openrouter")
+    st.session_state["graph_answer_provider"] = ta1.selectbox(
+        "Graph Q&A",
+        options=["openrouter", "ollama"],
+        index=["openrouter", "ollama"].index(current_answer_provider) if current_answer_provider in {"openrouter", "ollama"} else 0,
+    )
+    st.session_state["graph_answer_openrouter_model"] = ta2.text_input(
+        "Q&A OpenRouter model",
+        value=st.session_state.get("graph_answer_openrouter_model") or st.session_state.get("default_or_model", "deepseek/deepseek-v4-flash"),
+    )
+    st.session_state["graph_answer_ollama_model"] = ta3.text_input(
+        "Q&A Ollama model",
+        value=st.session_state.get("graph_answer_ollama_model") or st.session_state.get("ollama_model") or "qwen2.5:3b",
+    )
+
+    st.write("Runtime")
+    o1, o2 = st.columns(2)
+    st.session_state["ollama_base_url"] = _normalize_ollama_base_url(o1.text_input("Ollama base URL", value=st.session_state.get("ollama_base_url", OLLAMA_BASE_URL)))
+    st.session_state["scrape_concurrency"] = int(o2.number_input("Scrape concurrency", min_value=1, max_value=16, value=int(st.session_state.get("scrape_concurrency", 4)), step=1))
+
+    st.write("Embeddings")
+    e1, e2 = st.columns([1, 2])
+    st.session_state["embedding_enabled"] = e1.toggle("Embeddings", value=bool(st.session_state.get("embedding_enabled", True)))
+    st.session_state["embedding_model"] = e2.text_input("Embedding model", value=st.session_state.get("embedding_model", "nomic-embed-text:latest"))
+
+    st.write("Zvec")
+    z1, z2, z3 = st.columns([1, 2, 2])
+    st.session_state["zvec_enabled"] = z1.toggle("Zvec", value=bool(st.session_state.get("zvec_enabled", True)))
+    st.session_state["zvec_index_path"] = z2.text_input("Index path", value=st.session_state.get("zvec_index_path", ""), placeholder="data/sites/<site>/zvec")
+    st.session_state["zvec_collection"] = z3.text_input("Collection", value=st.session_state.get("zvec_collection", "university_wiki"))
+
+    st.write("Research")
+    r1, r2 = st.columns(2)
+    st.session_state["use_tavily_for_map"] = r1.toggle("Use Tavily for university map", value=bool(st.session_state.get("use_tavily_for_map", False)))
+    st.session_state["use_tavily_for_retry"] = r2.toggle("Use Tavily for failed retries", value=bool(st.session_state.get("use_tavily_for_retry", False)))
+
+    if st.button("Save Settings", type="primary"):
+        _save_app_state()
+        st.success("Settings saved.")

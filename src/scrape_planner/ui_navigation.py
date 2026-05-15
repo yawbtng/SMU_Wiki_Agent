@@ -5,7 +5,6 @@ WORKFLOW_TABS = [
     "Discover",
     "Choose URLs",
     "Scrape",
-    "Clean",
-    "Review",
+    "Graph",
     "Settings",
 ]

@@ -11,6 +11,10 @@ __pycache__/
 data/
 
 # ── GSD baseline (auto-generated) ──
+<<<<<<< Updated upstream
+=======
+.gsd
+>>>>>>> Stashed changes
 .gsd-id
 .mcp.json
 .bg-shell/

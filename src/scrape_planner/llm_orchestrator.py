@@ -154,6 +154,108 @@ def choose_top_urls_with_openrouter(
     return payload
 
 
+def choose_top_urls_with_ollama(
+    *,
+    site_url: str,
+    discovered_rows: list[dict[str, Any]],
+    out_path: Path,
+    max_urls: int = 150,
+    model: str = "qwen2.5:3b",
+    base_url: str = "http://localhost:11434",
+    batch_size: int = 100,
+    sleep_between_batches_sec: float = 0.0,
+) -> dict[str, Any]:
+    ollama_error = ""
+    try:
+        parsed = _choose_top_urls_ollama_batched(
+            site_url=site_url,
+            discovered_rows=discovered_rows,
+            max_urls=max_urls,
+            model=model,
+            base_url=base_url,
+            batch_size=batch_size,
+            sleep_between_batches_sec=sleep_between_batches_sec,
+        )
+        write_json(out_path, parsed)
+        return parsed
+    except Exception as exc:
+        ollama_error = str(exc)
+
+    payload = {
+        "selection_method": "ollama_failed",
+        "model": model,
+        "selected_urls": [],
+        "scored_urls": [],
+        "ollama_error": ollama_error,
+        "used_ollama": False,
+    }
+    write_json(out_path, payload)
+    return payload
+
+
+def _choose_top_urls_ollama_batched(
+    *,
+    site_url: str,
+    discovered_rows: list[dict[str, Any]],
+    max_urls: int,
+    model: str,
+    base_url: str,
+    batch_size: int = 100,
+    sleep_between_batches_sec: float = 0.0,
+) -> dict[str, Any]:
+    batches = [discovered_rows[i : i + batch_size] for i in range(0, len(discovered_rows), batch_size)]
+    scored_urls: list[dict[str, Any]] = []
+    batch_errors = []
+    batch_trace = []
+    for idx, batch in enumerate(batches, start=1):
+        prompt = _build_url_scoring_prompt(
+            site_url=site_url,
+            discovered_rows=batch,
+            batch_note=f"Batch {idx} of {len(batches)}. Score every URL in this batch.",
+        )
+        try:
+            t0 = time.perf_counter()
+            parsed = _call_ollama_json(base_url=base_url, model=model, prompt=prompt)
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            scored_batch = _normalize_score_payload(parsed)
+            scored_urls.extend(scored_batch)
+            batch_trace.append(
+                {
+                    "batch": idx,
+                    "status": "success",
+                    "latency_ms": latency_ms,
+                    "scored_count": len(scored_batch),
+                }
+            )
+        except Exception as exc:
+            batch_errors.append({"batch": idx, "error": str(exc)})
+            batch_trace.append({"batch": idx, "status": "failed", "latency_ms": None, "scored_count": 0, "error": str(exc)})
+        if sleep_between_batches_sec > 0:
+            time.sleep(sleep_between_batches_sec)
+
+    if batch_errors:
+        raise RuntimeError(f"{len(batch_errors)} Ollama batch calls failed. First error: {batch_errors[0].get('error')}")
+
+    scored_urls = _merge_scores_with_rows(discovered_rows, scored_urls)
+    selected_urls = [
+        {"url": row["url"], "reason": row.get("reason", ""), "priority": row.get("score", 0)}
+        for row in scored_urls
+        if int(row.get("score") or 0) >= 80
+    ]
+    return {
+        "selection_method": "ollama_scored",
+        "model": model,
+        "used_ollama": True,
+        "scored_urls": scored_urls,
+        "selected_urls": selected_urls[:max_urls],
+        "batch_count": len(batches),
+        "batch_size": batch_size,
+        "batch_errors": batch_errors,
+        "batch_trace": batch_trace,
+        "default_threshold": 80,
+    }
+
+
 def _choose_top_urls_batched(
     *,
     site_url: str,
@@ -285,6 +387,29 @@ def _call_openrouter_json(*, api_key: str, model: str, prompt: str) -> tuple[dic
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
     return _loads_json_from_text(content), data.get("usage", {})
+
+
+def _call_ollama_json(*, base_url: str, model: str, prompt: str) -> dict[str, Any]:
+    endpoint = f"{base_url.rstrip('/')}/api/chat"
+    resp = requests.post(
+        endpoint,
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "You select high-value URLs for student-facing university wiki coverage. Return JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0},
+        },
+        timeout=180,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:1000]}")
+    data = resp.json()
+    content = (data.get("message") or {}).get("content") or data.get("response") or ""
+    return _loads_json_from_text(content)
 
 
 def _add_usage(total: dict[str, int], usage: dict[str, Any]) -> None:
