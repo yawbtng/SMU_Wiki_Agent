@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from scrape_planner.raw_retrieval import QueryRequest, build_raw_index, query_raw_index
+from scripts.raw_retrieval_proof import run_fixture_proof
 
 
 def _src(path: Path, source_id: str, url: str) -> dict[str, str]:
@@ -40,3 +41,17 @@ def test_bounded_query_path_no_full_scan_fallback(tmp_path: Path) -> None:
     assert resp.status == "ok"
     assert len(resp.evidence) == 1
     assert resp.metadata["bounded"] is True
+
+
+def test_index_first_fixture_proof_command(tmp_path: Path) -> None:
+    fixtures_root = tmp_path / "fixtures"
+    index_root = tmp_path / "index"
+
+    result = run_fixture_proof(fixtures_root, index_root)
+
+    assert result["query"]["status"] == "ok"
+    assert result["query"]["bounded"] is True
+    assert result["query"]["evidence_count"] >= 1
+    assert (index_root / "raw_index_manifest.json").exists()
+    assert (index_root / "raw_postings.json").exists()
+    assert (index_root / "raw_chunks.jsonl").exists()

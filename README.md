@@ -76,3 +76,14 @@ Optional local semantic query path after scrape + clean + wiki build:
    `ZVEC_DB_PATH=/absolute/path/to/run/zvec_index OLLAMA_EMBED_MODEL=nomic-embed-text:latest python mcp_servers/smu_zvec_mcp.py`
 
 The MCP exposes `query_smu_wiki` and `zvec_index_info` for Claude, Codex, or any MCP client.
+
+## Raw markdown retrieval proof
+
+For fixture-level proof of index-first bounded retrieval behavior:
+
+```bash
+PYTHONPATH=src python3 scripts/raw_retrieval_proof.py
+PYTHONPATH=src python3 scripts/raw_retrieval_proof.py --help
+```
+
+The proof script builds lexical index artifacts under `tests/fixtures/raw_retrieval/index` and runs a bounded query path that must return `status: "ok"` from index artifacts.
