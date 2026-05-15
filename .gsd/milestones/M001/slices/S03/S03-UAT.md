@@ -1,42 +1,64 @@
-# S03: Stale dependency tracking and tracer job contract — UAT
+# S03: S03 — UAT
 
 **Milestone:** M001
-**Written:** 2026-05-15T18:04:08.459Z
+**Written:** 2026-05-15T20:46:23.439Z
 
-# UAT Type
-Integration / Contract validation (stale tracking + packet contract)
+# S03: S03 — UAT
 
-# Preconditions
-1. A prior source-hash view exists (from S01-style source ledger state).
-2. A current source-hash view exists with at least one changed hash.
-3. Source→tracer-page dependency map exists for at least one page.
-4. Bounded retrieval evidence identifiers exist (from S02) and are referencable by packet metadata.
+**Milestone:** M001
+**Written:** 2026-05-15
 
-# Steps
-1. Run stale evaluation with prior/current source hash views and dependency map.
-2. Inspect stale evaluation output for affected page IDs and reasons.
-3. Persist stale artifacts for the run (snapshot + transition events append).
-4. Emit maintenance job packet(s) for each stale page.
-5. Parse each packet as downstream S04 input and validate required fields.
-6. Re-run with unchanged hashes and verify no stale pages/packets are generated.
+## UAT Type
 
-# Expected Outcomes
-1. Only pages depending on changed source hashes are marked stale.
-2. Each stale reason is `source_hash_changed`.
-3. Stale snapshot JSON exists in the run artifacts.
-4. Stale transition events are appended to JSONL history without truncating prior events.
-5. One packet directory exists per stale page.
-6. Packet includes target page ID, metadata, bounded evidence references (no full raw body payload), and explicit output contract for S04.
-7. Unchanged-hash run yields zero stale pages and zero new packets.
+- UAT mode: artifact-driven
+- Why this mode is sufficient: S03’s deliverable is deterministic contract + persisted artifacts (stale transitions and maintenance packets), so correctness is proven by reproducible test fixtures and run outputs rather than interactive runtime UX.
 
-# Edge Cases
-1. Changed source hash with no mapped dependent page → no stale page emitted.
-2. Multiple changed sources mapping to same page → one stale page output with deterministic handling.
-3. Missing/empty dependency map → no stale pages, explicit empty result.
-4. Existing event history present → new events append-only and readable.
+## Preconditions
 
-# Not Proven By This UAT
-1. Actual tracer page content update/write behavior (covered in S04).
-2. Multi-page production-scale performance characteristics.
-3. End-to-end autonomous scheduling/daemon execution behavior (deferred scope).
+- Repository is at the S03 implementation state.
+- Python environment is available via `uv`.
+- Fixture test data for tracer dependencies and packet integration is present under `tests/`.
 
+## Smoke Test
+
+Run:
+
+1. `PYTHONPATH=src uv run pytest -q tests/test_tracer_stale_dependencies.py`
+2. Confirm suite passes and reports deterministic stale transition behavior.
+
+## Test Cases
+
+### 1. Source hash change marks dependent tracer page stale
+
+1. Prepare prior/current source-hash views where one source hash changes.
+2. Provide source-to-page dependency map including one dependent tracer page.
+3. Execute stale evaluator via test harness.
+4. **Expected:** Dependent page is marked stale with reason `source_hash_changed`; transition ordering and fields are deterministic and parseable.
+
+### 2. Run context emits maintenance packet with bounded evidence references
+
+1. Execute integration path that persists stale artifacts during run handling.
+2. Inspect emitted packet directory and manifest through integration assertions.
+3. **Expected:** Packet exists, references bounded retrieval evidence paths (not oversized inline payload), and links to stale transition context required by downstream tracer maintenance execution.
+
+## Edge Cases
+
+### Malformed dependency contract input
+
+1. Provide malformed dependency schema in evaluator/integration tests.
+2. **Expected:** Contract validation error is surfaced explicitly; no silent success path.
+
+## Failure Signals
+
+- Any failure in `tests/test_tracer_stale_dependencies.py` or `tests/test_tracer_job_packet_integration.py`.
+- Missing stale transition artifacts or missing packet manifest fields in integration assertions.
+- Non-deterministic ordering of transitions/targets across repeated runs.
+
+## Not Proven By This UAT
+
+- Live execution of downstream tracer wiki page mutation (covered in S04).
+- Production-scale performance/throughput characteristics under very large dependency maps.
+
+## Notes for Tester
+
+Focus on artifact integrity and determinism: this slice is a contract-and-persistence layer. If tests fail, inspect stale transition serialization and packet manifest assembly first, because those are the authoritative outputs consumed by S04.

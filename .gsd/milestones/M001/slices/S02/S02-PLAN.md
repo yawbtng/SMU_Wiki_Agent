@@ -17,7 +17,7 @@
   - Files: `src/scrape_planner/raw_retrieval.py`, `src/scrape_planner/__init__.py`, `tests/test_raw_retrieval.py`, `tests/test_raw_retrieval_integration.py`
   - Verify: python3 -m pytest -q tests/test_raw_retrieval.py && python3 -m pytest -q tests/test_raw_retrieval_integration.py
 
-- [ ] **T02: Add fixture-level proof command coverage for index-first bounded retrieval**
+- [x] **T02: Add fixture-level proof command coverage for index-first bounded retrieval**
   - Files: `scripts/raw_retrieval_proof.py`, `tests/test_raw_retrieval_integration.py`, `README.md`
   - Verify: python3 -m pytest -q tests/test_raw_retrieval_integration.py -k "index_first or bounded or read" && python3 scripts/raw_retrieval_proof.py --help
 

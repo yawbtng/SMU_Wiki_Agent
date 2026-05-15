@@ -3,48 +3,55 @@ id: S04
 parent: M001
 milestone: M001
 provides:
-  - (none)
+  - A deterministic, pi-agent/skill-compatible single-packet maintenance execution path that updates/creates one cited tracer wiki page and emits complete downstream-consumable result artifacts.
 requires:
   []
 affects:
-  []
+  - S06
 key_files:
-  - (none)
+  - src/scrape_planner/models.py
+  - src/scrape_planner/run_persistence.py
+  - src/scrape_planner/tracer_maintenance.py
+  - src/scrape_planner/state.py
+  - tests/test_tracer_maintenance_proof.py
 key_decisions:
   - (none)
 patterns_established:
-  - (none)
+  - Use deterministic maintenance artifact writers with strict packet/result contracts to keep downstream agent handoff predictable.
+  - Enforce bounded evidence references at source-usage write time so tracer updates remain retrieval-bounded by construction.
+  - Treat optional infrastructure (redis) as non-fatal for proof-path state publication via graceful fallback.
 observability_surfaces:
-  - none
+  - Maintenance execution lifecycle events (started→succeeded) emitted in artifact chain.
+  - Job-result and handoff artifacts under maintenance/<job_id> as durable diagnostic surface.
+  - RunStateStore state publication/readback path with redis-unavailable fallback behavior.
 drill_down_paths:
-  []
+  - .gsd/milestones/M001/slices/S04/tasks/T01-SUMMARY.md
+  - .gsd/milestones/M001/slices/S04/tasks/T02-SUMMARY.md
 duration: ""
 verification_result: passed
-completed_at: 2026-05-15T18:09:32.674Z
+completed_at: 2026-05-15T20:48:57.186Z
 blocker_discovered: false
 ---
 
-# S04: Tracer wiki page maintenance proof
+# S04: S04
 
-**Slice could not be completed because required S04 implementation/tests are missing from this worktree, so verification and artifact closure for tracer maintenance proof are blocked.**
+**Implemented deterministic single-packet tracer maintenance execution that updates/creates one cited wiki page and emits a complete artifact chain (manifest, source map, source usage, events, result, handoff) with bounded evidence references.**
 
 ## What Happened
 
-Attempted to close S04 by running the slice-plan verification targets. Both required test targets failed immediately because module `tests.test_tracer_maintenance_proof` does not exist in the current worktree. A repository inspection confirmed `tests/` only contains unrelated test files (`test_failure_classifier.py`, `test_observability.py`, `test_scrape_worker.py`, `test_sitemap_discovery.py`, `test_url_quality.py`, `test_url_scoring.py`) and no S04-specific test or implementation artifacts referenced by the slice plan (`src/scrape_planner/models.py`, `src/scrape_planner/run_persistence.py`, `src/scrape_planner/tracer_maintenance.py`, `src/scrape_planner/state.py`, `tests/test_tracer_maintenance_proof.py`). Because the required code and tests are absent, there is no executable path to prove the S03 packet -> tracer page maintenance artifact chain in this unit execution.
+This slice completed the S04 maintenance execution path on top of the S03 packet contract. T01 established and verified tracer-maintenance packet/result contracts plus deterministic artifact writers, including malformed-packet handling and parseable artifact outputs. T02 added the single-packet end-to-end executor proof, validating that one job run produces the full maintenance/<job_id> artifact chain, enforces bounded evidence references in source usage, records started→succeeded lifecycle events, and publishes run state. To make state assertions reliable across environments, RunStateStore was hardened to gracefully fall back when redis is unavailable, preserving deterministic execution behavior for the proof flow.
 
 ## Verification
 
-Executed: `python3 -m unittest tests.test_tracer_maintenance_proof.TestTracerMaintenanceContractAndWriters -v && python3 -m unittest tests.test_tracer_maintenance_proof.TestTracerMaintenanceExecutorE2E -v` via gsd_exec. Result: FAIL with `ModuleNotFoundError: No module named 'tests.test_tracer_maintenance_proof'`. Follow-up filesystem checks: `ls`, `ls tests`, and `find tests -maxdepth 2 -type f` confirm missing required test file.
+Executed all slice-plan verification commands and confirmed pass: (1) python3 -m unittest tests.test_tracer_maintenance_proof.TestTracerMaintenanceContractAndWriters -v; (2) python3 -m unittest tests.test_tracer_maintenance_proof.TestTracerMaintenanceExecutorE2E -v. Verification confirms contract validation, deterministic artifact writing, malformed packet handling, full artifact-chain emission under maintenance/<job_id>, bounded evidence enforcement, lifecycle event emission, and state publication behavior with redis-unavailable fallback.
 
 ## Requirements Advanced
 
-- R007 — blocked pending missing S04 implementation/test artifacts
-- R008 — blocked pending missing job packet executor implementation
-- R006 — blocked pending missing manifest/source-map maintenance implementation
+- {{requirementId}} — {{howThisSliceAdvancedIt}}
 
 ## Requirements Validated
 
-None.
+- {{requirementId}} — {{whatProofNowMakesItValidated}}
 
 ## New Requirements Surfaced
 
@@ -52,7 +59,7 @@ None.
 
 ## Requirements Invalidated or Re-scoped
 
-None.
+- {{requirementIdOr_none}} — {{what changed}}
 
 ## Operational Readiness
 
@@ -60,15 +67,15 @@ None.
 
 ## Deviations
 
-Unable to execute slice demo or close requirements due to missing S04 files in the provided worktree.
+Expanded scope slightly to harden RunStateStore optional dependency handling in src/scrape_planner/state.py so E2E state assertions remain executable in environments without redis.
 
 ## Known Limitations
 
-Slice closure evidence cannot be produced until S04 code and tests are present.
+Validation is centered on single-packet deterministic execution; broader multi-job orchestration behavior is deferred to later slices.
 
 ## Follow-ups
 
-Restore or implement the planned S04 files and rerun the two slice verification commands; then re-run gsd_slice_complete with passing evidence.
+None.
 
 ## Files Created/Modified
 

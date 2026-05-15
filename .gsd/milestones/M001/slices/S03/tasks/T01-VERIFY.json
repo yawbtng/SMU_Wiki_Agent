@@ -2,17 +2,15 @@
   "schemaVersion": 1,
   "taskId": "T01",
   "unitId": "M001/S03/T01",
-  "timestamp": 1778868065183,
-  "passed": false,
-  "discoverySource": "preference",
+  "timestamp": 1778877818807,
+  "passed": true,
+  "discoverySource": "task-plan",
   "checks": [
     {
-      "command": "pytest",
-      "exitCode": 127,
-      "durationMs": 4,
-      "verdict": "fail"
+      "command": "PYTHONPATH=src uv run pytest -q tests/test_tracer_stale_dependencies.py",
+      "exitCode": 0,
+      "durationMs": 131,
+      "verdict": "pass"
     }
-  ],
-  "retryAttempt": 1,
-  "maxRetries": 2
+  ]
 }

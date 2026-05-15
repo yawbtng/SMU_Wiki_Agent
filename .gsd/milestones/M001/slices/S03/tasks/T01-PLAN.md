@@ -1,67 +1,104 @@
 ---
-estimated_steps: 30
-estimated_files: 3
+estimated_steps: 52
+estimated_files: 4
 skills_used: []
 ---
 
-# T01: Define tracer dependency + stale/job packet contracts and deterministic stale evaluator
+# T01: Define stale-dependency and tracer job packet contracts with deterministic evaluator
 
-Why
-- S03’s main risk is ambiguous contract shape. Locking schema and pure evaluation logic first prevents drift in S04 packet consumers.
+---
+estimated_steps: 8
+estimated_files: 4
+skills_used:
+  - design-an-interface
+  - tdd
+---
 
-Files
-- `src/scrape_planner/models.py`
-- `src/scrape_planner/state.py`
-- `tests/test_stale_dependency_tracking.py`
+# T01: Define stale-dependency and tracer job packet contracts with deterministic evaluator
 
-Do
-1. Add typed contract structures for tracer page manifests, reverse dependency map entries, stale records, and maintenance job packet metadata/evidence references.
-2. Implement a pure stale-evaluation function that accepts prior/current source hash views and source->page dependencies, and returns affected pages + per-source stale records with deterministic ordering.
-3. Enforce raw-source identifiers (`source_id`, hashes) and reason taxonomy (at minimum `source_hash_changed`) aligned to R001/R006.
-4. Add unit tests that prove: unchanged hashes => no stale pages; changed hash for one source => only dependent pages marked stale; sources without dependents do not create page staleness.
-5. Keep this task I/O-free except fixtures in tests; persistence is handled in T02.
+**Slice:** S03 — Stale dependency tracking and tracer job contract
+**Milestone:** M001
 
-Must-haves
-- Pure function output is deterministic and parseable.
-- Contract fields required by downstream packet emission are present (page target, source refs, reason, run linkage).
+## Description
 
-Verification
-- `python3 -m pytest tests/test_stale_dependency_tracking.py -q`
+Establish the canonical contract types and pure stale-evaluation logic that map source hash transitions to affected tracer pages before any persistence wiring. This closes the highest-risk ambiguity in S03 by locking schema fields (`source_id`, `old_hash`, `new_hash`, `affected_pages`, `reason`) and the deterministic mapping from reverse dependencies to stale page IDs.
 
-Done when
-- Contract models and evaluator exist, tests pass, and evaluator output is sufficient for artifact writing and packet generation in T02.
+## Failure Modes
 
-Failure Modes (Q5)
-- Dependency: malformed prior/current hash maps. On error: raise typed validation error; no partial stale set.
-- Dependency: dependency map missing source IDs. On error: treat as no dependents (not crash), but include explicit empty handling in tests.
+| Dependency | On error | On timeout | On malformed response |
+|------------|----------|-----------|----------------------|
+| `src/scrape_planner/source_monitor.py` hash/state records | Raise validation error with explicit missing-key detail and skip stale output generation | N/A (local pure function) | Reject malformed source hash entries and return structured evaluator error result for caller logging |
+| Source-map/reverse-dependency input file consumed by tests | Fail fast in tests with actionable schema mismatch assertion | N/A | Treat non-list page mappings as invalid and assert contract violation |
 
-Load Profile (Q6)
-- Shared resources: none in pure function path.
-- Per-operation cost: O(changed_sources + dependency_edges_for_changed_sources).
-- 10x breakpoint: large dependency map iteration; ensure set/dict lookups, no full raw file scans.
+## Load Profile
 
-Negative Tests (Q7)
-- Malformed inputs: missing hash fields / wrong type maps raise clear errors.
-- Error paths: empty prior map with populated current map does not falsely mark unchanged sources stale.
-- Boundary: single source with multiple pages yields all dependent pages exactly once.
+- **Shared resources**: none (pure in-memory evaluation)
+- **Per-operation cost**: O(S + E) over changed sources S and dependency edges E
+- **10x breakpoint**: memory growth from oversized reverse maps; algorithm should remain linear and deterministic
 
-## Inputs
+## Negative Tests
 
-- `src/scrape_planner/models.py`
-- `src/scrape_planner/state.py`
-- `.gsd/milestones/M001/slices/S03/S03-RESEARCH.md`
-- `.gsd/REQUIREMENTS.md`
+- **Malformed inputs**: missing `source_id`, null hash values, reverse map entries with wrong types
+- **Error paths**: changed source not present in reverse map should produce zero affected pages without crash
+- **Boundary conditions**: empty changed-source set, duplicate page IDs in dependency list, repeated source entries
 
-## Expected Output
+## Steps
 
-- `src/scrape_planner/models.py`
-- `src/scrape_planner/state.py`
-- `tests/test_stale_dependency_tracking.py`
+1. Add a new tracer dependency module defining typed contracts for tracer page manifests, reverse dependency maps, stale transition records, and job packet metadata shape.
+2. Implement a pure evaluator function that accepts prior/current source hash views plus reverse map and returns stale page IDs and transition records with deterministic ordering.
+3. Implement schema normalization helpers that de-duplicate page IDs and validate required keys used by the evaluator.
+4. Add focused unit tests covering unchanged hashes, single hash change, multiple sources to same page, and malformed-map rejection.
+
+## Must-Haves
+
+- [ ] Pure evaluator has no filesystem side effects and is deterministic for identical inputs.
+- [ ] Transition records include `reason=source_hash_changed` for hash-delta stale marks and preserve source/page linkage.
 
 ## Verification
 
-python3 -m pytest tests/test_stale_dependency_tracking.py -q
+- `PYTHONPATH=src uv run pytest -q tests/test_tracer_stale_dependencies.py`
+- `python3 -m compileall src/scrape_planner/tracer_dependencies.py`
+
+## Verify Rules
+
+- Use a real executable check, not prose.
+- If the check needs file-content assertions, write a `node:test` file and run it with `node --test` or a package test script.
+- Do not use inline `node -e` assertions for verification.
 
 ## Observability Impact
 
-Defines normalized stale reason/state fields that T02 will emit into durable events.
+- Signals added/changed: structured stale transition record shape that downstream persistence appends to run events.
+- How a future agent inspects this: read evaluator outputs through integration artifacts generated in T02.
+- Failure state exposed: malformed dependency-map/schema errors become explicit and machine-parseable.
+
+## Inputs
+
+- `src/scrape_planner/source_monitor.py` — source hash/state conventions from S01.
+- `src/scrape_planner/raw_retrieval.py` — bounded evidence identifier/path contract used by downstream packet references.
+- `tests/test_source_monitor.py` — fixture and contract testing style precedent.
+
+## Expected Output
+
+- `src/scrape_planner/tracer_dependencies.py` — new contract and stale-evaluator module.
+- `tests/test_tracer_stale_dependencies.py` — unit tests for evaluator determinism and negative paths.
+- `src/scrape_planner/__init__.py` — export new S03 module surface if package-level access is used.
+
+## Inputs
+
+- `src/scrape_planner/source_monitor.py`
+- `src/scrape_planner/raw_retrieval.py`
+- `tests/test_source_monitor.py`
+
+## Expected Output
+
+- `src/scrape_planner/tracer_dependencies.py`
+- `tests/test_tracer_stale_dependencies.py`
+- `src/scrape_planner/__init__.py`
+
+## Verification
+
+PYTHONPATH=src uv run pytest -q tests/test_tracer_stale_dependencies.py
+
+## Observability Impact
+
+Defines structured stale transition and contract-validation error surfaces consumed by run artifact logging.

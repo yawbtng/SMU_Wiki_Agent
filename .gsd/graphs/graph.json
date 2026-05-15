@@ -36,14 +36,14 @@
     },
     {
       "id": "slice:M001:S02",
-      "label": "S02: Index-first raw retrieval",
+      "label": "S02: S02",
       "type": "slice",
       "confidence": "EXTRACTED",
       "sourceFile": "milestones/M001/slices/S02/S02-PLAN.md"
     },
     {
       "id": "task:M001:S02:T01",
-      "label": "T01: Implement raw retrieval index + query module and artifact contract",
+      "label": "T01: Added an index-first raw markdown lexical retrieval module with explicit missing/stale index status contracts and bounded evidence query responses.",
       "type": "task",
       "confidence": "EXTRACTED"
     },
@@ -61,15 +61,27 @@
       "sourceFile": "milestones/M001/slices/S03/S03-PLAN.md"
     },
     {
+      "id": "task:M001:S03:T01",
+      "label": "T01: Define stale-dependency and tracer job packet contracts with deterministic evaluator",
+      "type": "task",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "id": "task:M001:S03:T02",
+      "label": "T02: Persist stale artifacts and emit maintenance job packet from run context",
+      "type": "task",
+      "confidence": "EXTRACTED"
+    },
+    {
       "id": "slice:M001:S04",
-      "label": "S04: Tracer wiki page maintenance proof",
+      "label": "S04: S04",
       "type": "slice",
       "confidence": "EXTRACTED",
       "sourceFile": "milestones/M001/slices/S04/S04-PLAN.md"
     },
     {
       "id": "task:M001:S04:T01",
-      "label": "T01: Define S04 packet/result contracts and deterministic artifact writers",
+      "label": "T01: Added S04 tracer-maintenance packet/result contracts with deterministic artifact writers and bounded evidence enforcement.",
       "type": "task",
       "confidence": "EXTRACTED"
     },
@@ -150,6 +162,18 @@
       "confidence": "EXTRACTED"
     },
     {
+      "from": "slice:M001:S03",
+      "to": "task:M001:S03:T01",
+      "type": "contains",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "from": "slice:M001:S03",
+      "to": "task:M001:S03:T02",
+      "type": "contains",
+      "confidence": "EXTRACTED"
+    },
+    {
       "from": "milestone:M001",
       "to": "slice:M001:S04",
       "type": "contains",
@@ -192,5 +216,5 @@
       "confidence": "EXTRACTED"
     }
   ],
-  "builtAt": "2026-05-15T20:37:24.827Z"
+  "builtAt": "2026-05-15T20:48:57.199Z"
 }

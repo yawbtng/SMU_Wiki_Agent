@@ -2,14 +2,14 @@
   "schemaVersion": 1,
   "taskId": "T01",
   "unitId": "M001/S05/T01",
-  "timestamp": 1778871712175,
+  "timestamp": 1778878230269,
   "passed": false,
-  "discoverySource": "preference",
+  "discoverySource": "task-plan",
   "checks": [
     {
-      "command": "pytest",
-      "exitCode": 127,
-      "durationMs": 4,
+      "command": "python3 -m pytest tests/test_pdf_ingest.py -q",
+      "exitCode": 1,
+      "durationMs": 19,
       "verdict": "fail"
     }
   ],

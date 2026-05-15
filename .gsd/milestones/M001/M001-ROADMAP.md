@@ -15,16 +15,16 @@
 - [x] **S01: S01** `risk:high` `depends:[]`
   > After this: Given fixture source records, the system writes a run directory with run.json, events.jsonl, source_diff.jsonl, and a report showing new/changed/unchanged/failed/deleted-candidate sources.
 
-- [ ] **S02: S02** `risk:high` `depends:[]`
+- [x] **S02: S02** `risk:high` `depends:[]`
   > After this: A query over fixture raw markdown uses an index-first path and returns bounded evidence without scanning every raw file.
 
-- [ ] **S03: Stale dependency tracking and tracer job contract** `risk:high` `depends:[S01,S02]`
+- [x] **S03: S03** `risk:high` `depends:[]`
   > After this: A changed source hash marks a dependent tracer wiki page stale and creates an agent/skill-compatible maintenance job packet.
 
-- [ ] **S04: Tracer wiki page maintenance proof** `risk:medium` `depends:[S03]`
+- [x] **S04: S04** `risk:medium` `depends:[]`
   > After this: A pi-agent/skill-style job updates or creates one cited tracer wiki page with manifest, source map, source usage, events, and handoff/result artifacts.
 
-- [ ] **S05: Internal PDF ingestion and Zvec proof** `risk:high` `depends:[S01]`
+- [ ] **S05: S05** `risk:high` `depends:[]`
   > After this: A born-digital PDF is chunked with page numbers, indexed/queryable through Zvec, and scanned/encrypted/malformed/low-text PDFs are quarantined with reasons.
 
 - [ ] **S06: Simple V1 configuration and proof command** `risk:medium` `depends:[S01,S02,S03,S04,S05]`

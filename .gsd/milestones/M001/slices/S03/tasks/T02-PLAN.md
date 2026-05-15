@@ -1,87 +1,109 @@
 ---
-estimated_steps: 46
-estimated_files: 4
+estimated_steps: 55
+estimated_files: 5
 skills_used: []
 ---
 
-# T02: Persist stale artifacts and emit agent/skill-compatible maintenance job packets
+# T02: Persist stale artifacts and emit maintenance job packet from run context
 
-Why
-- S03 is not done until stale transitions are durably inspectable and downstream S04 receives executable packet inputs.
+---
+estimated_steps: 9
+estimated_files: 5
+skills_used:
+  - observability
+  - verify-before-complete
+---
 
-Files
-- `src/scrape_planner/run_persistence.py`
-- `src/scrape_planner/observability.py`
-- `src/scrape_planner/terminal_skill_runner.py`
-- `tests/test_tracer_job_packet_contract.py`
+# T02: Persist stale artifacts and emit maintenance job packet from run context
 
-Do
-1. Wire stale evaluator outputs into run persistence using existing S01 durability patterns: atomic JSON snapshot for stale summary and append-only JSONL for stale transitions/events.
-2. Add packet emission helper that writes one maintenance job packet directory/file set per stale page with:
-   - job metadata (run_id, job_id, created_at, slice marker)
-   - target tracer page identifier
-   - source references and hash deltas
-   - bounded retrieval evidence references (IDs/paths only)
-   - explicit expected output contract for S04 (result/manifest/source usage artifacts)
-3. Ensure job packet writer is additive and does not overwrite unrelated packet directories.
-4. Add integration tests that create a temp run root, trigger one hash change with one dependent page, and assert:
-   - stale snapshot JSON exists and parses
-   - stale transition/event JSONL appends and parses line-by-line
-   - job packet directory/files exist and include required contract keys
-5. Add negative integration coverage for unchanged-hash run (no packet emitted, no stale page records).
+**Slice:** S03 — Stale dependency tracking and tracer job contract
+**Milestone:** M001
 
-Must-haves
-- Append-only behavior preserved for JSONL streams.
-- Packet contract remains bounded (references instead of embedded raw bodies).
-- Paths and file names are stable and discoverable for S04.
+## Description
 
-Verification
-- `python3 -m pytest tests/test_tracer_job_packet_contract.py -q`
-- `python3 -m pytest tests/test_stale_dependency_tracking.py tests/test_tracer_job_packet_contract.py -q`
+Wire the evaluator into run persistence so S03 produces inspectable artifacts: stale snapshot JSON, append-only stale transition JSONL events, and a tracer maintenance packet directory contract suitable for S04 execution. Packet payload must reference bounded retrieval evidence IDs/paths instead of embedding raw corpus content.
 
-Done when
-- A reproducible test proves hash change => stale artifact + stale event + packet artifact, and unchanged case emits none.
+## Failure Modes
 
-Threat Surface (Q3)
-- Abuse: tampered dependency maps could over-mark pages stale; mitigate with strict schema + deterministic evaluator and explicit source IDs.
-- Data exposure: packet contains source metadata only; no secrets/PII expected.
-- Input trust: source/dependency inputs are internal run artifacts but still validated before writing events.
+| Dependency | On error | On timeout | On malformed response |
+|------------|----------|-----------|----------------------|
+| `src/scrape_planner/run_persistence.py` atomic/append writers | Propagate write failure with contextual artifact path in raised error and emit failure event where possible | N/A (local filesystem I/O) | Reject malformed event payload before append and fail task-level operation |
+| Retrieval evidence references from `src/scrape_planner/raw_retrieval.py` | Emit packet with empty evidence list plus explicit `evidence_status` marker for caller visibility | N/A | Validate required evidence reference keys and fail packet build when missing |
 
-Failure Modes (Q5)
-- Dependency: filesystem write failure. On error: fail task with explicit error event; no silent success.
-- Dependency: malformed evidence refs. On error: reject packet creation and log validation failure event.
-- Dependency: JSONL append failure. On timeout/error: propagate failure; do not claim stale dispatch complete.
+## Load Profile
 
-Load Profile (Q6)
-- Shared resources: run artifact filesystem.
-- Per-operation cost: O(stale_pages + events_written) file writes.
-- 10x breakpoint: many stale pages in one run increase packet file count; maintain per-page bounded packet size.
+- **Shared resources**: filesystem writes under run directory
+- **Per-operation cost**: constant-count JSON writes + JSONL appends per stale run, proportional to stale transition count
+- **10x breakpoint**: event file growth; ensure append-only semantics and parseability under larger stale batches
 
-Negative Tests (Q7)
-- Malformed inputs: invalid evidence reference shape rejects packet.
-- Error paths: missing run directory causes explicit failure.
-- Boundary: multiple stale pages produce one packet each without collisions.
+## Negative Tests
+
+- **Malformed inputs**: packet request missing `page_id` or `run_id` fails with structured error
+- **Error paths**: unwritable run directory raises and does not leave partial packet manifest without metadata
+- **Boundary conditions**: zero stale pages creates no packet directory but still writes empty/explicit stale snapshot
+
+## Steps
+
+1. Extend run persistence or add a dedicated tracer maintenance persistence helper to write `stale_dependencies.json`, append `stale_dependencies.jsonl`, and create packet directory structure.
+2. Define packet file contract (metadata, page targets, evidence references, execution instructions, expected outputs) aligned to agent/skill handoff needs.
+3. Implement integration entrypoint used by tests/CLI-facing flow to call evaluator then persistence writers in order.
+4. Add integration test using fixture run root that asserts artifact existence, JSON/JSONL parseability, stale reason correctness, and packet contract fields.
+5. Add a lightweight proof/verification script or test assertion that surfaces emitted packet path and stale counts for operator diagnostics.
+
+## Must-Haves
+
+- [ ] Append-only stale transition log remains valid JSONL across repeated writes.
+- [ ] Packet contract includes target page IDs and bounded evidence references (IDs/paths), not embedded full raw file contents.
+
+## Verification
+
+- `PYTHONPATH=src uv run pytest -q tests/test_tracer_job_packet_integration.py`
+- `PYTHONPATH=src uv run pytest -q tests/test_tracer_stale_dependencies.py`
+
+## Verify Rules
+
+- Use a real executable check, not prose.
+- If the check needs file-content assertions, write a `node:test` file and run it with `node --test` or a package test script.
+- Do not use inline `node -e` assertions for verification.
+
+## Observability Impact
+
+- Signals added/changed: `stale_dependencies.json`, `stale_dependencies.jsonl`, and packet manifest metadata with timestamps/run IDs.
+- How a future agent inspects this: inspect run directory artifacts and packet directory contents from integration-test fixtures.
+- Failure state exposed: artifact-write and packet-build failures include stage + path context for localization.
 
 ## Inputs
 
+- `src/scrape_planner/tracer_dependencies.py` — evaluator and contract definitions from T01.
+- `src/scrape_planner/run_persistence.py` — atomic JSON and JSONL append helpers from S01.
+- `src/scrape_planner/raw_retrieval.py` — evidence reference shape consumed by packet contract.
+- `tests/test_raw_retrieval_integration.py` — integration test style for bounded evidence handling.
+
+## Expected Output
+
+- `src/scrape_planner/run_persistence.py` — stale artifact + packet persistence wiring.
+- `src/scrape_planner/tracer_dependencies.py` — orchestration helpers for packet emission from stale set.
+- `tests/test_tracer_job_packet_integration.py` — integration coverage for run artifact and packet contract.
+- `scripts/tracer_stale_proof.py` — optional proof command or diagnostics script for S03 artifact emission.
+
+## Inputs
+
+- `src/scrape_planner/tracer_dependencies.py`
 - `src/scrape_planner/run_persistence.py`
-- `src/scrape_planner/observability.py`
-- `src/scrape_planner/terminal_skill_runner.py`
-- `tests/test_stale_dependency_tracking.py`
-- `.gsd/milestones/M001/slices/S01/S01-SUMMARY.md`
-- `.gsd/milestones/M001/slices/S02/S02-SUMMARY.md`
+- `src/scrape_planner/raw_retrieval.py`
+- `tests/test_raw_retrieval_integration.py`
 
 ## Expected Output
 
 - `src/scrape_planner/run_persistence.py`
-- `src/scrape_planner/observability.py`
-- `src/scrape_planner/terminal_skill_runner.py`
-- `tests/test_tracer_job_packet_contract.py`
+- `src/scrape_planner/tracer_dependencies.py`
+- `tests/test_tracer_job_packet_integration.py`
+- `scripts/tracer_stale_proof.py`
 
 ## Verification
 
-python3 -m pytest tests/test_tracer_job_packet_contract.py -q && python3 -m pytest tests/test_stale_dependency_tracking.py tests/test_tracer_job_packet_contract.py -q
+PYTHONPATH=src uv run pytest -q tests/test_tracer_job_packet_integration.py
 
 ## Observability Impact
 
-Introduces stale transition signals and packet emission/failure events inspectable via run artifacts.
+Introduces durable stale transition artifacts and packet manifests for failure diagnosis and downstream executor traceability.
