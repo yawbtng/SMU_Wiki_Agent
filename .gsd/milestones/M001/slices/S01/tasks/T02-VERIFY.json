@@ -2,14 +2,14 @@
   "schemaVersion": 1,
   "taskId": "T02",
   "unitId": "M001/S01/T02",
-  "timestamp": 1778867473016,
+  "timestamp": 1778877396578,
   "passed": false,
-  "discoverySource": "preference",
+  "discoverySource": "task-plan",
   "checks": [
     {
-      "command": "pytest",
-      "exitCode": 127,
-      "durationMs": 3,
+      "command": "python3 -m pytest tests/test_source_monitor.py -q",
+      "exitCode": 1,
+      "durationMs": 18,
       "verdict": "fail"
     }
   ],

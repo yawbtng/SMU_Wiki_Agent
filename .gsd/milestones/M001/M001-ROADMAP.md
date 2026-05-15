@@ -12,10 +12,10 @@
 
 ## Slices
 
-- [ ] **S01: S01** `risk:high` `depends:[]`
+- [x] **S01: S01** `risk:high` `depends:[]`
   > After this: Given fixture source records, the system writes a run directory with run.json, events.jsonl, source_diff.jsonl, and a report showing new/changed/unchanged/failed/deleted-candidate sources.
 
-- [ ] **S02: Index-first raw retrieval** `risk:high` `depends:[S01]`
+- [ ] **S02: S02** `risk:high` `depends:[]`
   > After this: A query over fixture raw markdown uses an index-first path and returns bounded evidence without scanning every raw file.
 
 - [ ] **S03: Stale dependency tracking and tracer job contract** `risk:high` `depends:[S01,S02]`

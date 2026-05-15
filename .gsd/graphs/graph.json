@@ -9,22 +9,22 @@
       "sourceFile": "STATE.md"
     },
     {
-      "id": "concept:phase:validating-milestone",
-      "label": "Phase: validating-milestone",
+      "id": "concept:phase:executing",
+      "label": "Phase: executing",
       "type": "concept",
       "confidence": "EXTRACTED",
       "sourceFile": "STATE.md"
     },
     {
       "id": "slice:M001:S01",
-      "label": "S01: Source ledger and run log foundation",
+      "label": "S01: S01",
       "type": "slice",
       "confidence": "EXTRACTED",
       "sourceFile": "milestones/M001/slices/S01/S01-PLAN.md"
     },
     {
       "id": "task:M001:S01:T01",
-      "label": "T01: Implement source ledger models and lifecycle diff/classification engine",
+      "label": "T01: Added `src/scrape_planner/source_monitor.py` with deterministic URL/source hashing, JSONL ledger helpers, and lifecycle classification for new/unchanged/changed/redirected/failed/deleted-candidate states.",
       "type": "task",
       "confidence": "EXTRACTED"
     },
@@ -192,5 +192,5 @@
       "confidence": "EXTRACTED"
     }
   ],
-  "builtAt": "2026-05-15T19:07:48.222Z"
+  "builtAt": "2026-05-15T20:37:24.827Z"
 }
