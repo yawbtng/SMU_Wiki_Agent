@@ -1,0 +1,18 @@
+{
+  "id": "0b3627fd-acc8-460e-b60a-202f86d4fd54",
+  "runtime": "bash",
+  "purpose": "Inspect repo layout for correct test module paths",
+  "script_chars": 386,
+  "started_at": "2026-05-15T19:07:07.760Z",
+  "finished_at": "2026-05-15T19:07:07.795Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "duration_ms": 35,
+  "stdout_bytes": 47,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/0b3627fd-acc8-460e-b60a-202f86d4fd54.stdout",
+  "stderr_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/0b3627fd-acc8-460e-b60a-202f86d4fd54.stderr"
+}

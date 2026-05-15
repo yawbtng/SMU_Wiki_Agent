@@ -1,0 +1,18 @@
+{
+  "id": "aa16d32a-f462-4df9-bf01-12a5884e26f9",
+  "runtime": "bash",
+  "purpose": "locate S03 tests",
+  "script_chars": 94,
+  "started_at": "2026-05-15T18:03:43.768Z",
+  "finished_at": "2026-05-15T18:03:43.826Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "duration_ms": 58,
+  "stdout_bytes": 0,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/aa16d32a-f462-4df9-bf01-12a5884e26f9.stdout",
+  "stderr_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/aa16d32a-f462-4df9-bf01-12a5884e26f9.stderr"
+}

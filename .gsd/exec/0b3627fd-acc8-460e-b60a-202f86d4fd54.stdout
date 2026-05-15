@@ -1,0 +1,4 @@
+tests True
+src True
+scripts True
+configs False

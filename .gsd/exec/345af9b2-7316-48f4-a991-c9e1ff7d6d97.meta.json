@@ -1,0 +1,18 @@
+{
+  "id": "345af9b2-7316-48f4-a991-c9e1ff7d6d97",
+  "runtime": "bash",
+  "purpose": "Discover proper test module path for S04 tests",
+  "script_chars": 54,
+  "started_at": "2026-05-15T18:08:56.127Z",
+  "finished_at": "2026-05-15T18:08:56.180Z",
+  "exit_code": 5,
+  "signal": null,
+  "timed_out": false,
+  "duration_ms": 53,
+  "stdout_bytes": 0,
+  "stderr_bytes": 108,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/345af9b2-7316-48f4-a991-c9e1ff7d6d97.stdout",
+  "stderr_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/345af9b2-7316-48f4-a991-c9e1ff7d6d97.stderr"
+}

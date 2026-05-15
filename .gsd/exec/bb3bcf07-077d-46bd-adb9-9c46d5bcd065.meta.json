@@ -1,0 +1,18 @@
+{
+  "id": "bb3bcf07-077d-46bd-adb9-9c46d5bcd065",
+  "runtime": "bash",
+  "purpose": "run S05 verification tests",
+  "script_chars": 98,
+  "started_at": "2026-05-15T19:02:39.960Z",
+  "finished_at": "2026-05-15T19:02:40.012Z",
+  "exit_code": 1,
+  "signal": null,
+  "timed_out": false,
+  "duration_ms": 52,
+  "stdout_bytes": 0,
+  "stderr_bytes": 69,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/bb3bcf07-077d-46bd-adb9-9c46d5bcd065.stdout",
+  "stderr_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/bb3bcf07-077d-46bd-adb9-9c46d5bcd065.stderr"
+}

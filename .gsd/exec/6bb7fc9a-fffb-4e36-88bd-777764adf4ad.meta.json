@@ -1,0 +1,18 @@
+{
+  "id": "6bb7fc9a-fffb-4e36-88bd-777764adf4ad",
+  "runtime": "bash",
+  "purpose": "Install pytest",
+  "script_chars": 31,
+  "started_at": "2026-05-15T18:03:02.090Z",
+  "finished_at": "2026-05-15T18:03:03.771Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "duration_ms": 1681,
+  "stdout_bytes": 0,
+  "stderr_bytes": 370,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/6bb7fc9a-fffb-4e36-88bd-777764adf4ad.stdout",
+  "stderr_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/6bb7fc9a-fffb-4e36-88bd-777764adf4ad.stderr"
+}

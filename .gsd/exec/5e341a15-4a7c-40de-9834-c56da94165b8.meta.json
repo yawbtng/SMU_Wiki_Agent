@@ -1,0 +1,18 @@
+{
+  "id": "5e341a15-4a7c-40de-9834-c56da94165b8",
+  "runtime": "bash",
+  "purpose": "run tests via unittest fallback",
+  "script_chars": 97,
+  "started_at": "2026-05-15T18:03:39.803Z",
+  "finished_at": "2026-05-15T18:03:39.863Z",
+  "exit_code": 1,
+  "signal": null,
+  "timed_out": false,
+  "duration_ms": 60,
+  "stdout_bytes": 0,
+  "stderr_bytes": 1571,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/5e341a15-4a7c-40de-9834-c56da94165b8.stdout",
+  "stderr_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/5e341a15-4a7c-40de-9834-c56da94165b8.stderr"
+}

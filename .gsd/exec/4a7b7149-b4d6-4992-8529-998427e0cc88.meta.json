@@ -1,0 +1,18 @@
+{
+  "id": "4a7b7149-b4d6-4992-8529-998427e0cc88",
+  "runtime": "bash",
+  "purpose": "List tests to locate S03 test files",
+  "script_chars": 37,
+  "started_at": "2026-05-15T18:03:17.217Z",
+  "finished_at": "2026-05-15T18:03:17.225Z",
+  "exit_code": 0,
+  "signal": null,
+  "timed_out": false,
+  "duration_ms": 8,
+  "stdout_bytes": 173,
+  "stderr_bytes": 0,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/4a7b7149-b4d6-4992-8529-998427e0cc88.stdout",
+  "stderr_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/4a7b7149-b4d6-4992-8529-998427e0cc88.stderr"
+}

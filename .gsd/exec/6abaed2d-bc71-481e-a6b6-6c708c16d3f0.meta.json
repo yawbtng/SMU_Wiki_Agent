@@ -1,0 +1,18 @@
+{
+  "id": "6abaed2d-bc71-481e-a6b6-6c708c16d3f0",
+  "runtime": "bash",
+  "purpose": "Run S03 verification tests via uv",
+  "script_chars": 248,
+  "started_at": "2026-05-15T18:01:52.242Z",
+  "finished_at": "2026-05-15T18:01:52.785Z",
+  "exit_code": 1,
+  "signal": null,
+  "timed_out": false,
+  "duration_ms": 543,
+  "stdout_bytes": 0,
+  "stderr_bytes": 113,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/6abaed2d-bc71-481e-a6b6-6c708c16d3f0.stdout",
+  "stderr_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/6abaed2d-bc71-481e-a6b6-6c708c16d3f0.stderr"
+}

@@ -1,0 +1,18 @@
+{
+  "id": "adb6abce-30ef-4676-8611-bce56b75ac58",
+  "runtime": "bash",
+  "purpose": "Fallback verification using unittest discovery for raw retrieval tests and proof help",
+  "script_chars": 160,
+  "started_at": "2026-05-15T17:55:31.852Z",
+  "finished_at": "2026-05-15T17:55:31.974Z",
+  "exit_code": 1,
+  "signal": null,
+  "timed_out": false,
+  "duration_ms": 122,
+  "stdout_bytes": 0,
+  "stderr_bytes": 687,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/adb6abce-30ef-4676-8611-bce56b75ac58.stdout",
+  "stderr_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/adb6abce-30ef-4676-8611-bce56b75ac58.stderr"
+}

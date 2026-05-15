@@ -1,0 +1,18 @@
+{
+  "id": "4153d677-be49-417d-8f19-08ae420359de",
+  "runtime": "bash",
+  "purpose": "Install dependencies for tests",
+  "script_chars": 45,
+  "started_at": "2026-05-15T18:02:01.961Z",
+  "finished_at": "2026-05-15T18:02:02.482Z",
+  "exit_code": 1,
+  "signal": null,
+  "timed_out": false,
+  "duration_ms": 521,
+  "stdout_bytes": 0,
+  "stderr_bytes": 1467,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/4153d677-be49-417d-8f19-08ae420359de.stdout",
+  "stderr_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.gsd/worktrees/M001/.gsd/exec/4153d677-be49-417d-8f19-08ae420359de.stderr"
+}

@@ -1,0 +1,16 @@
+app.py
+docker-compose.yml
+Dockerfile
+docs
+mcp_servers
+openspec
+prompts
+README.md
+requirements-mcp.txt
+requirements-pdf.txt
+requirements.txt
+score_urls.py
+scripts
+simple_plan.md
+src
+tests
