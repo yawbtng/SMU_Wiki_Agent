@@ -37,6 +37,8 @@ class PdfChunkRow:
     text: str
     char_count: int
     created_at: str
+    parser: str = "docling"
+    source_path: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -47,6 +49,8 @@ class PdfChunkRow:
             "text": self.text,
             "char_count": self.char_count,
             "created_at": self.created_at,
+            "parser": self.parser,
+            "source_path": self.source_path,
         }
 
 

@@ -116,6 +116,22 @@ def test_happy_path_chunks_include_page_and_source_and_deterministic_ids(tmp_pat
     assert [c.chunk_id for c in r1.chunks] == [c.chunk_id for c in r2.chunks]
 
 
+def test_pdf_chunks_include_docling_parser_metadata(tmp_path: Path, monkeypatch) -> None:
+    pdf_path = tmp_path / "catalog.pdf"
+    pdf_path.write_bytes(b"%PDF-1.7\n")
+
+    monkeypatch.setattr(
+        "src.scrape_planner.pdf_ingest._parse_pdf_with_docling",
+        lambda path: "# Catalog\n\nAdmissions requirements and tuition information for students.",
+    )
+
+    result = ingest_pdfs([pdf_path], PdfIngestConfig(min_meaningful_chars=20))
+
+    assert result.quarantine == []
+    assert result.chunks[0].parser == "docling"
+    assert result.chunks[0].source_path == str(pdf_path)
+
+
 def test_mixed_valid_invalid_batch(tmp_path: Path, monkeypatch) -> None:
     good = tmp_path / "good.pdf"
     bad = tmp_path / "bad.pdf"
