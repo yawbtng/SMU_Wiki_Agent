@@ -8,11 +8,11 @@ The app is a Streamlit workflow with tabs:
 - Discover
 - Choose URLs
 - Scrape
-- Clean
+- Graph
 - Review
 - Settings
 
-The backend already has pieces for sitemap discovery, manual URLs, Scrapling scrape, cleanup, Tavily retry, OpenRouter selection, Ollama cleanup, wiki orchestration, Zvec index scaffolding, and MCP query scaffolding.
+The backend already has pieces for sitemap discovery, manual URLs, Scrapling scrape, Tavily retry, OpenRouter reasoning, scraped-content graph planning, wiki orchestration, Zvec index scaffolding, and MCP query scaffolding.
 
 The redesign should reorganize these capabilities around a simple product story rather than adding new visible controls everywhere. V1 should not use `Advanced` sections. Features that are not necessary for the main workflow should be removed from the visible UI and reintroduced later only when there is a concrete need.
 
@@ -104,25 +104,26 @@ Removed from V1:
 - deep failure triage
 - Tavily fallback controls
 
-### Clean
+### Graph
 
-Purpose: clean scraped markdown into useful wiki/search content.
+Purpose: reason over scraped markdown and produce the deterministic university source graph.
 
 Primary visible content:
 
-- provider/model label from Settings
-- start/resume/cancel
-- progress
-- cleaned/failed/skipped counts
-- latest cleaned outputs
+- scraped page count
+- graph included/excluded counts
+- OpenRouter model label from Settings
+- button: `Build Source Graph`
+- included source table with category, group, title, URL, confidence, and reason
+- graph artifact path and index preview
 
 Removed from V1:
 
+- cleanup queue
 - max token controls
 - thinking mode
-- raw cleanup manifest/events
-- Tavily retry
-- Claude plan legacy controls
+- cleanup manifest/events
+- page-by-page cleanup provider controls
 
 ### Review
 
@@ -131,8 +132,8 @@ Purpose: inspect outputs and build final artifacts.
 Primary visible content:
 
 - run summary
-- selected/scraped/cleaned/skipped/failed
-- cleaned output links
+- selected/scraped/graph included/graph excluded/failed
+- graph source links
 - university map graph
 - wiki artifact links
 - build embeddings button
@@ -153,14 +154,12 @@ Primary sections:
 - OpenRouter
   - API key status/input
   - URL reasoning model
-  - cleanup model
 - Tavily
   - API key status/input
   - use for university map research toggle
   - use for failed scrape retry toggle
 - Ollama
   - base URL
-  - cleanup fallback model
   - embedding toggle
   - embedding model, default `nomic-embed-text:latest`
 - Zvec
@@ -169,7 +168,6 @@ Primary sections:
   - collection/index name
 - Defaults
   - scrape concurrency
-  - cleanup concurrency
   - max selected URLs
 
 No API keys should appear on action pages.
@@ -182,16 +180,15 @@ Build a structured, Obsidian-like map of the university so URL selection and wik
 
 ### Inputs
 
-- sitemap/discovered URLs
-- manual URLs
-- optional Tavily search snippets
-- optional cleaned content when available
+- successful scraped markdown files
+- manual/PDF source metadata when available
+- optional Tavily recovered markdown when available
 
 ### Output Artifact
 
 Path:
 
-`data/sites/<site_id>/university_map.json`
+`data/sites/<site_id>/<run_id>/wiki/graph.json`
 
 Shape:
 
@@ -199,7 +196,7 @@ Shape:
 {
   "site_url": "...",
   "generated_at": "...",
-  "method": "openrouter_with_tavily_and_sitemap",
+  "method": "scraped_content_llm_reasoning",
   "nodes": [
     {
       "id": "school:dedman-college",
@@ -239,10 +236,11 @@ Use a lightweight graph component that works in Streamlit:
 
 ## LLM URL Reasoning
 
-OpenRouter should be the primary V1 selector.
+OpenRouter should be the primary V1 graph reasoner after scraping.
 
 Prompt intent:
 
+- reason over scraped page text, not URL guesses only
 - identify student-useful pages
 - identify spam/noisy/legacy/archive pages
 - classify likely school/department/office when possible
@@ -259,19 +257,18 @@ Local rules remain:
 ## Data Flow
 
 1. Discovery writes `discovered_urls.json`.
-2. Choose URLs runs OpenRouter and writes `selected_urls_llm.json`.
-3. Selected rows are persisted back to `discovered_urls.json` with score/reason/selected fields.
-4. Scrape reads selected rows through the existing `selected_df -> DiscoveredURL` path.
-5. Clean reads scrape artifacts and writes `cleanup_manifest.json`.
-6. Review builds wiki/map/index artifacts from run outputs.
-7. Zvec indexing reads cleaned/wiki markdown and writes a local Zvec index.
-8. MCP server reads the Zvec index and exposes query tools.
+2. Choose URLs may apply a broad candidate cap, but should not pretend URL guesses are final content decisions.
+3. Scrape reads selected/candidate rows through the existing `selected_df -> DiscoveredURL` path.
+4. Graph reads successful scraped markdown and writes `wiki/graph.json` plus `scraped_url_reasoning.json`.
+5. Review builds wiki/map/index artifacts from graph and run outputs.
+6. Zvec indexing reads graph/wiki markdown and writes a local Zvec index.
+7. MCP server reads the Zvec index and exposes query tools.
 
 ## Error Handling
 
 - If OpenRouter key is missing, show one Settings link/callout and keep local fallback available.
 - If Tavily key is missing, build university map from sitemap only and show lower-confidence notice.
-- If Ollama embedding model is missing, show command/instruction from Settings and do not block other review actions.
+- If Ollama embedding model is missing, show command/instruction from Settings and do not block graph/review actions.
 - If Zvec is unavailable for current Python, show environment guidance and do not break Streamlit.
 
 ## Migration Notes
@@ -280,4 +277,3 @@ Local rules remain:
 - Existing `selected_urls_llm.json` should remain compatible.
 - Existing local scoring profile should stay out of the V1 UI unless OpenRouter is unavailable and the operator explicitly needs a fallback.
 - Existing dirty/debug panels should be removed from the V1 UI. Keep backend helpers only when they are still required by the main workflow.
-

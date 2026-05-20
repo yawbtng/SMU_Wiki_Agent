@@ -6,10 +6,9 @@ Redesign the Streamlit app into a minimal V1 operator workflow for building a un
 
 1. Configure providers once in Settings.
 2. Discover sitemap/manual/PDF sources.
-3. Use LLM reasoning to classify and select useful URLs.
-4. Scrape selected sources.
-5. Clean scraped content.
-6. Build a wiki and university structure map.
+3. Scrape candidate sources before ranking content.
+4. Use LLM reasoning over scraped markdown to classify useful URLs.
+5. Build a deterministic university graph and wiki structure map.
 7. Build embeddings with Ollama `nomic-embed-text:latest`.
 8. Store/query vectors through Zvec and MCP.
 
@@ -21,7 +20,7 @@ The current app has grown into a dense operator/debug console. It contains usefu
 
 - Choose URLs mixes manual filters, local rules, LLM scoring, profile generation, raw tables, and too many recovery controls.
 - Provider settings appear in multiple tabs.
-- Scrape, Clean, and Review expose too many internal details by default.
+- Scrape, Graph, and Review expose too many internal details by default.
 - The app does not yet present a clear "student-useful university knowledge base" product path.
 - The user needs control, but not every control should be visible all the time.
 
@@ -38,7 +37,7 @@ The V1 product should feel obvious:
 - Make Settings the single home for keys, providers, models, embeddings, and vector DB toggles.
 - Keep the existing tab order unless a simpler grouping clearly removes confusion.
 - Make each page have one primary action and a small number of secondary actions.
-- Use OpenRouter for LLM URL reasoning and university structure classification.
+- Use OpenRouter for scraped-content URL reasoning and university structure classification.
 - Use Tavily only for research/enrichment and failed-source recovery when enabled.
 - Use Ollama embeddings with `nomic-embed-text:latest` for local vector indexing.
 - Use Zvec as the local vector DB target.
@@ -54,9 +53,9 @@ The V1 product should feel obvious:
 
 - Do not replace Streamlit in this change.
 - Do not build a full custom frontend.
-- Do not remove existing scrape/clean functionality.
+- Do not require cleanup as a normal V1 stage.
 - Do not require Tavily for the core pipeline.
-- Do not force Ollama for cleanup; OpenRouter remains the preferred fast cleanup path when configured.
+- Do not force Ollama cleanup; scraped markdown is the primary graph input.
 - Do not implement production auth or hosted deployment.
 
 ## User Experience Principles
@@ -70,11 +69,10 @@ The V1 product should feel obvious:
 
 ## Success Criteria
 
-- A new user can run Setup -> Discover -> Choose URLs -> Scrape -> Clean -> Review without needing hidden/debug controls.
+- A new user can run Setup -> Discover -> Choose URLs -> Scrape -> Graph -> Review without needing hidden/debug controls.
 - Choose URLs primarily uses OpenRouter reasoning, with local rules as fallback.
 - Settings contains OpenRouter, Tavily, Ollama embedding, and Zvec configuration.
 - University Map renders a clear Obsidian-style School -> Department -> Office/Service graph with categorized URLs.
-- Clean/Review focuses on run outcomes and generated artifacts.
+- Graph/Review focuses on run outcomes and generated artifacts.
 - Embedding/index actions are visible only after usable cleaned/wiki content exists.
 - Raw JSON, queues, terminal details, dense analytics, and legacy scoring controls are not part of the V1 UI.
-

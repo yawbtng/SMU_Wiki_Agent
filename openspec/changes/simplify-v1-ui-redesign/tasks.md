@@ -5,9 +5,7 @@
 - [ ] Move Tavily API key input to Settings only.
 - [ ] Ensure OpenRouter key/status is visible only in Settings.
 - [ ] Add OpenRouter URL reasoning model setting.
-- [ ] Add OpenRouter cleanup model setting.
 - [ ] Add Ollama base URL setting.
-- [ ] Add Ollama cleanup fallback model setting.
 - [ ] Add Ollama embeddings toggle.
 - [ ] Add embedding model setting with default `nomic-embed-text:latest`.
 - [ ] Add Zvec enabled toggle.
@@ -60,19 +58,23 @@
 - [ ] Show retry failed only after failures exist.
 - [ ] Remove page inspector, raw event timeline, full queue table, and failure triage from V1 UI.
 
-## 7. Clean Cockpit
+## 7. Graph Builder
 
-- [ ] Show provider/model from Settings without key/model setup clutter.
-- [ ] Keep start/resume/cancel, progress, cleaned/failed/skipped, latest outputs.
-- [ ] Remove max tokens, thinking mode, raw cleanup queue/events, reset, Tavily retry, and Claude plan from V1 UI.
+- [ ] Build graph from successful scraped markdown, not cleaned markdown.
+- [ ] Run LLM reasoning over every scraped URL.
+- [ ] Write deterministic `wiki/graph.json` and `scraped_url_reasoning.json`.
+- [ ] Show included/excluded source counts.
+- [ ] Show included URL table by category/group/reason.
+- [ ] Keep excluded pages behind a secondary view.
+- [ ] Remove cleanup queue/events/reset from V1 UI.
 
 ## 8. Review and Outputs
 
 - [ ] Show run summary first.
-- [ ] Show cleaned outputs and wiki artifacts.
+- [ ] Show scraped source graph and wiki artifacts.
 - [ ] Show University Map graph and table when available.
 - [ ] Add `Build Wiki` action if artifacts are ready.
-- [ ] Add `Build Embeddings` action when cleaned/wiki content exists.
+- [ ] Add `Build Embeddings` action when graph/wiki content exists.
 - [ ] Add Zvec/MCP connection instructions when index exists.
 - [ ] Remove dense cost/call/latency analytics and raw traces from V1 UI.
 
@@ -80,7 +82,7 @@
 
 - [ ] Read embedding settings from Settings.
 - [ ] Use Ollama `nomic-embed-text:latest` by default.
-- [ ] Build Zvec index from cleaned/wiki markdown.
+- [ ] Build Zvec index from graph/wiki markdown.
 - [ ] Persist `zvec_index_manifest.json`.
 - [ ] Surface index status in Review.
 - [ ] Keep MCP server instructions in Review/Settings, not action pages.
@@ -94,5 +96,4 @@
 - [ ] Manually verify there are no `Advanced` sections in the V1 UI.
 - [ ] Manually verify OpenRouter URL reasoning writes scores/reasons.
 - [ ] Manually verify university map renders as an Obsidian-style categorized graph.
-- [ ] Manually verify Scrape/Clean/Review normal paths are minimal.
-
+- [ ] Manually verify Scrape/Graph/Review normal paths are minimal.
