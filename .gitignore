@@ -1,7 +1,11 @@
 .env
 .venv/
 .home/
-.pi/
+.pi/*
+!.pi/skills/
+.pi/skills/*
+!.pi/skills/content-organizer/
+!.pi/skills/content-organizer/SKILL.md
 __pycache__/
 *.py[cod]
 .pytest_cache/

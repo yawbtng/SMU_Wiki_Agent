@@ -8,11 +8,10 @@ Use one linear workflow:
 
 1. Setup
 2. Discover
-3. Choose URLs
-4. Scrape
-5. Clean
-6. Review
-7. Settings
+3. Scrape
+4. Clean
+5. Review
+6. Settings
 
 The normal user should never see raw queue JSON, tmux internals, huge debug tables, or duplicate workspace/site controls unless they open an Advanced section.
 
@@ -20,12 +19,12 @@ The normal user should never see raw queue JSON, tmux internals, huge debug tabl
 
 - Rename tabs:
   - `Workspace` -> `Setup`
-  - `Select` -> `Choose URLs`
+  - remove `Choose URLs`
   - `Cleanup` -> `Clean`
   - `Metrics` -> `Review`
 - Keep `Discover`, `Scrape`, `Settings`.
 - Remove duplicate or repeated helper text.
-- Keep tab order: `Setup`, `Discover`, `Choose URLs`, `Scrape`, `Clean`, `Review`, `Settings`.
+- Keep tab order: `Setup`, `Discover`, `Scrape`, `Clean`, `Review`, `Settings`.
 
 ## Phase 2: Simplify Setup Tab
 
@@ -61,30 +60,31 @@ Advanced expander:
 - manual URL input
 - sitemap notes
 
-## Phase 4: Simplify Choose URLs Tab
+## Phase 4: Replace Choose URLs With Do-Not-Parse Planning
 
 Normal view:
 
-- `Importance threshold` slider with recommended value `80`
-- Button: `Use Recommended Important URLs`
-- Show only selected/important URLs by default
+- Button: `Build Do-Not-Parse Plan`
+- Scrape queue count
+- Excluded count
+- Exclusion category summary
 - Show counts:
-  - selected
-  - excluded stale/archive
-  - low value
-  - total scored
+  - discovered
+  - scrape candidates
+  - do-not-parse URLs
+  - sitemap sources
 
 Advanced expander:
 
-- scoring prompt
-- terminal/tmux/pi details
-- full scored table
-- raw score import controls
+- manual URL input
+- raw discovered URL table
+- raw source exclusion plan
 
 Important behavior:
 
-- Do not let old dated pages pass just because sitemap lastmod is recent.
-- Prefer current canonical pages over dated child pages.
+- Do not rank usefulness before scraping.
+- Exclude only obvious spam, login/search/filter/feed/archive/news/event/media pages.
+- Scrape departments, offices, programs, PDFs, and people/professor pages.
 
 ## Phase 5: Simplify Scrape Tab
 
@@ -160,7 +160,7 @@ Merge useful metrics into Review.
 
 Show:
 
-- selected URLs
+- queued URLs
 - scraped pages
 - cleaned pages
 - skipped pages
@@ -173,7 +173,7 @@ Also show:
 
 - searchable cleaned files table
 - preview links
-- export/build-wiki actions
+- content organizer task/report/quarantine
 
 Avoid charts unless they answer a real question.
 
@@ -196,8 +196,8 @@ After implementation:
 
 - App starts at `http://127.0.0.1:8501`.
 - Inside SMU workspace does not look like workspace creation screen.
-- User can follow: Discover -> Choose URLs -> Scrape -> Clean -> Review.
-- Important URL selection excludes stale archive pages.
+- User can follow: Discover -> Scrape -> Clean -> Review.
+- Do-not-parse planning excludes obvious spam/news/archive/search/filter/feed pages.
 - Scrape realtime view shows running pages only by default.
 - Clean results show cleaned files only.
 - Advanced/debug internals are hidden by default.
@@ -212,7 +212,7 @@ Commit after each completed phase with a short message, for example:
 - `Simplify navigation tabs`
 - `Clean up setup dashboard`
 - `Simplify discover flow`
-- `Simplify URL selection`
+- `Replace URL selection with source exclusion`
 - `Simplify scrape cockpit`
 - `Simplify cleanup flow`
 - `Add cleanup skip rules`

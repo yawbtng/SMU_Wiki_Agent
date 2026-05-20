@@ -3,12 +3,12 @@
 Local Streamlit app for this workflow:
 
 1. Discover all URLs from sitemap(s)
-2. Use OpenRouter `deepseek/deepseek-v4-flash` to select top student-useful and freshest URLs (prefer 2026/current-year)
-3. Scrape selected URLs with Scrapling (fallback modes for harder pages)
+2. Use OpenRouter to build `source_exclusion_plan.json`, excluding only spam/login/search/filter/feed/archive/news/event/media URLs
+3. Scrape every remaining URL with Scrapling (fallback modes for harder pages)
 4. Clean pages sequentially with local Ollama model (one URL at a time)
-5. Edit cleaned markdown in-app
-6. Retry failed URLs with Tavily Extract
-7. Generate and run Claude wiki build orchestration
+5. Use the Pi `content-organizer` skill to quarantine useless final-output pages and organize content by school, department, office, service, document, and people/professor profile
+6. Retry failed URLs with Tavily Extract when needed
+7. Review generated wiki/graph outputs
 
 ## Quickstart
 
@@ -31,8 +31,9 @@ Ollama from host is wired by default as `http://host.docker.internal:11434`.
 Optional:
 
 - Redis: set `REDIS_URL` (default `redis://localhost:6379/0`)
-- OpenRouter: set `OPENROUTER_API_KEY` for URL-selection stage
-- Claude CLI: install/login `claude` to enable LLM selection and wiki build
+- OpenRouter: set `OPENROUTER_API_KEY` for the pre-scrape do-not-parse classifier
+- Data root: set `ULTRA_FAST_RAG_DATA_ROOT` if you want artifacts somewhere other than `data/`; Codex/Git worktrees automatically reuse the main checkout's populated `data/` directory when local worktree data is empty.
+- Claude CLI: install/login `claude` for optional wiki build helpers
 - Ollama: run local server at `http://localhost:11434` for cleanup
 - PDF/document wiki ingest: use Python 3.10+ and install `pip install -r requirements-pdf.txt` to install Docling for converting PDFs/documents before graph wiki indexing.
 
@@ -45,8 +46,8 @@ Run artifacts are written under:
 Key files:
 
 - `discovered_urls.json`
+- `source_exclusion_plan.json`
 - `selected_urls.json`
-- `selected_urls_llm.json`
 - `scrape_manifest.json`
 - `failures.json`
 - `raw_html/*.html`
@@ -58,6 +59,8 @@ Key files:
 - `document_ingest/converted_markdown/*.md`
 - `document_ingest/manifest.json`
 - `document_ingest/report.md`
+- `content_organizer/quarantine.json`
+- `content_organizer/report.md`
 - `wiki/index.md`
 - `wiki/graph.json`
 - `wiki/subwikis/<topic>/index.md`
