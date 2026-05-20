@@ -61,13 +61,6 @@ DEFAULT_SPAMMY_TERMS = (
     "staging",
     "page/",
     "author/",
-    "donor",
-    "giving",
-    "gift",
-    "alumni",
-    "trustee",
-    "annual-report",
-    "annualreport",
 )
 
 DEFAULT_DATED_PATTERNS = (
@@ -167,6 +160,7 @@ class UrlCriteria:
     max_urls: int = 500
     threshold: int = 70
     include_pdfs: bool = True
+    scrape_first: bool = False
 
 
 def host_from_url(url: str) -> str:
@@ -376,7 +370,11 @@ def score_and_filter_rows(
                 continue
 
         merged = {**row, **quality}
-        merged["selected"] = int(quality["score"]) >= int(criteria.threshold)
+        if criteria.scrape_first:
+            merged["selected"] = not bool(quality["spammy"])
+            merged["selection_source"] = "deterministic_exclusion"
+        else:
+            merged["selected"] = int(quality["score"]) >= int(criteria.threshold)
         if merged["selected"]:
             counts["selected"] += 1
         if quality["spammy"]:

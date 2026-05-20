@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
 from .content_extract import extract_content
 from .failure_classifier import classify_failure, to_failure_record
 from .models import DiscoveredURL, PageResult
+from .pdf_ingest import PdfIngestConfig, ingest_pdfs
 from .run_persistence import read_page_states, upsert_page_state, write_run_status
 from .state import RunStateStore
 from .storage import ensure_run_dirs, write_json
@@ -28,6 +31,19 @@ except Exception:  # pragma: no cover - optional import
 
 def _slug_from_url(url: str) -> str:
     return hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
+
+
+def _safe_pdf_filename(url: str) -> str:
+    path_name = Path(urlparse(url).path).name or f"{_slug_from_url(url)}.pdf"
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", path_name).strip(".-")
+    if not cleaned.lower().endswith(".pdf"):
+        cleaned = f"{cleaned or _slug_from_url(url)}.pdf"
+    return cleaned[:160]
+
+
+def _is_pdf_url(item: DiscoveredURL) -> bool:
+    content_guess = str(item.content_type_guess or "").lower()
+    return urlparse(item.url).path.lower().endswith(".pdf") or "pdf" in content_guess
 
 
 def _utc_now_iso() -> str:
@@ -179,6 +195,14 @@ class ScrapeRunner:
             return StealthyFetcher.fetch(url, headless=True, timeout=30000, network_idle=True)
         return requests.get(url, timeout=20)
 
+    def _download_pdf(self, url: str, target: Path) -> tuple[int | None, str | None, int]:
+        resp = requests.get(url, timeout=60)
+        content_type = resp.headers.get("content-type") if isinstance(resp.headers, dict) else None
+        resp.raise_for_status()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(resp.content)
+        return getattr(resp, "status_code", None), content_type, len(resp.content)
+
     def _execute(self, site_id: str, run_id: str, urls: list[DiscoveredURL], concurrency: int = 4) -> None:
         selected_urls = [item for item in urls if item.selected and not item.excluded_reason]
         run_root = self.base_data_dir / "sites" / site_id / run_id
@@ -188,6 +212,7 @@ class ScrapeRunner:
         worker_count = max(1, min(int(concurrency or 4), 16))
         status_lock = threading.Lock()
         failures_lock = threading.Lock()
+        pdf_lock = threading.Lock()
         failures: list[dict[str, Any]] = []
         pages_order = [item.url for item in selected_urls]
         pages_by_url: dict[str, dict[str, Any]] = {}
@@ -313,6 +338,7 @@ class ScrapeRunner:
                 raw_html_path = dirs["raw_html"] / f"{slug}.html"
                 md_path = dirs["markdown"] / f"{slug}.md"
                 meta_path = dirs["metadata"] / f"{slug}.json"
+                pdf_path = run_root / "pdf_downloads" / _safe_pdf_filename(item.url)
                 last_error: Exception | None = None
 
                 with status_lock:
@@ -341,62 +367,69 @@ class ScrapeRunner:
                     },
                 )
 
-                for attempt, mode in enumerate(("fetcher", "dynamic", "stealthy"), start=1):
+                if _is_pdf_url(item):
                     try:
-                        with status_lock:
-                            page = pages_by_url[item.url]
-                            page["attempt"] = attempt
-                            page["fetch_mode"] = mode
-                            pages_by_url[item.url] = page
-                            self.state.set_pages(site_id, run_id, _pages_snapshot_locked())
-                        self.state.push_event(
-                            site_id,
-                            run_id,
+                        http_status, content_type, size_bytes = self._download_pdf(item.url, pdf_path)
+                        pdf_result = ingest_pdfs([pdf_path], PdfIngestConfig())
+                        with pdf_lock:
+                            _merge_jsonl_rows(
+                                run_root / "s05" / "pdf_sources.jsonl",
+                                [row.to_dict() for row in pdf_result.sources],
+                                key="pdf_source_id",
+                            )
+                            _merge_jsonl_rows(
+                                run_root / "s05" / "pdf_chunks.jsonl",
+                                [row.to_dict() for row in pdf_result.chunks],
+                                key="chunk_id",
+                            )
+                            _merge_jsonl_rows(
+                                run_root / "s05" / "pdf_quarantine.jsonl",
+                                [row.to_dict() for row in pdf_result.quarantine],
+                                key="pdf_source_id",
+                            )
+                        accepted = any(row.accepted for row in pdf_result.sources)
+                        chunk_count = len(pdf_result.chunks)
+                        write_json(
+                            meta_path,
                             {
-                                "ts": _utc_now_iso(),
-                                "event": "fetch_attempt",
-                                "status": "running",
                                 "url": item.url,
+                                "http_status": http_status,
+                                "content_type": content_type,
+                                "size_bytes": size_bytes,
+                                "fetch_mode": "pdf",
                                 "worker_id": worker_id,
-                                "attempt": attempt,
-                                "fetch_mode": mode,
+                                "attempt": 1,
+                                "pdf_path": str(pdf_path),
+                                "pdf_chunks": chunk_count,
+                                "pdf_quarantine": [row.to_dict() for row in pdf_result.quarantine],
                             },
                         )
-                        response = self._fetch_with_mode(mode, item.url)
-                        http_status, content_type, html = _extract_response_parts(response)
-                        _, markdown, text_length, link_density = extract_content(html)
-                        reason = classify_failure(
-                            http_status=http_status,
-                            content_type=content_type,
-                            text_length=text_length,
-                            link_density=link_density,
-                        )
-                        if reason is None:
-                            raw_html_path.write_text(html, encoding="utf-8")
-                            md_path.write_text(markdown, encoding="utf-8")
-                            write_json(
-                                meta_path,
-                                {
-                                    "url": item.url,
-                                    "http_status": http_status,
-                                    "content_type": content_type,
-                                    "text_length": text_length,
-                                    "link_density": link_density,
-                                    "fetch_mode": mode,
-                                    "worker_id": worker_id,
-                                    "attempt": attempt,
-                                },
-                            )
+                        if not accepted or chunk_count <= 0:
+                            reason = "ocr_required" if pdf_result.quarantine else "parse_error"
+                            with status_lock:
+                                page = pages_by_url[item.url]
+                                page["status"] = "failed"
+                                page["http_status"] = http_status
+                                page["failure_reason"] = reason
+                                page["fetch_mode"] = "pdf"
+                                page["metadata_path"] = str(meta_path)
+                                page["text_length"] = 0
+                                page["link_density"] = 0.0
+                                page["finished_at"] = _utc_now_iso()
+                                pages_by_url[item.url] = page
+                                _set_state_locked()
+                        else:
                             with status_lock:
                                 page = pages_by_url[item.url]
                                 page["status"] = "success"
                                 page["http_status"] = http_status
                                 page["failure_reason"] = None
-                                page["text_length"] = text_length
-                                page["link_density"] = link_density
-                                page["raw_html_path"] = str(raw_html_path)
-                                page["markdown_path"] = str(md_path)
+                                page["fetch_mode"] = "pdf"
                                 page["metadata_path"] = str(meta_path)
+                                page["raw_html_path"] = str(pdf_path)
+                                page["markdown_path"] = None
+                                page["text_length"] = sum(chunk.char_count for chunk in pdf_result.chunks)
+                                page["link_density"] = 0.0
                                 page["finished_at"] = _utc_now_iso()
                                 pages_by_url[item.url] = page
                                 _set_state_locked()
@@ -405,50 +438,22 @@ class ScrapeRunner:
                                 run_id,
                                 {
                                     "ts": _utc_now_iso(),
-                                    "event": "artifacts_saved",
+                                    "event": "pdf_artifacts_saved",
                                     "status": "running",
                                     "url": item.url,
                                     "worker_id": worker_id,
-                                    "attempt": attempt,
-                                    "fetch_mode": mode,
+                                    "attempt": 1,
+                                    "fetch_mode": "pdf",
                                     "http_status": http_status,
-                                    "markdown_path": str(md_path),
-                                    "raw_html_path": str(raw_html_path),
+                                    "pdf_path": str(pdf_path),
+                                    "pdf_chunks": chunk_count,
                                 },
                             )
-                            break
-
-                        with status_lock:
-                            page = pages_by_url[item.url]
-                            page["status"] = "failed"
-                            page["http_status"] = http_status
-                            page["failure_reason"] = reason
-                            page["text_length"] = text_length
-                            page["link_density"] = link_density
-                            pages_by_url[item.url] = page
-                            self.state.set_pages(site_id, run_id, _pages_snapshot_locked())
-                        if reason in {"blocked", "timeout", "parse_error"} and mode != "stealthy":
-                            self.state.push_event(
-                                site_id,
-                                run_id,
-                                {
-                                    "ts": _utc_now_iso(),
-                                    "event": "fetch_retrying_next_mode",
-                                    "status": "retry",
-                                    "url": item.url,
-                                    "worker_id": worker_id,
-                                    "attempt": attempt,
-                                    "fetch_mode": mode,
-                                    "failure_reason": reason,
-                                },
-                            )
-                            continue
-                        break
                     except Exception as exc:
                         last_error = exc
                         failure_reason = classify_failure(
                             http_status=None,
-                            content_type=None,
+                            content_type="application/pdf",
                             text_length=0,
                             link_density=0.0,
                             error=exc,
@@ -457,26 +462,162 @@ class ScrapeRunner:
                             page = pages_by_url[item.url]
                             page["status"] = "failed"
                             page["failure_reason"] = failure_reason
-                            page["fetch_mode"] = mode
+                            page["fetch_mode"] = "pdf"
+                            page["finished_at"] = _utc_now_iso()
                             pages_by_url[item.url] = page
-                            self.state.set_pages(site_id, run_id, _pages_snapshot_locked())
+                            _set_state_locked()
                         self.state.push_event(
                             site_id,
                             run_id,
                             {
                                 "ts": _utc_now_iso(),
-                                "event": "fetch_exception",
+                                "event": "pdf_fetch_exception",
                                 "status": "failed",
                                 "url": item.url,
                                 "worker_id": worker_id,
-                                "attempt": attempt,
-                                "fetch_mode": mode,
+                                "attempt": 1,
+                                "fetch_mode": "pdf",
                                 "failure_reason": failure_reason,
                                 "error": str(exc),
                             },
                         )
-                        if mode != "stealthy":
-                            continue
+                else:
+                    for attempt, mode in enumerate(("fetcher", "dynamic", "stealthy"), start=1):
+                        try:
+                            with status_lock:
+                                page = pages_by_url[item.url]
+                                page["attempt"] = attempt
+                                page["fetch_mode"] = mode
+                                pages_by_url[item.url] = page
+                                self.state.set_pages(site_id, run_id, _pages_snapshot_locked())
+                            self.state.push_event(
+                                site_id,
+                                run_id,
+                                {
+                                    "ts": _utc_now_iso(),
+                                    "event": "fetch_attempt",
+                                    "status": "running",
+                                    "url": item.url,
+                                    "worker_id": worker_id,
+                                    "attempt": attempt,
+                                    "fetch_mode": mode,
+                                },
+                            )
+                            response = self._fetch_with_mode(mode, item.url)
+                            http_status, content_type, html = _extract_response_parts(response)
+                            _, markdown, text_length, link_density = extract_content(html)
+                            reason = classify_failure(
+                                http_status=http_status,
+                                content_type=content_type,
+                                text_length=text_length,
+                                link_density=link_density,
+                            )
+                            if reason is None:
+                                raw_html_path.write_text(html, encoding="utf-8")
+                                md_path.write_text(markdown, encoding="utf-8")
+                                write_json(
+                                    meta_path,
+                                    {
+                                        "url": item.url,
+                                        "http_status": http_status,
+                                        "content_type": content_type,
+                                        "text_length": text_length,
+                                        "link_density": link_density,
+                                        "fetch_mode": mode,
+                                        "worker_id": worker_id,
+                                        "attempt": attempt,
+                                    },
+                                )
+                                with status_lock:
+                                    page = pages_by_url[item.url]
+                                    page["status"] = "success"
+                                    page["http_status"] = http_status
+                                    page["failure_reason"] = None
+                                    page["text_length"] = text_length
+                                    page["link_density"] = link_density
+                                    page["raw_html_path"] = str(raw_html_path)
+                                    page["markdown_path"] = str(md_path)
+                                    page["metadata_path"] = str(meta_path)
+                                    page["finished_at"] = _utc_now_iso()
+                                    pages_by_url[item.url] = page
+                                    _set_state_locked()
+                                self.state.push_event(
+                                    site_id,
+                                    run_id,
+                                    {
+                                        "ts": _utc_now_iso(),
+                                        "event": "artifacts_saved",
+                                        "status": "running",
+                                        "url": item.url,
+                                        "worker_id": worker_id,
+                                        "attempt": attempt,
+                                        "fetch_mode": mode,
+                                        "http_status": http_status,
+                                        "markdown_path": str(md_path),
+                                        "raw_html_path": str(raw_html_path),
+                                    },
+                                )
+                                break
+
+                            with status_lock:
+                                page = pages_by_url[item.url]
+                                page["status"] = "failed"
+                                page["http_status"] = http_status
+                                page["failure_reason"] = reason
+                                page["text_length"] = text_length
+                                page["link_density"] = link_density
+                                pages_by_url[item.url] = page
+                                self.state.set_pages(site_id, run_id, _pages_snapshot_locked())
+                            if reason in {"blocked", "timeout", "parse_error"} and mode != "stealthy":
+                                self.state.push_event(
+                                    site_id,
+                                    run_id,
+                                    {
+                                        "ts": _utc_now_iso(),
+                                        "event": "fetch_retrying_next_mode",
+                                        "status": "retry",
+                                        "url": item.url,
+                                        "worker_id": worker_id,
+                                        "attempt": attempt,
+                                        "fetch_mode": mode,
+                                        "failure_reason": reason,
+                                    },
+                                )
+                                continue
+                            break
+                        except Exception as exc:
+                            last_error = exc
+                            failure_reason = classify_failure(
+                                http_status=None,
+                                content_type=None,
+                                text_length=0,
+                                link_density=0.0,
+                                error=exc,
+                            )
+                            with status_lock:
+                                page = pages_by_url[item.url]
+                                page["status"] = "failed"
+                                page["failure_reason"] = failure_reason
+                                page["fetch_mode"] = mode
+                                pages_by_url[item.url] = page
+                                self.state.set_pages(site_id, run_id, _pages_snapshot_locked())
+                            self.state.push_event(
+                                site_id,
+                                run_id,
+                                {
+                                    "ts": _utc_now_iso(),
+                                    "event": "fetch_exception",
+                                    "status": "failed",
+                                    "url": item.url,
+                                    "worker_id": worker_id,
+                                    "attempt": attempt,
+                                    "fetch_mode": mode,
+                                    "failure_reason": failure_reason,
+                                    "error": str(exc),
+                                },
+                            )
+                            if mode != "stealthy":
+                                continue
 
                 with status_lock:
                     page = pages_by_url[item.url]
@@ -576,3 +717,29 @@ class ScrapeRunner:
             pages_final = _pages_snapshot_locked()
         write_json(run_root / "scrape_manifest.json", pages_final)
         write_json(run_root / "failures.json", failures)
+
+
+def _read_jsonl_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            rows.append(value)
+    return rows
+
+
+def _merge_jsonl_rows(path: Path, rows: list[dict[str, Any]], *, key: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    merged = {str(row.get(key) or ""): row for row in _read_jsonl_rows(path) if row.get(key)}
+    for row in rows:
+        row_key = str(row.get(key) or "")
+        if row_key:
+            merged[row_key] = row
+    path.write_text("".join(json.dumps(row, ensure_ascii=True) + "\n" for row in merged.values()), encoding="utf-8")

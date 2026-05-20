@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import threading
 import time
 
@@ -12,7 +13,12 @@ class _FakeResponse:
     def __init__(self, status_code: int = 200, text: str = "<html>ok</html>", content_type: str = "text/html"):
         self.status_code = status_code
         self.text = text
+        self.content = text.encode("utf-8")
         self.headers = {"content-type": content_type}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"http {self.status_code}")
 
 
 class _FakeScraplingResponse:
@@ -61,6 +67,52 @@ def test_execute_success_path(monkeypatch, tmp_path: Path):
     assert pages[0]["markdown_path"]
     assert any(e["event"] == "artifacts_saved" for e in events)
     assert (tmp_path / "sites" / "site-a" / "run-1" / "scrape_manifest.json").exists()
+
+
+def test_execute_pdf_url_downloads_and_writes_pdf_chunks(monkeypatch, tmp_path: Path):
+    runner, state = _make_runner(tmp_path)
+    item = DiscoveredURL(
+        url="https://example.com/catalog.pdf",
+        source_sitemap="https://example.com/sitemap.xml",
+        content_type_guess="pdf",
+        selected=True,
+    )
+
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape_worker.requests.get",
+        lambda url, timeout: _FakeResponse(text="%PDF-1.7", content_type="application/pdf"),
+    )
+
+    class Source:
+        accepted = True
+
+        def to_dict(self):
+            return {"pdf_source_id": "pdf-1", "path": str(tmp_path / "catalog.pdf"), "accepted": True}
+
+    class Chunk:
+        char_count = 19
+
+        def to_dict(self):
+            return {"chunk_id": "chunk-1", "pdf_source_id": "pdf-1", "text": "PDF catalog content", "char_count": 19}
+
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape_worker.ingest_pdfs",
+        lambda paths, config: SimpleNamespace(sources=[Source()], chunks=[Chunk()], quarantine=[]),
+    )
+
+    runner._execute("site-a", "run-pdf", [item])
+
+    run_root = tmp_path / "sites" / "site-a" / "run-pdf"
+    pages = state.get_pages("site-a", "run-pdf")
+    events = state.get_events("site-a", "run-pdf")
+    chunks = [json.loads(line) for line in (run_root / "s05" / "pdf_chunks.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    assert pages[0]["status"] == "success"
+    assert pages[0]["fetch_mode"] == "pdf"
+    assert pages[0]["raw_html_path"].endswith("catalog.pdf")
+    assert pages[0]["markdown_path"] is None
+    assert chunks[0]["text"] == "PDF catalog content"
+    assert any(event["event"] == "pdf_artifacts_saved" for event in events)
 
 
 def test_execute_retry_then_success(monkeypatch, tmp_path: Path):

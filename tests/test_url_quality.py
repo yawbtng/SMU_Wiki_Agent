@@ -80,6 +80,51 @@ def test_score_and_filter_uses_custom_profile():
     assert [row["url"] for row in scored if row["selected"]] == ["https://example.edu/bursar/payment-plans"]
 
 
+def test_scrape_first_selects_generic_pages_and_excludes_only_junk():
+    rows = [
+        {"url": "https://www.smu.edu/about/contact"},
+        {"url": "https://www.smu.edu/search?q=tuition"},
+        {"url": "https://www.smu.edu/calendar/2019/04/open-house"},
+    ]
+    scored, counts = score_and_filter_rows(rows, UrlCriteria(max_urls=50, threshold=95, scrape_first=True))
+
+    selected_urls = [row["url"] for row in scored if row["selected"]]
+    assert counts["selected"] == 1
+    assert selected_urls == ["https://www.smu.edu/about/contact"]
+    assert all(row["selection_source"] == "deterministic_exclusion" for row in scored if row["selected"])
+
+
+def test_scrape_first_keeps_lower_priority_institutional_pages():
+    rows = [
+        {"url": "https://www.smu.edu/alumni/giving"},
+        {"url": "https://www.smu.edu/trustees/annual-report.pdf"},
+        {"url": "https://www.smu.edu/search?q=tuition"},
+    ]
+    scored, counts = score_and_filter_rows(rows, UrlCriteria(max_urls=50, scrape_first=True))
+
+    selected_urls = {row["url"] for row in scored if row["selected"]}
+    assert counts["selected"] == 2
+    assert "https://www.smu.edu/alumni/giving" in selected_urls
+    assert "https://www.smu.edu/trustees/annual-report.pdf" in selected_urls
+    assert "https://www.smu.edu/search?q=tuition" not in selected_urls
+
+
+def test_focus_terms_are_optional_in_scrape_first_mode():
+    rows = [
+        {"url": "https://www.smu.edu/about/contact"},
+        {"url": "https://www.smu.edu/registrar/transcripts"},
+    ]
+
+    broad, _ = score_and_filter_rows(rows, UrlCriteria(scrape_first=True))
+    focused, _ = score_and_filter_rows(rows, UrlCriteria(include_text="registrar", scrape_first=True))
+
+    assert {row["url"] for row in broad if row["selected"]} == {
+        "https://www.smu.edu/about/contact",
+        "https://www.smu.edu/registrar/transcripts",
+    }
+    assert [row["url"] for row in focused if row["selected"]] == ["https://www.smu.edu/registrar/transcripts"]
+
+
 def test_suggest_profile_uses_terms_seen_in_discovered_urls():
     rows = [
         {"url": "https://college.example.edu/student-accounts/payment-plans"},
