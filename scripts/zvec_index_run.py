@@ -18,6 +18,24 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
 
 
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return rows
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
 def _ollama_embed(text: str, *, model: str, base_url: str) -> list[float]:
     payload = {"model": model, "prompt": text}
     resp = requests.post(f"{base_url.rstrip('/')}/api/embeddings", json=payload, timeout=120)
@@ -72,6 +90,34 @@ def _load_cleaned_docs(run_root: Path) -> list[dict[str, str]]:
     return docs
 
 
+def _load_pdf_chunk_docs(run_root: Path) -> list[dict[str, str]]:
+    docs: list[dict[str, str]] = []
+    for row in _read_jsonl(run_root / "s05" / "pdf_chunks.jsonl"):
+        text = str(row.get("text") or "")
+        source_path = str(row.get("source_path") or "").strip()
+        if not text.strip() or not source_path:
+            continue
+        try:
+            page_number = int(row.get("page_number") or 0)
+            chunk_index = int(row.get("chunk_index") or 0)
+        except (TypeError, ValueError):
+            continue
+
+        filename = Path(source_path).name
+        if page_number > 0:
+            title = f"{filename} page {page_number}"
+            path = f"{source_path}#page={page_number}&chunk={chunk_index}"
+        else:
+            title = filename
+            path = f"{source_path}#chunk={chunk_index}"
+        docs.append({"url": "", "title": title, "path": path, "text": text})
+    return docs
+
+
+def _load_docs_for_indexing(run_root: Path) -> list[dict[str, str]]:
+    return _load_cleaned_docs(run_root) + _load_pdf_chunk_docs(run_root)
+
+
 def _create_schema(zvec: Any, *, dimension: int) -> Any:
     return zvec.CollectionSchema(
         name="smu_wiki",
@@ -108,7 +154,7 @@ def main() -> None:
 
     run_root = args.run_root.resolve()
     db_path = (args.db or (run_root / "zvec_index")).resolve()
-    docs = _load_cleaned_docs(run_root)
+    docs = _load_docs_for_indexing(run_root)
     if not docs:
         raise SystemExit(f"No cleaned markdown/wiki docs found under {run_root}")
 
