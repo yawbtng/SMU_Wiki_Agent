@@ -5,9 +5,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from pypdf import PdfReader
-from pypdf.errors import PdfReadError
-
 from .pdf_contracts import PdfChunkRow, PdfQuarantineRow, PdfSourceRow, utc_now_iso
 
 
@@ -25,6 +22,10 @@ class PdfIngestResult:
     sources: list[PdfSourceRow]
     chunks: list[PdfChunkRow]
     quarantine: list[PdfQuarantineRow]
+
+
+class PdfParserUnavailableError(RuntimeError):
+    """Raised when the only supported PDF parser cannot be imported."""
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]")
@@ -73,69 +74,69 @@ def ingest_pdfs(paths: list[str | Path], config: PdfIngestConfig | None = None) 
                     quarantined_at=utc_now_iso(),
                 )
             )
-            sources.append(
-                PdfSourceRow(source_id, str(path), size, None, False, utc_now_iso())
-            )
+            sources.append(PdfSourceRow(source_id, str(path), size, None, False, utc_now_iso()))
             continue
 
         try:
-            reader = PdfReader(str(path))
-        except (PdfReadError, Exception) as exc:
+            markdown = _parse_pdf_with_docling(path).strip()
+        except PdfParserUnavailableError:
+            raise
+        except Exception as exc:
             quarantine.append(
-                PdfQuarantineRow(source_id, str(path), "malformed", str(exc), utc_now_iso())
+                PdfQuarantineRow(source_id, str(path), "parse_failed", str(exc), utc_now_iso())
             )
             sources.append(PdfSourceRow(source_id, str(path), size, None, False, utc_now_iso()))
             continue
 
-        if reader.is_encrypted:
-            quarantine.append(
-                PdfQuarantineRow(source_id, str(path), "encrypted", "PDF is encrypted", utc_now_iso())
-            )
-            sources.append(
-                PdfSourceRow(source_id, str(path), size, len(reader.pages), False, utc_now_iso())
-            )
-            continue
-
-        page_texts: list[tuple[int, str]] = []
-        total_chars = 0
-        for i, page in enumerate(reader.pages, start=1):
-            text = (page.extract_text() or "").strip()
-            page_texts.append((i, text))
-            total_chars += _meaningful_chars(text)
-
-        reason = _classify_low_text(total_chars, len(page_texts), cfg)
+        total_chars = _meaningful_chars(markdown)
+        reason = _classify_low_text(total_chars, 1, cfg)
         if reason is not None:
             quarantine.append(
                 PdfQuarantineRow(
                     source_id,
                     str(path),
                     reason,
-                    f"meaningful_chars={total_chars} pages={len(page_texts)}",
+                    f"meaningful_chars={total_chars} pages=1",
                     utc_now_iso(),
                 )
             )
-            sources.append(
-                PdfSourceRow(source_id, str(path), size, len(page_texts), False, utc_now_iso())
-            )
+            sources.append(PdfSourceRow(source_id, str(path), size, 1, False, utc_now_iso()))
             continue
 
-        sources.append(PdfSourceRow(source_id, str(path), size, len(page_texts), True, utc_now_iso()))
-        for page_number, text in page_texts:
-            for chunk_index, chunk_text in enumerate(_chunk_text(text, cfg), start=0):
-                chunk_id = _chunk_id(source_id, page_number, chunk_index, chunk_text)
-                chunks.append(
-                    PdfChunkRow(
-                        chunk_id=chunk_id,
-                        pdf_source_id=source_id,
-                        page_number=page_number,
-                        chunk_index=chunk_index,
-                        text=chunk_text,
-                        char_count=len(chunk_text),
-                        created_at=utc_now_iso(),
-                    )
+        sources.append(PdfSourceRow(source_id, str(path), size, 1, True, utc_now_iso()))
+        for chunk_index, chunk_text in enumerate(_chunk_text(markdown, cfg), start=0):
+            chunk_id = _chunk_id(source_id, 1, chunk_index, chunk_text)
+            chunks.append(
+                PdfChunkRow(
+                    chunk_id=chunk_id,
+                    pdf_source_id=source_id,
+                    page_number=1,
+                    chunk_index=chunk_index,
+                    text=chunk_text,
+                    char_count=len(chunk_text),
+                    created_at=utc_now_iso(),
+                    parser="docling",
+                    source_path=str(path),
                 )
+            )
 
     return PdfIngestResult(sources=sources, chunks=chunks, quarantine=quarantine)
+
+
+def _parse_pdf_with_docling(path: Path) -> str:
+    try:
+        from docling.document_converter import DocumentConverter
+    except ImportError as exc:
+        raise PdfParserUnavailableError("Docling is not installed. Install requirements-pdf.txt.") from exc
+
+    converter = DocumentConverter()
+    result = converter.convert(str(path))
+    document = getattr(result, "document", None)
+    if document is None:
+        raise RuntimeError("Docling returned no document")
+    if not hasattr(document, "export_to_markdown"):
+        raise RuntimeError("Docling document cannot export markdown")
+    return str(document.export_to_markdown() or "")
 
 
 def _source_id(path: Path) -> str:
