@@ -17,6 +17,21 @@ def test_manual_pdfs_are_kept_as_high_value_sources():
     assert scored["score"] >= 70
 
 
+def test_manual_github_package_url_is_selected_by_default():
+    rows = [
+        {
+            "url": "https://github.com/earendil-works/pi/tree/main/packages/agent",
+            "source_sitemap": "manual",
+        }
+    ]
+
+    scored, counts = score_and_filter_rows(rows, UrlCriteria(threshold=70))
+
+    assert counts["selected"] == 1
+    assert scored[0]["selected"] is True
+    assert scored[0]["url"] == "https://github.com/earendil-works/pi/tree/main/packages/agent"
+
+
 def test_filter_criteria_applies_include_exclude_and_cap():
     rows = [
         {"url": "https://www.smu.edu/admission/apply"},

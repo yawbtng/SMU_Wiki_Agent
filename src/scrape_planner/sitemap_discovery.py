@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
 from typing import Iterable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 
@@ -35,6 +35,17 @@ def normalize_site_url(url: str) -> str:
     scheme = parsed.scheme or "https"
     netloc = parsed.netloc.lower()
     return f"{scheme}://{netloc}"
+
+
+def normalize_seed_url(url: str) -> str:
+    raw = url.strip()
+    if not raw.startswith(("http://", "https://")):
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc.lower()
+    path = parsed.path.rstrip("/") if parsed.path not in ("", "/") else parsed.path
+    return urlunparse((scheme, netloc, path, "", parsed.query, ""))
 
 
 def category_from_path(path: str) -> str:
@@ -110,6 +121,7 @@ def _parse_sitemap_xml(xml_text: str) -> tuple[list[tuple[str, str | None]], lis
 
 def discover_site_urls(site_url: str, timeout: int = 15) -> DiscoveryResult:
     normalized = normalize_site_url(site_url)
+    seed_url = normalize_seed_url(site_url)
     root_host = urlparse(normalized).netloc
     notes: list[str] = []
     sitemap_seeds, robots_error = _extract_sitemap_from_robots(normalized, timeout=timeout)
@@ -156,6 +168,19 @@ def discover_site_urls(site_url: str, timeout: int = 15) -> DiscoveryResult:
         except Exception as exc:
             notes.append(f"Sitemap {sitemap_url} failed: {exc}")
 
+    seed_parsed = urlparse(seed_url)
+    if (seed_parsed.path not in ("", "/") or seed_parsed.query) and _same_domain(seed_url, root_host):
+        discovered_map.setdefault(
+            seed_url,
+            DiscoveredURL(
+                url=seed_url,
+                source_sitemap="seed",
+                path_category=category_from_path(seed_parsed.path),
+                content_type_guess="html",
+                selected=True,
+            ),
+        )
+
     return DiscoveryResult(
         site_url=normalized,
         sitemap_sources=sorted(visited_sitemaps),
@@ -189,4 +214,3 @@ def apply_manual_urls(site_url: str, urls: Iterable[str]) -> list[DiscoveredURL]
     for item in items:
         deduped[item.url] = item
     return sorted(deduped.values(), key=lambda item: item.url)
-

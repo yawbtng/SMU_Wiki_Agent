@@ -118,7 +118,7 @@ class UrlScoringProfile:
     dated_scrape_penalty: int = 20
     pdf_student_boost: int = 12
     pdf_scrape_boost: int = 8
-    manual_student_boost: int = 8
+    manual_student_boost: int = 50
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "UrlScoringProfile":
@@ -137,7 +137,7 @@ class UrlScoringProfile:
             dated_scrape_penalty=int(data.get("dated_scrape_penalty", 20) or 20),
             pdf_student_boost=int(data.get("pdf_student_boost", 12) or 12),
             pdf_scrape_boost=int(data.get("pdf_scrape_boost", 8) or 8),
-            manual_student_boost=int(data.get("manual_student_boost", 8) or 8),
+            manual_student_boost=int(data.get("manual_student_boost", 50) or 50),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -314,7 +314,7 @@ def score_url_row(
     if depth >= 6:
         scrape_value -= 10
         reasons.append("deep path")
-    if row.get("source_sitemap") == "manual":
+    if row.get("source_sitemap") in {"manual", "seed"}:
         student_value += profile.manual_student_boost
         source_quality += 5
         reasons.append("manual add")

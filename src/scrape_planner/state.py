@@ -4,6 +4,7 @@ import json
 import threading
 from collections import defaultdict
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     import redis  # type: ignore
@@ -47,6 +48,9 @@ class RunStateStore:
         self._mem = _MemoryStore()
         self._client: "redis.Redis | None" = None
         try:
+            parsed_url = urlparse(redis_url)
+            if parsed_url.port == 0:
+                raise RuntimeError("redis disabled by port 0")
             if redis is None:
                 raise RuntimeError("redis dependency unavailable")
             client = redis.Redis.from_url(redis_url, decode_responses=True)
