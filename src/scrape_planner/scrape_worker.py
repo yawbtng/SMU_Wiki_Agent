@@ -17,7 +17,7 @@ from .content_extract import extract_content
 from .failure_classifier import classify_failure, to_failure_record
 from .models import DiscoveredURL, PageResult
 from .pdf_ingest import PdfIngestConfig, ingest_pdfs
-from .run_persistence import read_page_states, upsert_page_state, write_run_status
+from .run_persistence import read_page_states, upsert_page_state, write_page_states, write_run_status
 from .state import RunStateStore
 from .storage import ensure_run_dirs, write_json
 
@@ -253,8 +253,7 @@ class ScrapeRunner:
             self.state.set_pages(site_id, run_id, _pages_snapshot_locked())
             self.state.set_status(site_id, run_id, status.copy())
             write_run_status(run_root, status.copy())
-            for page in _pages_snapshot_locked():
-                upsert_page_state(run_root, page)
+            write_page_states(run_root, _pages_snapshot_locked())
 
         existing_pages = {
             str(page.get("url") or ""): page
