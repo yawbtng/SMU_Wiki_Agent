@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 
 import pytest
 
-from src.scrape_planner.pdf_ingest import PdfIngestConfig, PdfParserUnavailableError, ingest_pdfs
+from src.scrape_planner.pdf_ingest import ParsedPdf, PdfIngestConfig, PdfParserUnavailableError, ingest_pdfs
 
 
 def test_empty_input_returns_no_rows(tmp_path: Path) -> None:
@@ -49,7 +51,7 @@ def test_docling_empty_output_is_low_text(tmp_path: Path, monkeypatch: pytest.Mo
     pdf_path = tmp_path / "empty.pdf"
     pdf_path.write_bytes(b"%PDF-1.7\n")
 
-    monkeypatch.setattr("src.scrape_planner.pdf_ingest._parse_pdf_with_docling", lambda _path: "")
+    monkeypatch.setattr("src.scrape_planner.pdf_ingest._parse_pdf_with_docling", lambda _path: ParsedPdf("", 1))
 
     result = ingest_pdfs([pdf_path], PdfIngestConfig(min_meaningful_chars=20, ocr_like_char_threshold=-1))
 
@@ -65,7 +67,7 @@ def test_docling_happy_path_chunks_deterministically(tmp_path: Path, monkeypatch
     pdf_path.write_bytes(b"%PDF-1.7\n")
     markdown = "# Catalog\n\n" + "Admissions requirements and tuition information for students. " * 6
 
-    monkeypatch.setattr("src.scrape_planner.pdf_ingest._parse_pdf_with_docling", lambda _path: markdown)
+    monkeypatch.setattr("src.scrape_planner.pdf_ingest._parse_pdf_with_docling", lambda _path: ParsedPdf(markdown, 1))
 
     cfg = PdfIngestConfig(chunk_size=80, chunk_overlap=20, min_meaningful_chars=10)
     r1 = ingest_pdfs([pdf_path], cfg)
@@ -74,10 +76,39 @@ def test_docling_happy_path_chunks_deterministically(tmp_path: Path, monkeypatch
     assert r1.quarantine == []
     assert r1.sources[0].accepted is True
     assert r1.sources[0].page_count == 1
-    assert all(c.page_number == 1 for c in r1.chunks)
+    assert all(c.page_number == 0 for c in r1.chunks)
     assert all(c.pdf_source_id == r1.sources[0].pdf_source_id for c in r1.chunks)
     assert [c.text for c in r1.chunks] == [c.text for c in r2.chunks]
     assert [c.chunk_id for c in r1.chunks] == [c.chunk_id for c in r2.chunks]
+
+
+def test_docling_page_count_is_preserved_for_document_level_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pdf_path = tmp_path / "multi.pdf"
+    pdf_path.write_bytes(b"%PDF-1.7\n")
+
+    class FakeDocument:
+        pages = {1: object(), 2: object()}
+
+        def export_to_markdown(self) -> str:
+            return "# Catalog\n\n" + "Admissions requirements and tuition information for students. " * 4
+
+    class FakeConverter:
+        def convert(self, _path: str) -> object:
+            return types.SimpleNamespace(document=FakeDocument())
+
+    docling_module = types.ModuleType("docling")
+    converter_module = types.ModuleType("docling.document_converter")
+    converter_module.DocumentConverter = FakeConverter
+    monkeypatch.setitem(sys.modules, "docling", docling_module)
+    monkeypatch.setitem(sys.modules, "docling.document_converter", converter_module)
+
+    result = ingest_pdfs([pdf_path], PdfIngestConfig(min_meaningful_chars=20))
+
+    assert result.quarantine == []
+    assert result.sources[0].page_count == 2
+    assert {chunk.page_number for chunk in result.chunks} == {0}
 
 
 def test_missing_docling_raises_setup_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -102,7 +133,7 @@ def test_pdf_chunks_include_docling_parser_metadata(tmp_path: Path, monkeypatch:
 
     monkeypatch.setattr(
         "src.scrape_planner.pdf_ingest._parse_pdf_with_docling",
-        lambda _path: "# Catalog\n\nAdmissions requirements and tuition information for students.",
+        lambda _path: ParsedPdf("# Catalog\n\nAdmissions requirements and tuition information for students.", None),
     )
 
     result = ingest_pdfs([pdf_path], PdfIngestConfig(min_meaningful_chars=20))

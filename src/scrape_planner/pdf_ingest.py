@@ -24,6 +24,12 @@ class PdfIngestResult:
     quarantine: list[PdfQuarantineRow]
 
 
+@dataclass(frozen=True)
+class ParsedPdf:
+    markdown: str
+    page_count: int | None
+
+
 class PdfParserUnavailableError(RuntimeError):
     """Raised when the only supported PDF parser cannot be imported."""
 
@@ -78,7 +84,8 @@ def ingest_pdfs(paths: list[str | Path], config: PdfIngestConfig | None = None) 
             continue
 
         try:
-            markdown = _parse_pdf_with_docling(path).strip()
+            parsed = _parse_pdf_with_docling(path)
+            markdown = parsed.markdown.strip()
         except PdfParserUnavailableError:
             raise
         except Exception as exc:
@@ -88,29 +95,32 @@ def ingest_pdfs(paths: list[str | Path], config: PdfIngestConfig | None = None) 
             sources.append(PdfSourceRow(source_id, str(path), size, None, False, utc_now_iso()))
             continue
 
+        page_count = parsed.page_count
+        page_count_for_classification = page_count if page_count is not None else 1
+        page_count_detail = str(page_count) if page_count is not None else "unknown"
         total_chars = _meaningful_chars(markdown)
-        reason = _classify_low_text(total_chars, 1, cfg)
+        reason = _classify_low_text(total_chars, page_count_for_classification, cfg)
         if reason is not None:
             quarantine.append(
                 PdfQuarantineRow(
                     source_id,
                     str(path),
                     reason,
-                    f"meaningful_chars={total_chars} pages=1",
+                    f"meaningful_chars={total_chars} pages={page_count_detail}",
                     utc_now_iso(),
                 )
             )
-            sources.append(PdfSourceRow(source_id, str(path), size, 1, False, utc_now_iso()))
+            sources.append(PdfSourceRow(source_id, str(path), size, page_count, False, utc_now_iso()))
             continue
 
-        sources.append(PdfSourceRow(source_id, str(path), size, 1, True, utc_now_iso()))
+        sources.append(PdfSourceRow(source_id, str(path), size, page_count, True, utc_now_iso()))
         for chunk_index, chunk_text in enumerate(_chunk_text(markdown, cfg), start=0):
-            chunk_id = _chunk_id(source_id, 1, chunk_index, chunk_text)
+            chunk_id = _chunk_id(source_id, 0, chunk_index, chunk_text)
             chunks.append(
                 PdfChunkRow(
                     chunk_id=chunk_id,
                     pdf_source_id=source_id,
-                    page_number=1,
+                    page_number=0,
                     chunk_index=chunk_index,
                     text=chunk_text,
                     char_count=len(chunk_text),
@@ -123,7 +133,7 @@ def ingest_pdfs(paths: list[str | Path], config: PdfIngestConfig | None = None) 
     return PdfIngestResult(sources=sources, chunks=chunks, quarantine=quarantine)
 
 
-def _parse_pdf_with_docling(path: Path) -> str:
+def _parse_pdf_with_docling(path: Path) -> ParsedPdf:
     try:
         from docling.document_converter import DocumentConverter
     except ImportError as exc:
@@ -136,7 +146,23 @@ def _parse_pdf_with_docling(path: Path) -> str:
         raise RuntimeError("Docling returned no document")
     if not hasattr(document, "export_to_markdown"):
         raise RuntimeError("Docling document cannot export markdown")
-    return str(document.export_to_markdown() or "")
+    return ParsedPdf(str(document.export_to_markdown() or ""), _docling_page_count(document))
+
+
+def _docling_page_count(document: object) -> int | None:
+    pages = getattr(document, "pages", None)
+    if pages is not None:
+        try:
+            return len(pages)
+        except TypeError:
+            pass
+
+    for attr in ("num_pages", "page_count"):
+        value = getattr(document, attr, None)
+        if value is not None:
+            return int(value)
+
+    return None
 
 
 def _source_id(path: Path) -> str:
