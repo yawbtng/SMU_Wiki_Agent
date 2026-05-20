@@ -68,3 +68,35 @@ def test_load_docs_for_indexing_skips_bad_pdf_chunk_rows(tmp_path: Path) -> None
             "text": "Valid text.",
         }
     ]
+
+
+def test_load_docs_for_indexing_keeps_markdown_and_pdf_docs(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    md_dir = run_root / "wiki"
+    md_dir.mkdir(parents=True)
+    (md_dir / "admissions.md").write_text("Admissions markdown page", encoding="utf-8")
+
+    s05 = run_root / "s05"
+    s05.mkdir(parents=True)
+    (s05 / "pdf_chunks.jsonl").write_text(
+        json.dumps(
+            {
+                "chunk_id": "pdf1-p0002-c0001-def",
+                "pdf_source_id": "pdf1",
+                "page_number": 2,
+                "chunk_index": 1,
+                "text": "Tuition PDF chunk",
+                "char_count": 17,
+                "created_at": "2026-05-20T00:00:00+00:00",
+                "parser": "docling",
+                "source_path": "/tmp/tuition.pdf",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    docs = _load_docs_for_indexing(run_root)
+
+    assert [doc["title"] for doc in docs] == ["admissions", "tuition.pdf page 2"]
+    assert [doc["text"] for doc in docs] == ["Admissions markdown page", "Tuition PDF chunk"]
