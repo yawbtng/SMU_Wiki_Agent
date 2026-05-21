@@ -84,6 +84,22 @@ def test_settings_is_not_rendered_inside_mcp_query_tab() -> None:
     assert 'st.subheader("MCP Query")' not in app_source
 
 
+def test_settings_has_own_top_level_tab() -> None:
+    app_source = Path("app.py").read_text(encoding="utf-8")
+    settings_tab_start = app_source.index("with tabs[6]:")
+    settings_block = app_source[settings_tab_start:]
+
+    assert 'st.subheader("Settings")' in settings_block
+    assert "settings_tabs = st.tabs" in settings_block
+    assert 'settings_tabs = st.tabs(["Keys", "LLM", "Scraping", "Retrieval", "Research"])' in settings_block
+    assert "OPENROUTER_API_KEY" in settings_block
+    assert "TAVILY_API_KEY" in settings_block
+    assert "Save All Settings" in settings_block
+    assert 'type="password"' in settings_block[settings_block.index('"OPENROUTER_API_KEY"') : settings_block.index('key="save_openrouter_key"')]
+    assert 'type="password"' in settings_block[settings_block.index('"TAVILY_API_KEY"') : settings_block.index('key="save_tavily_key"')]
+    assert not any(label in settings_block for label in ["🔑", "🤖", "🕷", "🔎", "🧪"])
+
+
 def test_runs_tab_owns_concrete_run_controls_and_activity() -> None:
     runs_body = _tab_body(2)
     literals = set(_literal_call_args(runs_body))

@@ -2776,7 +2776,7 @@ with tabs[5]:
 
 with tabs[6]:
     st.subheader("Settings")
-    st.caption("Configure only what you need. Advanced knobs are grouped to reduce clutter.")
+    st.caption("Configure local providers, models, scraping, retrieval, and research.")
 
     status_cols = st.columns(4)
     status_cols[0].metric("OpenRouter", "set" if st.session_state.get("openrouter_api_key") else "missing")
@@ -2784,7 +2784,7 @@ with tabs[6]:
     status_cols[2].metric("Concurrency", int(st.session_state.get("scrape_concurrency", 10)))
     status_cols[3].metric("Vector", "on" if st.session_state.get("zvec_enabled", True) else "off")
 
-    settings_tabs = st.tabs(["🔑 Keys", "🤖 LLM", "🕷 Scraping", "🔎 Retrieval", "🧪 Research"])
+    settings_tabs = st.tabs(["Keys", "LLM", "Scraping", "Retrieval", "Research"])
 
     with settings_tabs[0]:
         st.caption("API keys are stored locally in `.env`.")
