@@ -2126,18 +2126,66 @@ with tabs[4]:
 
 with tabs[5]:
     st.subheader("Retrieval")
+    retrieval_quality_summary = None
     site_id = st.session_state.get("site_id", "")
     if site_id:
         layout = site_layout(DATA_ROOT / "sites" / site_id)
         raw_status = _raw_source_status(layout)
         wiki_status = _load_wiki_status(layout, raw_status)
         embedding_status = _load_embedding_status(layout)
+        chunk_rows = _read_jsonl_rows(layout.site_root / "sources" / "pdf_ingest" / "pdf_chunks.jsonl")
+        retrieval_quality_summary = build_chunk_quality_summary(row for row in chunk_rows if isinstance(row, dict))
+        vectors_exist = bool(embedding_status["raw_index_count"] or embedding_status["wiki_index_count"])
         wiki_ready = _wiki_ready(wiki_status)
         if not _raw_sources_ready(raw_status):
             st.warning("Missing prerequisite: normalize raw data sources before embedding and reranking.")
         elif not wiki_ready:
             st.warning("Missing prerequisite: build the LLM Wiki before embedding and reranking.")
 
+        st.markdown("### Chunk quality")
+        quality_state_label = (
+            "Unknown"
+            if retrieval_quality_summary.total == 0
+            else ("Ready" if retrieval_quality_summary.ready_for_retrieval else "Needs review")
+        )
+        render_status_band(
+            title="Retrieval readiness",
+            subtitle=(
+                "Chunk quality is unknown. Next action: open Corpus Content Inspector."
+                if retrieval_quality_summary.total == 0
+                else (
+                    "Chunk samples support retrieval."
+                    if retrieval_quality_summary.ready_for_retrieval
+                    else "Source chunks need review before retrieval answers can be trusted."
+                )
+            ),
+            status_label=quality_state_label,
+            tone="ready" if retrieval_quality_summary.ready_for_retrieval else "warning",
+            action_label="Content Inspector" if not retrieval_quality_summary.ready_for_retrieval else "Query retrieval",
+        )
+        render_metric_strip(
+            [
+                {"label": "Sampled chunks", "value": f"{retrieval_quality_summary.total:,}"},
+                {"label": "Good", "value": f"{retrieval_quality_summary.good_count:,}"},
+                {"label": "Needs review", "value": f"{retrieval_quality_summary.needs_review_count:,}"},
+                {"label": "Poor", "value": f"{retrieval_quality_summary.poor_count:,}"},
+                {
+                    "label": "ready_for_retrieval",
+                    "value": "true" if retrieval_quality_summary.ready_for_retrieval else "false",
+                },
+            ]
+        )
+        if retrieval_quality_summary.total == 0:
+            st.info("Unknown chunk quality. Next action: review Corpus Content Inspector before trusting retrieval.")
+        elif not retrieval_quality_summary.ready_for_retrieval:
+            if vectors_exist:
+                st.warning("Vectors exist, but source chunks need review before retrieval can be trusted.")
+            st.caption(
+                "Top chunk quality flags: "
+                + (", ".join(retrieval_quality_summary.top_flags) if retrieval_quality_summary.top_flags else "none")
+            )
+
+        st.markdown("### Index Health")
         e1, e2, e3, e4, e5 = st.columns(5)
         e1.metric("Raw Index", f"{embedding_status['raw_index_count']:,}")
         e2.metric("Wiki Index", f"{embedding_status['wiki_index_count']:,}")
@@ -2685,7 +2733,7 @@ with tabs[5]:
                             use_container_width=True,
                         )
     st.divider()
-    st.markdown("### MCP Readiness")
+    st.markdown("### MCP readiness")
     site_id = st.session_state.get("site_id", "")
     if not site_id:
         st.info("Create or open a workspace first.")
@@ -2694,11 +2742,16 @@ with tabs[5]:
         raw_status = _raw_source_status(layout)
         wiki_status = _load_wiki_status(layout, raw_status)
         embedding_status = _load_embedding_status(layout)
+        if retrieval_quality_summary is None:
+            chunk_rows = _read_jsonl_rows(layout.site_root / "sources" / "pdf_ingest" / "pdf_chunks.jsonl")
+            retrieval_quality_summary = build_chunk_quality_summary(row for row in chunk_rows if isinstance(row, dict))
         mcp_status = _load_mcp_status(layout)
         if not _raw_sources_ready(raw_status):
             st.warning("Missing prerequisite: normalize raw data sources before MCP query setup.")
         elif not _wiki_ready(wiki_status):
             st.warning("Missing prerequisite: build the LLM Wiki before MCP query setup.")
+        elif not retrieval_quality_summary.ready_for_retrieval:
+            st.warning("Retrieval is blocked until Corpus Content Inspector chunk quality is ready.")
         elif embedding_status["index_health"] != "ready":
             st.warning("Missing prerequisite: build healthy raw/wiki indexes before MCP query setup.")
         elif not mcp_status["server_available"]:
@@ -2709,16 +2762,15 @@ with tabs[5]:
         m1, m2 = st.columns(2)
         m1.metric("Index Health", mcp_status["index_health"])
         m2.metric("Server", "configured" if mcp_status["server_available"] else "pending")
-        if mcp_status["server_command"]:
-            st.caption("Server command")
-            st.code(mcp_status["server_command"], language="bash")
-            st.caption("Codex MCP config snippet")
-            st.json(mcp_status["config_snippet"])
-        else:
-            st.caption("Expected MCP command once implemented")
-            st.code(mcp_status["expected_server_command"], language="bash")
-        if mcp_status.get("latest_report_path"):
-            st.caption(f"Latest MCP report: `{mcp_status['latest_report_path']}`")
+        render_operator_details(
+            "Operator Details",
+            {
+                "Server command": mcp_status.get("server_command") or "",
+                "Expected server command": mcp_status.get("expected_server_command") or "",
+                "Config snippet": mcp_status.get("config_snippet") or {},
+                "Latest MCP report path": str(mcp_status.get("latest_report_path") or ""),
+            },
+        )
 
 with tabs[6]:
     st.subheader("Settings")
