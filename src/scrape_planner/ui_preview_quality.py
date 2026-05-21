@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -60,6 +61,40 @@ def _normalize_section_path(section_path: Sequence[str] | str | None) -> tuple[s
     else:
         parts = [str(part) for part in section_path]
     return tuple(part.strip() for part in parts if part and str(part).strip())
+
+
+def _metadata_context_parts(
+    *,
+    source_title: str = "",
+    source_path: object = "",
+    page_number: object = None,
+    markdown_path: object = "",
+    pdf_source_id: object = "",
+) -> tuple[str, ...]:
+    parts: list[str] = []
+    title = str(source_title or "").strip()
+    if title and title != "Untitled source":
+        parts.append(title)
+
+    if page_number not in (None, ""):
+        parts.append(f"Page {page_number}")
+
+    for value in (source_path, markdown_path):
+        path_value = str(value or "").strip()
+        if path_value:
+            parts.append(Path(path_value).name or path_value)
+
+    pdf_id = str(pdf_source_id or "").strip()
+    if pdf_id:
+        parts.append(pdf_id)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        if part not in seen:
+            deduped.append(part)
+            seen.add(part)
+    return tuple(deduped)
 
 
 def _is_duplicate_like(text: str) -> bool:
@@ -127,16 +162,18 @@ def classify_chunk_sample(
     section_path: Sequence[str] | str | None,
     previous_text: str = "",
     next_text: str = "",
+    metadata_context: Sequence[str] | None = None,
 ) -> ChunkQuality:
     normalized_text = str(text or "").strip()
     sections = _normalize_section_path(section_path)
+    metadata_parts = tuple(str(part).strip() for part in (metadata_context or ()) if str(part).strip())
     char_count = len(normalized_text)
     word_count = len(re.findall(r"[A-Za-z0-9']+", normalized_text))
 
     flags: list[str] = []
     if char_count < 40 or word_count < 6:
         flags.append("too_short")
-    if not sections:
+    if not sections and not metadata_parts:
         flags.append("missing_section_context")
     if _is_boilerplate(normalized_text):
         flags.append("boilerplate")
@@ -157,7 +194,12 @@ def classify_chunk_sample(
     else:
         quality = "good"
 
-    context_label = " > ".join(sections) if sections else str(source_title or "No section context")
+    if sections:
+        context_label = " > ".join(sections)
+    elif metadata_parts:
+        context_label = " > ".join(metadata_parts)
+    else:
+        context_label = str(source_title or "No section context")
     if quality == "good":
         reason = "Chunk has enough body text and source/section context for retrieval preview."
     elif quality == "poor":
@@ -174,15 +216,27 @@ def classify_chunk_sample(
     )
 
 
+def classify_chunk_row(row: Mapping[str, Any]) -> ChunkQuality:
+    source_title = str(row.get("source_title") or row.get("title") or row.get("source_path") or "Untitled source")
+    return classify_chunk_sample(
+        text=str(row.get("text") or row.get("content") or ""),
+        source_title=source_title,
+        section_path=row.get("section_path") or row.get("sections") or row.get("section") or [],
+        previous_text=str(row.get("previous_text") or ""),
+        next_text=str(row.get("next_text") or ""),
+        metadata_context=_metadata_context_parts(
+            source_title=source_title,
+            source_path=row.get("source_path") or row.get("path") or "",
+            page_number=row.get("page_number"),
+            markdown_path=row.get("markdown_path") or "",
+            pdf_source_id=row.get("pdf_source_id") or row.get("source_id") or "",
+        ),
+    )
+
+
 def build_chunk_quality_summary(rows: Iterable[Mapping[str, Any]]) -> ChunkQualitySummary:
     samples = [
-        classify_chunk_sample(
-            text=str(row.get("text") or row.get("content") or ""),
-            source_title=str(row.get("source_title") or row.get("title") or row.get("source_path") or "Untitled source"),
-            section_path=row.get("section_path") or row.get("sections") or row.get("section") or [],
-            previous_text=str(row.get("previous_text") or ""),
-            next_text=str(row.get("next_text") or ""),
-        )
+        classify_chunk_row(row)
         for row in rows
         if isinstance(row, Mapping)
     ]

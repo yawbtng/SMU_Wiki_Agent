@@ -93,7 +93,7 @@ from src.scrape_planner.ui_operator_status import (
 )
 from src.scrape_planner.ui_preview_quality import (
     build_chunk_quality_summary,
-    classify_chunk_sample,
+    classify_chunk_row,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -1825,18 +1825,11 @@ with tabs[3]:
 
         st.markdown("### Content Inspector")
         st.caption("Preview extracted pages and chunks before trusting them for wiki or retrieval.")
-        with st.expander("Embedding chunks", expanded=bool(quarantine_rows)):
+        with st.expander("Embedding chunks", expanded=False):
             if chunk_rows:
                 for idx, row in enumerate([item for item in chunk_rows[:20] if isinstance(item, dict)]):
-                    section_path = _chunk_section_path(row)
                     source_title = _chunk_source_title(row)
-                    quality = classify_chunk_sample(
-                        text=str(row.get("text") or ""),
-                        source_title=source_title,
-                        section_path=section_path,
-                        previous_text=str(row.get("previous_text") or ""),
-                        next_text=str(row.get("next_text") or ""),
-                    )
+                    quality = classify_chunk_row(row)
                     with st.container(border=True):
                         c1, c2, c3 = st.columns([2.5, 1.2, 1.3])
                         c1.markdown(f"**{source_title}**")

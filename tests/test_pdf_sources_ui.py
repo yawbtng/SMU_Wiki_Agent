@@ -90,3 +90,22 @@ def test_corpus_tab_promotes_pdf_extraction_progress() -> None:
     assert "Registry path:" in corpus
     assert "Operator Details" in corpus
     assert "Raw Data Sources" not in corpus
+
+
+def test_corpus_tab_uses_review_oriented_expander_defaults() -> None:
+    corpus = _corpus_tab_source()
+
+    assert 'with st.expander("PDF extraction", expanded=bool(page_rows)):' in corpus
+    assert 'with st.expander("Embedding chunks", expanded=False):' in corpus
+    assert 'with st.expander("PDF review queue", expanded=bool(quarantine_rows)):' in corpus
+
+
+def test_corpus_tab_hides_raw_registry_path_outside_operator_details() -> None:
+    corpus = _corpus_tab_source()
+
+    assert 'st.caption(f"Registry path:' not in corpus
+    assert 'st.caption("Registry path:' not in corpus
+    registry_index = corpus.index('"Registry path:"')
+    operator_details_index = corpus.rfind("render_operator_details(", 0, registry_index)
+    assert operator_details_index != -1
+    assert registry_index - operator_details_index < 250
