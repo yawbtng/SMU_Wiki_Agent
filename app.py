@@ -873,6 +873,14 @@ def _render_scraped_page_preview() -> None:
     meta_cols[3].metric("Text length", preview.text_length if preview.text_length is not None else "n/a")
 
     expected_markdown_path = preview.path or (run_root / "markdown" / f"{slug}.md")
+    metadata_summary_rows = [
+        {"Metric": "HTTP status", "Value": preview.http_status if preview.http_status is not None else "n/a"},
+        {"Metric": "Fetch mode", "Value": preview.fetch_mode or "n/a"},
+        {"Metric": "Text length", "Value": preview.text_length if preview.text_length is not None else "n/a"},
+    ]
+    st.markdown("#### Metadata summary")
+    st.dataframe(pd.DataFrame(metadata_summary_rows), use_container_width=True, hide_index=True)
+
     render_operator_details(
         "Operator Details",
         {
@@ -1611,10 +1619,17 @@ with tabs[2]:
                                 "Status": str(row.get("status") or "success"),
                                 "Source URL": url,
                                 "Scraped timestamp": str(row.get("finished_at") or row.get("started_at") or "unknown"),
-                                "Preview action": href,
+                                "Preview URL": href,
                             }
                         )
-                    st.dataframe(pd.DataFrame(recent_preview_rows), use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        pd.DataFrame(recent_preview_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Preview URL": st.column_config.LinkColumn("Preview", display_text="Preview"),
+                        },
+                    )
                 else:
                     st.info("Successful pages will appear here as soon as markdown is saved.")
 
