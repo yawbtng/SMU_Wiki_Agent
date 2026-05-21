@@ -54,7 +54,7 @@ def test_sources_tab_keeps_pdf_sources_not_url_selection() -> None:
 def test_sources_tab_uses_lightweight_page_preview_controls() -> None:
     source = _corpus_tab_source()
 
-    assert '"PDF extraction details"' in source
+    assert '"PDF extraction"' in source
     assert '"Page-by-page markdown"' in source
     source = _sources_tab_source()
 
@@ -73,3 +73,20 @@ def test_pdf_extract_actions_handle_missing_docling_without_crashing() -> None:
     assert "def _render_pdf_parser_unavailable_error(" in app_source
     assert "PDF extraction is unavailable until Docling is installed." in app_source
     assert 'Install `requirements-pdf.txt` in this environment' in app_source
+
+
+def test_corpus_tab_promotes_pdf_extraction_progress() -> None:
+    source = APP_PATH.read_text(encoding="utf-8")
+    start = source.index("with tabs[3]:")
+    end = source.index("with tabs[4]:", start)
+    corpus = source[start:end]
+
+    assert 'st.subheader("Corpus")' in corpus
+    assert "PDF extraction" in corpus
+    assert "Pages extracted" in corpus
+    assert "Search chunks" in corpus
+    assert "Chunk quality" in corpus
+    assert "Content Inspector" in corpus
+    assert "Registry path:" in corpus
+    assert "Operator Details" in corpus
+    assert "Raw Data Sources" not in corpus

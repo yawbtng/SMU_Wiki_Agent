@@ -91,6 +91,10 @@ from src.scrape_planner.ui_operator_status import (
     build_operator_run_status,
     build_operator_source_status,
 )
+from src.scrape_planner.ui_preview_quality import (
+    build_chunk_quality_summary,
+    classify_chunk_sample,
+)
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT / "data"
@@ -518,6 +522,38 @@ def _load_markdown_preview(markdown_path: str, max_chars: int = 16000) -> str:
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8", errors="replace")[:max_chars]
+
+
+def _chunk_section_path(row: dict) -> list[str]:
+    raw_section = row.get("section_path") or row.get("sections") or row.get("section") or []
+    if isinstance(raw_section, str):
+        return [part.strip() for part in re.split(r"\s*(?:>|/|::)\s*", raw_section) if part.strip()]
+    if isinstance(raw_section, (list, tuple)):
+        return [str(part).strip() for part in raw_section if str(part).strip()]
+    return []
+
+
+def _chunk_source_title(row: dict) -> str:
+    title = str(row.get("source_title") or row.get("title") or "").strip()
+    if title:
+        return title
+    source_path = str(row.get("source_path") or "").strip()
+    if source_path:
+        return Path(source_path).stem or source_path
+    return "Untitled source"
+
+
+def _chunk_source_location(row: dict) -> str:
+    url = str(row.get("url") or row.get("source_url") or row.get("original_url") or "").strip()
+    if url:
+        return url
+    source_path = str(row.get("source_path") or row.get("markdown_path") or "").strip()
+    page_number = row.get("page_number")
+    if page_number not in (None, "") and source_path:
+        return f"Page {page_number} - {source_path}"
+    if page_number not in (None, ""):
+        return f"Page {page_number}"
+    return source_path or "n/a"
 
 
 if hasattr(st, "dialog"):
@@ -1628,28 +1664,67 @@ with tabs[3]:
         st.info("Create or open a workspace first.")
     else:
         layout = site_layout(DATA_ROOT / "sites" / site_id)
-        raw_status = _raw_source_status(layout)
-        counts_by_kind = raw_status["by_kind"]
-        counts_by_status = raw_status["by_status"]
-        counts_by_change = raw_status["by_change"]
+        corpus_ingest_dir = layout.site_root / "sources" / "pdf_ingest"
+        corpus_pages_dir = layout.site_root / "sources" / "pdf_pages"
+        chunk_rows = _read_jsonl_rows(corpus_ingest_dir / "pdf_chunks.jsonl")
+        quarantine_rows = _read_jsonl_rows(corpus_ingest_dir / "pdf_quarantine.jsonl")
+        page_rows = []
+        for pages_index in sorted(corpus_pages_dir.glob("*/pages.json")) if corpus_pages_dir.exists() else []:
+            payload = read_json(pages_index, [])
+            if isinstance(payload, list):
+                page_rows.extend([row for row in payload if isinstance(row, dict)])
 
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Sources", f"{len(raw_status['rows']):,}")
-        k2.metric("Ready", f"{int(counts_by_status.get('ready', 0)):,}")
-        k3.metric("Failed", f"{int(counts_by_status.get('failed', 0)):,}")
-        k4.metric("Changed", f"{int(counts_by_change.get('changed', 0)):,}")
-        k5.metric("Needs Review", f"{int(counts_by_status.get('needs-review', 0)):,}")
-        st.caption(f"Registry path: `{layout.registry_path}`")
+        raw_status = _raw_source_status(layout)
+        counts_by_status = raw_status["by_status"]
 
         latest_report_path = raw_status.get("latest_report_path")
+        render_metric_strip(
+            [
+                {"label": "PDF Pages", "value": f"{len(page_rows):,}"},
+                {"label": "Search Chunks", "value": f"{len(chunk_rows):,}"},
+                {"label": "PDF Review", "value": f"{len(quarantine_rows):,}"},
+                {"label": "Raw Sources", "value": f"{len(raw_status['rows']):,}"},
+                {"label": "Raw Ready", "value": f"{int(counts_by_status.get('ready', 0)):,}"},
+            ]
+        )
+
+        quality_sample_rows = [row for row in chunk_rows[:50] if isinstance(row, dict)]
+        quality_summary = build_chunk_quality_summary(quality_sample_rows)
+        st.markdown("### Chunk quality")
+        render_metric_strip(
+            [
+                {"label": "Sampled chunks", "value": f"{quality_summary.total:,}"},
+                {"label": "Good", "value": f"{quality_summary.good_count:,}"},
+                {"label": "Needs review", "value": f"{quality_summary.needs_review_count:,}"},
+                {"label": "Poor", "value": f"{quality_summary.poor_count:,}"},
+                {
+                    "label": "Ready state",
+                    "value": "Ready for retrieval" if quality_summary.ready_for_retrieval else "Needs review",
+                },
+            ]
+        )
+        if quality_summary.total:
+            st.caption(
+                "Top flags: "
+                + (", ".join(quality_summary.top_flags) if quality_summary.top_flags else "none")
+            )
+        else:
+            st.caption("Unknown chunk quality. Next action: inspect sample chunks after PDF extraction.")
+
+        render_operator_details(
+            "Operator Details",
+            {
+                "Registry path:": str(layout.registry_path),
+                "Latest report path:": str(latest_report_path or ""),
+            },
+        )
         if latest_report_path:
-            st.caption(f"Latest normalization report: `{latest_report_path}`")
             with st.expander("Latest normalization report", expanded=False):
                 st.json(raw_status.get("latest_report") or {})
         else:
             st.warning("Missing prerequisite: raw data sources have not been normalized yet.")
 
-        with st.expander("PDF extraction details", expanded=False):
+        with st.expander("PDF extraction", expanded=bool(page_rows)):
             p1, p2, p3 = st.columns(3)
             p1.metric("Pages extracted", f"{len(page_rows):,}")
             p2.metric("Search chunks", f"{len(chunk_rows):,}")
@@ -1740,20 +1815,6 @@ with tabs[3]:
                             st.warning("No previewable page markdown files were found yet.")
                     else:
                         st.warning("No page markdown files yet. Click Extract / Re-extract PDFs.")
-                with st.expander("Embedding chunks", expanded=False):
-                    if chunk_rows:
-                        preview = [
-                            {
-                                "parser": row.get("parser", ""),
-                                "source_path": row.get("source_path", ""),
-                                "char_count": row.get("char_count", 0),
-                                "text": str(row.get("text") or "")[:500],
-                            }
-                            for row in chunk_rows[:20]
-                        ]
-                        st.dataframe(pd.DataFrame(preview), use_container_width=True, hide_index=True)
-                    else:
-                        st.warning("No chunks extracted yet. Click Extract / Re-extract PDFs.")
                 with st.expander("PDF review queue", expanded=bool(quarantine_rows)):
                     if quarantine_rows:
                         st.dataframe(pd.DataFrame(quarantine_rows), use_container_width=True, hide_index=True)
@@ -1761,6 +1822,47 @@ with tabs[3]:
                         st.success("No PDFs need review.")
             else:
                 st.info("Upload one or more PDFs to extract them for embedding.")
+
+        st.markdown("### Content Inspector")
+        st.caption("Preview extracted pages and chunks before trusting them for wiki or retrieval.")
+        with st.expander("Embedding chunks", expanded=bool(quarantine_rows)):
+            if chunk_rows:
+                for idx, row in enumerate([item for item in chunk_rows[:20] if isinstance(item, dict)]):
+                    section_path = _chunk_section_path(row)
+                    source_title = _chunk_source_title(row)
+                    quality = classify_chunk_sample(
+                        text=str(row.get("text") or ""),
+                        source_title=source_title,
+                        section_path=section_path,
+                        previous_text=str(row.get("previous_text") or ""),
+                        next_text=str(row.get("next_text") or ""),
+                    )
+                    with st.container(border=True):
+                        c1, c2, c3 = st.columns([2.5, 1.2, 1.3])
+                        c1.markdown(f"**{source_title}**")
+                        c2.caption(f"Quality: `{quality.quality}`")
+                        c3.caption(f"Chars: `{quality.char_count:,}`")
+                        st.caption(f"Source: `{_chunk_source_location(row)}`")
+                        st.caption(f"Section path/context: `{quality.context_label}`")
+                        st.caption(
+                            "Flags: `"
+                            + (", ".join(quality.flags) if quality.flags else "none")
+                            + "`"
+                        )
+                        st.caption(f"Reason: {quality.reason}")
+                        text_sample = str(row.get("text") or "").strip()
+                        if text_sample:
+                            st.text_area(
+                                "Chunk text",
+                                value=text_sample[:1200],
+                                height=140,
+                                disabled=True,
+                                key=f"corpus_chunk_text_{idx}",
+                            )
+                        else:
+                            st.warning("This chunk has no text.")
+            else:
+                st.warning("No chunks extracted yet. Click Extract / Re-extract PDFs.")
 
         if raw_status["rows"]:
             rows = raw_status["rows"][:1000]
