@@ -51,6 +51,11 @@ from src.scrape_planner.observability import load_events
 from src.scrape_planner.run_persistence import read_page_states, read_run_events, read_run_status
 from src.scrape_planner.run_analytics import (
     build_completion_timeseries,
+    build_llm_calls_timeseries,
+    build_llm_cost_breakdown,
+    build_llm_latency_table,
+    build_llm_model_counts,
+    build_llm_token_timeseries,
     build_slowest_pages_table,
     summarize_durations,
     summarize_failures,
@@ -1989,8 +1994,8 @@ if st.session_state.get("_show_legacy_cleanup_ui", False):
     else:
         st.info("Complete a scrape run first.")
 
-if st.session_state.get("_show_legacy_review_ui", False):
-    st.subheader("Review")
+with tabs[4]:
+    st.subheader("Metrics")
     if not st.session_state.get("site_id"):
         st.info("Select or create a site first.")
     else:
@@ -2296,6 +2301,10 @@ if st.session_state.get("_show_legacy_review_ui", False):
                 agg3.metric("Models Used (run)", _fmt_compact_number(unique_models))
 
                 if not trace_df.empty:
+                    openrouter_trace = trace_df[
+                        (trace_df["provider"].fillna("").astype(str) == "openrouter")
+                        & (~trace_df.get("is_summary", pd.Series(False, index=trace_df.index)).fillna(False).astype(bool))
+                    ].copy()
                     provider_series = (
                         trace_df["provider"].astype(str)
                         if "provider" in trace_df.columns
@@ -2379,6 +2388,191 @@ if st.session_state.get("_show_legacy_review_ui", False):
                             use_container_width=True,
                         )
 
+                    st.write("")
+                    with st.container(border=True):
+                        st.caption("OpenRouter LLM Metrics")
+                        if openrouter_trace.empty:
+                            st.info("No non-summary OpenRouter calls recorded for this run yet.")
+                        else:
+                            openrouter_trace["ts"] = pd.to_datetime(openrouter_trace.get("ts"), errors="coerce", utc=True)
+                            openrouter_trace = openrouter_trace.dropna(subset=["ts"]).copy()
+                            openrouter_trace["operation"] = openrouter_trace.get("operation", "unknown").fillna("unknown").astype(str)
+                            openrouter_trace["model"] = openrouter_trace.get("model", "unknown").fillna("unknown").astype(str)
+                            openrouter_trace["prompt_tokens"] = pd.to_numeric(openrouter_trace.get("prompt_tokens"), errors="coerce").fillna(0.0)
+                            openrouter_trace["completion_tokens"] = pd.to_numeric(openrouter_trace.get("completion_tokens"), errors="coerce").fillna(0.0)
+                            openrouter_trace["total_tokens"] = pd.to_numeric(openrouter_trace.get("total_tokens"), errors="coerce").fillna(
+                                openrouter_trace["prompt_tokens"] + openrouter_trace["completion_tokens"]
+                            )
+                            openrouter_trace["latency_ms"] = pd.to_numeric(openrouter_trace.get("latency_ms"), errors="coerce")
+                            openrouter_trace["cost_usd"] = pd.to_numeric(openrouter_trace.get("cost_usd"), errors="coerce").fillna(0.0)
+
+                            llm_calls_ts = build_llm_calls_timeseries(trace_df)
+                            llm_tokens_ts = build_llm_token_timeseries(trace_df)
+                            llm_model_counts = build_llm_model_counts(trace_df)
+                            llm_latency = build_llm_latency_table(trace_df)
+                            llm_cost_by_operation = build_llm_cost_breakdown(trace_df, group_by="operation")
+                            llm_cost_by_model = build_llm_cost_breakdown(trace_df, group_by="model")
+                            llm_operation_counts = (
+                                llm_calls_ts.groupby("operation", as_index=False)["calls"].sum().sort_values("calls", ascending=False)
+                                if not llm_calls_ts.empty
+                                else pd.DataFrame(columns=["operation", "calls"])
+                            )
+                            llm_p95_latency = (
+                                float(llm_latency["latency_ms"].quantile(0.95))
+                                if not llm_latency.empty
+                                else 0.0
+                            )
+                            llm_total_cost = float(openrouter_trace["cost_usd"].sum())
+
+                            l1, l2, l3, l4 = st.columns(4)
+                            l1.metric("OpenRouter Calls", _fmt_compact_number(len(openrouter_trace)))
+                            l2.metric("Prompt Tokens", _fmt_compact_number(float(openrouter_trace["prompt_tokens"].sum())))
+                            l3.metric("Completion Tokens", _fmt_compact_number(float(openrouter_trace["completion_tokens"].sum())))
+                            l4.metric("P95 Latency", f"{llm_p95_latency:.1f} ms")
+                            l5, l6 = st.columns(2)
+                            l5.metric("Estimated Cost", f"${llm_total_cost:.4f}")
+                            l6.metric("Models", _fmt_compact_number(openrouter_trace["model"].nunique()))
+
+                            st.caption("Trend, mix, and spend for OpenRouter calls captured in this run.")
+                            gt1, gt2 = st.columns(2)
+                            if llm_calls_ts.empty:
+                                gt1.info("No call timeline data yet.")
+                            else:
+                                gt1.altair_chart(
+                                    alt.Chart(llm_calls_ts)
+                                    .mark_line(point=alt.OverlayMarkDef(size=18, filled=True))
+                                    .encode(
+                                        x=alt.X("bucket:T", title="Time"),
+                                        y=alt.Y("calls:Q", title="Calls"),
+                                        color=alt.Color("operation:N", title="Operation"),
+                                        tooltip=["bucket:T", "operation", "calls"],
+                                    )
+                                    .properties(height=280),
+                                    use_container_width=True,
+                                )
+                            if llm_operation_counts.empty:
+                                gt2.info("No operation breakdown yet.")
+                            else:
+                                gt2.altair_chart(
+                                    alt.Chart(llm_operation_counts)
+                                    .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+                                    .encode(
+                                        x=alt.X("calls:Q", title="Calls"),
+                                        y=alt.Y("operation:N", title="Operation", sort="-x"),
+                                        tooltip=["operation", "calls"],
+                                    )
+                                    .properties(height=280),
+                                    use_container_width=True,
+                                )
+
+                            gt3, gt4 = st.columns(2)
+                            if llm_model_counts.empty:
+                                gt3.info("No model mix data yet.")
+                            else:
+                                gt3.altair_chart(
+                                    alt.Chart(llm_model_counts)
+                                    .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+                                    .encode(
+                                        x=alt.X("calls:Q", title="Calls"),
+                                        y=alt.Y("model:N", title="Model", sort="-x"),
+                                        tooltip=["model", "calls"],
+                                    )
+                                    .properties(height=300),
+                                    use_container_width=True,
+                                )
+                            if llm_tokens_ts.empty:
+                                gt4.info("No token timeline data yet.")
+                            else:
+                                token_long = llm_tokens_ts.melt(
+                                    id_vars=["bucket"],
+                                    value_vars=["prompt_tokens", "completion_tokens"],
+                                    var_name="token_type",
+                                    value_name="tokens",
+                                )
+                                gt4.altair_chart(
+                                    alt.Chart(token_long)
+                                    .mark_area(opacity=0.7)
+                                    .encode(
+                                        x=alt.X("bucket:T", title="Time"),
+                                        y=alt.Y("tokens:Q", title="Tokens"),
+                                        color=alt.Color("token_type:N", title="Token Type"),
+                                        tooltip=["bucket:T", "token_type", "tokens"],
+                                    )
+                                    .properties(height=300),
+                                    use_container_width=True,
+                                )
+
+                            gt5, gt6 = st.columns(2)
+                            if openrouter_trace["total_tokens"].dropna().empty:
+                                gt5.info("No per-call token distribution yet.")
+                            else:
+                                gt5.altair_chart(
+                                    alt.Chart(openrouter_trace)
+                                    .mark_bar()
+                                    .encode(
+                                        x=alt.X("total_tokens:Q", bin=alt.Bin(maxbins=20), title="Total Tokens / Call"),
+                                        y=alt.Y("count():Q", title="Calls"),
+                                        tooltip=[alt.Tooltip("count():Q", title="Calls")],
+                                    )
+                                    .properties(height=280),
+                                    use_container_width=True,
+                                )
+                            latency_ts = openrouter_trace.dropna(subset=["latency_ms"]).sort_values("ts")
+                            if latency_ts.empty:
+                                gt6.info("No latency timeline yet.")
+                            else:
+                                gt6.altair_chart(
+                                    alt.Chart(latency_ts)
+                                    .mark_line(point=alt.OverlayMarkDef(size=18, filled=True, opacity=0.6))
+                                    .encode(
+                                        x=alt.X("ts:T", title="Time"),
+                                        y=alt.Y("latency_ms:Q", title="Latency (ms)"),
+                                        color=alt.Color("operation:N", title="Operation"),
+                                        tooltip=["ts:T", "operation", "model", "latency_ms", "status"],
+                                    )
+                                    .properties(height=280),
+                                    use_container_width=True,
+                                )
+
+                            gt7, gt8 = st.columns(2)
+                            if llm_latency.empty:
+                                gt7.info("No latency distribution yet.")
+                            else:
+                                gt7.altair_chart(
+                                    alt.Chart(llm_latency)
+                                    .mark_boxplot(extent="min-max")
+                                    .encode(
+                                        x=alt.X("operation:N", title="Operation"),
+                                        y=alt.Y("latency_ms:Q", title="Latency (ms)"),
+                                        color=alt.Color("operation:N", legend=None),
+                                        tooltip=["operation", "model", "latency_ms"],
+                                    )
+                                    .properties(height=300),
+                                    use_container_width=True,
+                                )
+                            cost_long = pd.concat(
+                                [
+                                    llm_cost_by_operation.rename(columns={"operation": "label"}).assign(dimension="operation"),
+                                    llm_cost_by_model.rename(columns={"model": "label"}).assign(dimension="model"),
+                                ],
+                                ignore_index=True,
+                            )
+                            if cost_long.empty:
+                                gt8.info("No non-zero OpenRouter cost data yet.")
+                            else:
+                                gt8.altair_chart(
+                                    alt.Chart(cost_long)
+                                    .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+                                    .encode(
+                                        x=alt.X("cost_usd:Q", title="Estimated Cost (USD)"),
+                                        y=alt.Y("label:N", title="Operation / Model", sort="-x"),
+                                        color=alt.Color("dimension:N", title="Breakdown"),
+                                        tooltip=["dimension", "label", "cost_usd"],
+                                    )
+                                    .properties(height=300),
+                                    use_container_width=True,
+                                )
+
                     latency_ts = trace_df.copy()
                     latency_ts["latency_ms"] = latency_series
                     if "ts" not in latency_ts.columns:
@@ -2440,7 +2634,7 @@ if st.session_state.get("_show_legacy_review_ui", False):
                 else:
                     st.info("No trace events for this run yet.")
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("Knowledge Graph")
     if not st.session_state.get("site_id"):
         st.info("Select or create a site first.")
@@ -2627,7 +2821,7 @@ with tabs[4]:
                         components.html(graph_html.read_text(encoding="utf-8", errors="replace"), height=650, scrolling=True)
                     else:
                         st.info("HTML graph view will appear after build.")
-with tabs[5]:
+with tabs[6]:
     st.subheader("Settings")
     st.caption("One place for keys, providers, models, embeddings, and vector search.")
 
