@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .pdf_contracts import PdfChunkRow, PdfQuarantineRow, PdfSourceRow, utc_now_iso
@@ -15,6 +16,7 @@ class PdfIngestConfig:
     ocr_like_char_threshold: int = 8
     chunk_size: int = 1200
     chunk_overlap: int = 200
+    page_markdown_dir: Path | None = None
 
 
 @dataclass
@@ -28,6 +30,8 @@ class PdfIngestResult:
 class ParsedPdf:
     markdown: str
     page_count: int | None
+    parser: str = "docling"
+    pages: list[tuple[int, str]] = field(default_factory=list)
 
 
 class PdfParserUnavailableError(RuntimeError):
@@ -114,6 +118,7 @@ def ingest_pdfs(paths: list[str | Path], config: PdfIngestConfig | None = None) 
             continue
 
         sources.append(PdfSourceRow(source_id, str(path), size, page_count, True, utc_now_iso()))
+        _write_page_markdown_files(source_id, path, parsed, cfg)
         for chunk_index, chunk_text in enumerate(_chunk_text(markdown, cfg), start=0):
             chunk_id = _chunk_id(source_id, 0, chunk_index, chunk_text)
             chunks.append(
@@ -125,7 +130,7 @@ def ingest_pdfs(paths: list[str | Path], config: PdfIngestConfig | None = None) 
                     text=chunk_text,
                     char_count=len(chunk_text),
                     created_at=utc_now_iso(),
-                    parser="docling",
+                    parser=parsed.parser,
                     source_path=str(path),
                 )
             )
@@ -146,7 +151,8 @@ def _parse_pdf_with_docling(path: Path) -> ParsedPdf:
         raise RuntimeError("Docling returned no document")
     if not hasattr(document, "export_to_markdown"):
         raise RuntimeError("Docling document cannot export markdown")
-    return ParsedPdf(str(document.export_to_markdown() or ""), _docling_page_count(document))
+    markdown = str(document.export_to_markdown() or "")
+    return ParsedPdf(markdown, _docling_page_count(document), "docling", [(0, markdown)] if markdown.strip() else [])
 
 
 def _docling_page_count(document: object) -> int | None:
@@ -163,6 +169,36 @@ def _docling_page_count(document: object) -> int | None:
             return int(value)
 
     return None
+
+
+def _write_page_markdown_files(source_id: str, path: Path, parsed: ParsedPdf, cfg: PdfIngestConfig) -> None:
+    if cfg.page_markdown_dir is None:
+        return
+    source_dir = cfg.page_markdown_dir / source_id
+    source_dir.mkdir(parents=True, exist_ok=True)
+    index_rows = []
+    pages = parsed.pages or [(0, parsed.markdown)]
+    for page_number, markdown in pages:
+        if not str(markdown or "").strip():
+            continue
+        if page_number > 0:
+            filename = f"page-{page_number:04d}.md"
+        else:
+            filename = "document.md"
+        page_path = source_dir / filename
+        page_path.write_text(str(markdown).strip() + "\n", encoding="utf-8")
+        index_rows.append(
+            {
+                "pdf_source_id": source_id,
+                "source_path": str(path),
+                "page_number": page_number,
+                "parser": parsed.parser,
+                "markdown_path": str(page_path),
+                "char_count": len(str(markdown)),
+            }
+        )
+    if index_rows:
+        (source_dir / "pages.json").write_text(json.dumps(index_rows, indent=2), encoding="utf-8")
 
 
 def _source_id(path: Path) -> str:

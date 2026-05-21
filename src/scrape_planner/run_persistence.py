@@ -81,6 +81,23 @@ def upsert_page_state(run_root: Path, page: dict[str, Any]) -> None:
     _append_jsonl(run_root / "pages.jsonl", page)
 
 
+def write_page_states(run_root: Path, pages: list[dict[str, Any]]) -> None:
+    """Overwrite page state JSONL with one compact row per URL.
+
+    The scrape runner updates a full in-memory snapshot frequently. Appending
+    that entire snapshot on every update makes pages.jsonl grow into tens of GB.
+    This writer keeps the durable file bounded to the current page count.
+    """
+    path = run_root / "pages.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with _LOCK:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            for page in pages:
+                handle.write(json.dumps(page, ensure_ascii=True) + "\n")
+        tmp_path.replace(path)
+
+
 def read_page_states(run_root: Path) -> list[dict[str, Any]]:
     rows = _read_jsonl(run_root / "pages.jsonl")
     pages_by_url: dict[str, dict[str, Any]] = {}

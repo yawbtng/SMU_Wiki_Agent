@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 WORKFLOW_TABS = [
-    "Setup",
-    "Discover",
-    "Choose URLs",
-    "Scrape",
-    "Graph",
+    "Overview",
+    "Sources",
+    "Runs",
+    "Corpus",
+    "Wiki",
+    "Retrieval",
     "Settings",
 ]

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse, urlunparse
 
+from .graph_profile import infer_graph_profile, maybe_label_profile_with_openrouter
 from .storage import read_json, write_json
 
 
@@ -353,8 +354,8 @@ def build_page_nodes(run_root: Path, site_id: str, run_id: str) -> list[dict[str
     return nodes
 
 
-def build_unit_nodes(site_id: str, run_id: str) -> list[dict[str, Any]]:
-    return [
+def build_unit_nodes(site_id: str, run_id: str, profile: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    nodes = [
         {
             "id": unit_id(rule["id"]),
             "type": "unit",
@@ -363,9 +364,23 @@ def build_unit_nodes(site_id: str, run_id: str) -> list[dict[str, Any]]:
             "unit_key": rule["id"],
             "label": rule["label"],
             "patterns": rule["patterns"],
+            "source": "built_in_rule",
         }
         for rule in UNIT_RULES
     ]
+    seen = {str(node["id"]) for node in nodes}
+    for unit in (profile or {}).get("units", []):
+        if not isinstance(unit, dict):
+            continue
+        node = unit.copy()
+        node["site_id"] = site_id
+        node["run_id"] = run_id
+        node.setdefault("type", "unit")
+        node.setdefault("unit_key", str(node.get("id") or "").removeprefix("unit:"))
+        if node.get("id") and str(node["id"]) not in seen:
+            nodes.append(node)
+            seen.add(str(node["id"]))
+    return nodes
 
 
 def _reason_if_match(pattern: str, url_path: str, title: str, headings: str, body_sample: str) -> str:
@@ -376,7 +391,7 @@ def _reason_if_match(pattern: str, url_path: str, title: str, headings: str, bod
     return ""
 
 
-def tag_page_units(page: dict[str, Any], markdown: str) -> list[dict[str, Any]]:
+def tag_page_units(page: dict[str, Any], markdown: str, unit_nodes: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     parsed = urlparse(str(page.get("source_url") or ""))
     url_path = parsed.path.lower() or "/"
     title = str(page.get("title") or "")
@@ -401,6 +416,9 @@ def tag_page_units(page: dict[str, Any], markdown: str) -> list[dict[str, Any]]:
                     "reasons": reasons[:5],
                 }
             )
+    dynamic_match = _best_dynamic_unit_for_page(page, unit_nodes or [])
+    if dynamic_match:
+        tags.append(dynamic_match)
     if not tags and parsed.netloc:
         tags.append(
             {
@@ -411,7 +429,45 @@ def tag_page_units(page: dict[str, Any], markdown: str) -> list[dict[str, Any]]:
                 "reasons": ["fallback: no unit-specific rule matched"],
             }
         )
-    return tags
+    return _dedupe_tags(tags)
+
+
+def _dedupe_tags(tags: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str]] = set()
+    out: list[dict[str, Any]] = []
+    for tag in tags:
+        key = (str(tag.get("page_id") or ""), str(tag.get("unit_id") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tag)
+    return out
+
+
+def _best_dynamic_unit_for_page(page: dict[str, Any], unit_nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    parts = [s.lower() for s in urlparse(str(page.get("source_url") or "")).path.split("/") if s]
+    if not parts:
+        return None
+    best: dict[str, Any] | None = None
+    best_len = 0
+    for unit in unit_nodes:
+        if unit.get("source") != "dynamic_url_profile":
+            continue
+        prefix = [str(s).lower() for s in unit.get("path_prefix") or []]
+        if not prefix or len(prefix) <= best_len:
+            continue
+        if parts[: len(prefix)] == prefix:
+            best = unit
+            best_len = len(prefix)
+    if not best:
+        return None
+    return {
+        "page_id": page["id"],
+        "unit_id": best["id"],
+        "unit_key": str(best.get("unit_key") or str(best["id"]).removeprefix("unit:")),
+        "unit_label": str(best.get("label") or best.get("unit_key") or "Unit"),
+        "reasons": [f"dynamic URL profile matched /{'/'.join(best.get('path_prefix') or [])}/"],
+    }
 
 
 def _extract_markdown_links(markdown: str, base_url: str) -> list[str]:
@@ -429,7 +485,7 @@ def _extract_markdown_links(markdown: str, base_url: str) -> list[str]:
     return sorted({link for link in links if link})
 
 
-def build_edges(page_nodes: list[dict[str, Any]], unit_nodes: list[dict[str, Any]], tags: list[dict[str, Any]], markdown_by_page: dict[str, str]) -> list[dict[str, Any]]:
+def build_edges(page_nodes: list[dict[str, Any]], unit_nodes: list[dict[str, Any]], tags: list[dict[str, Any]], markdown_by_page: dict[str, str], profile: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     edges: list[dict[str, Any]] = []
     site_id = str(page_nodes[0].get("site_id") if page_nodes else "")
     site_node = f"site:{site_id}" if site_id else "site:unknown"
@@ -446,8 +502,18 @@ def build_edges(page_nodes: list[dict[str, Any]], unit_nodes: list[dict[str, Any
         payload.update(attrs)
         edges.append(payload)
 
+    child_targets = {str(edge.get("target") or "") for edge in (profile or {}).get("edges", []) if isinstance(edge, dict) and edge.get("type") == "unit_has_child"}
     for unit in unit_nodes:
-        add(site_node, unit["id"], "site_has_unit")
+        if unit["id"] not in child_targets:
+            add(site_node, unit["id"], "site_has_unit")
+    for edge in (profile or {}).get("edges", []):
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("source") or "")
+        target = str(edge.get("target") or "")
+        edge_type = str(edge.get("type") or "unit_has_child")
+        if source and target:
+            add(source, target, edge_type, reason=edge.get("reason", "dynamic URL hierarchy"))
 
     tags_by_unit: dict[str, list[str]] = defaultdict(list)
     for tag in tags:
@@ -490,12 +556,13 @@ def build_graph(run_root: Path, site_id: str, run_id: str) -> dict[str, Any]:
     out_dir = knowledge_graph_dir(run_root)
     started_at = utc_now_iso()
     page_nodes = build_page_nodes(run_root, site_id, run_id)
-    unit_nodes = build_unit_nodes(site_id, run_id)
+    profile = maybe_label_profile_with_openrouter(infer_graph_profile(page_nodes, site_id=site_id, run_id=run_id))
+    unit_nodes = build_unit_nodes(site_id, run_id, profile)
     markdown_by_page = {page["id"]: _read_text(Path(page["path"])) for page in page_nodes}
     tags = []
     for page in page_nodes:
-        tags.extend(tag_page_units(page, markdown_by_page[page["id"]]))
-    edges = build_edges(page_nodes, unit_nodes, tags, markdown_by_page)
+        tags.extend(tag_page_units(page, markdown_by_page[page["id"]], unit_nodes))
+    edges = build_edges(page_nodes, unit_nodes, tags, markdown_by_page, profile)
     graph = {
         "schema_version": 1,
         "site_id": site_id,
@@ -508,6 +575,7 @@ def build_graph(run_root: Path, site_id: str, run_id: str) -> dict[str, Any]:
             "unit_nodes": len(unit_nodes),
             "edges": len(edges),
             "tags": len(tags),
+            "dynamic_profile_units": len(profile.get("units", [])),
         },
         "nodes": [{"id": f"site:{site_id}", "type": "site", "site_id": site_id, "run_id": run_id}] + unit_nodes + page_nodes,
         "edges": edges,
@@ -516,6 +584,7 @@ def build_graph(run_root: Path, site_id: str, run_id: str) -> dict[str, Any]:
     write_json(out_dir / "graph.json", graph)
     write_jsonl(out_dir / "page_nodes.jsonl", page_nodes)
     write_json(out_dir / "unit_nodes.json", unit_nodes)
+    write_json(out_dir / "graph_profile.json", profile)
     write_jsonl(out_dir / "edges.jsonl", edges)
     write_jsonl(out_dir / "tags.jsonl", tags)
     (out_dir / "graph_report.md").write_text(report, encoding="utf-8")

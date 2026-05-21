@@ -1,3 +1,0 @@
-# Handoff
-
-Maintenance run succeeded.

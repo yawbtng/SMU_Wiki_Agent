@@ -1,3 +1,0 @@
-# Page
-
-Maintained page artifact.

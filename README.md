@@ -1,21 +1,20 @@
-# Ultra Fast RAG Scrape Planner
+# Ultra Fast RAG
 
-Local Streamlit app for this workflow:
+Local Streamlit app for building a content-first university knowledge base:
 
-1. Discover all URLs from sitemap(s)
-2. Use OpenRouter `deepseek/deepseek-v4-flash` to select top student-useful and freshest URLs (prefer 2026/current-year)
-3. Scrape selected URLs with Scrapling (fallback modes for harder pages)
-4. Clean pages sequentially with local Ollama model (one URL at a time)
-5. Edit cleaned markdown in-app
-6. Retry failed URLs with Tavily Extract
-7. Generate and run Claude wiki build orchestration
+1. Create or open a workspace for a university site.
+2. Add website URLs and PDF sources.
+3. Scrape selected website URLs into raw markdown artifacts.
+4. Normalize web/PDF/tabular artifacts into `raw_sources/`.
+5. Build the local LLM Wiki from the normalized source registry.
+6. Build/query supporting graph, embedding, rerank, and MCP surfaces.
 
 ## Quickstart
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-pdf.txt
 streamlit run app.py
 ```
 
@@ -31,80 +30,47 @@ Ollama from host is wired by default as `http://host.docker.internal:11434`.
 Optional:
 
 - Redis: set `REDIS_URL` (default `redis://localhost:6379/0`)
-- OpenRouter: set `OPENROUTER_API_KEY` for URL-selection stage
-- Claude CLI: install/login `claude` to enable LLM selection and wiki build
-- Ollama: run local server at `http://localhost:11434` for cleanup
-- PDF/document wiki ingest: use Python 3.10+ and install `pip install -r requirements-pdf.txt` to install Docling for converting PDFs/documents before graph wiki indexing.
+- OpenRouter: set `OPENROUTER_API_KEY` for URL reasoning, graph labeling, and Q&A
+- Tavily: set `TAVILY_API_KEY` for optional research flows
+- Data root: set `ULTRA_FAST_RAG_DATA_ROOT` if you want artifacts somewhere other than `data/`
+- PDF ingest: `requirements-pdf.txt` installs Docling, the only supported PDF parser
 
-## Data layout
+## Data Layout
 
-Run artifacts are written under:
+Runtime artifacts are written under:
 
-`data/sites/<site_slug>/<run_id>/`
+`data/sites/<site_slug>/`
 
-Key files:
+Key workspace and run files:
 
 - `discovered_urls.json`
-- `selected_urls.json`
-- `selected_urls_llm.json`
-- `scrape_manifest.json`
-- `failures.json`
-- `raw_html/*.html`
-- `markdown/*.md`
-- `metadata/*.json`
-- `claude_wiki_manifest.json`
-- `claude_wiki_prompt.md`
+- `<run_id>/selected_urls.json`
+- `<run_id>/scrape_manifest.json`
+- `<run_id>/pages.jsonl`
+- `<run_id>/raw_html/*.html`
+- `<run_id>/markdown/*.md`
+- `<run_id>/metadata/*.json`
 - `sources/pdf_uploads/*`
-- `document_ingest/converted_markdown/*.md`
-- `document_ingest/manifest.json`
-- `document_ingest/report.md`
-- `wiki/index.md`
-- `wiki/graph.json`
-- `wiki/subwikis/<topic>/index.md`
+- `sources/pdf_pages/<pdf_source_id>/*.md`
+- `sources/pdf_ingest/pdf_sources.jsonl`
+- `sources/pdf_ingest/pdf_chunks.jsonl`
+- `sources/pdf_ingest/pdf_quarantine.jsonl`
+- `raw_sources/registry.jsonl`
+- `wiki/pages/*.md`
+- `wiki/reports/*.json`
+- `indexes/*`
 
-## Local Zvec Query MCP
+`data/` is ignored because it is runtime state and can become very large.
 
-Optional local semantic query path after scrape + clean + wiki build:
+## MCP
 
-1. Install optional dependencies:
-   `pip install -r requirements-mcp.txt`
-2. Ensure Ollama has the embedding model:
-   `ollama pull nomic-embed-text:latest`
-3. Build a Zvec index from a run directory:
-   `python scripts/zvec_index_run.py data/sites/<site_id>/<run_id> --model nomic-embed-text:latest`
-4. Connect an agent to the MCP server:
-   `ZVEC_DB_PATH=/absolute/path/to/run/zvec_index OLLAMA_EMBED_MODEL=nomic-embed-text:latest python mcp_servers/smu_zvec_mcp.py`
+The repo currently has two MCP surfaces:
 
-The MCP exposes `query_smu_wiki` and `zvec_index_info` for Claude, Codex, or any MCP client.
+- `mcp_servers/llm_wiki_mcp.py` for the LLM Wiki index/query path.
+- `mcp_servers/markdown_graph_mcp.py` for the supporting markdown graph path.
 
-## M001 readiness proof
-
-Run the single proof command to validate M001 cross-slice contracts (S03 stale packet, S04 maintenance artifacts, S05 PDF contracts):
+Install the minimal MCP server dependency with:
 
 ```bash
-python3 scripts/m001_proof.py --config configs/m001_v1.json --run-root tests/fixtures/m001_proof/pass/run_root --output-dir tests/fixtures/m001_proof/tmp_output
+pip install -r requirements-markdown-graph-mcp.txt
 ```
-
-Required inputs:
-- `--config`: V1 contract file (example: `configs/m001_v1.json`)
-- `--run-root`: run artifact root containing `s03/`, `s04/`, `s05/`
-- `--output-dir`: destination for deterministic proof outputs
-
-Output artifacts:
-- `<output-dir>/proof_result.json` — machine-readable per-check results with `check_id`, `status`, `reason`, and timestamps
-- `<output-dir>/proof_report.md` — operator-readable markdown summary
-
-Exit code semantics:
-- `0`: overall pass (all checks pass)
-- `1`: overall fail (one or more checks fail; inspect `proof_result.json` for failing `check_id` and `reason`)
-
-## Raw markdown retrieval proof
-
-For fixture-level proof of index-first bounded retrieval behavior:
-
-```bash
-PYTHONPATH=src python3 scripts/raw_retrieval_proof.py
-PYTHONPATH=src python3 scripts/raw_retrieval_proof.py --help
-```
-
-The proof script builds lexical index artifacts under `tests/fixtures/raw_retrieval/index` and runs a bounded query path that must return `status: "ok"` from index artifacts.

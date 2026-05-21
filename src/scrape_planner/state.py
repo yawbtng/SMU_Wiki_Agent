@@ -4,6 +4,7 @@ import json
 import threading
 from collections import defaultdict
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     import redis  # type: ignore
@@ -47,6 +48,9 @@ class RunStateStore:
         self._mem = _MemoryStore()
         self._client: "redis.Redis | None" = None
         try:
+            parsed_url = urlparse(redis_url)
+            if parsed_url.port == 0:
+                raise RuntimeError("redis disabled by port 0")
             if redis is None:
                 raise RuntimeError("redis dependency unavailable")
             client = redis.Redis.from_url(redis_url, decode_responses=True)
@@ -122,36 +126,3 @@ class RunStateStore:
         self._delete(f"site:{site_id}:run:{run_id}:pages")
         self._delete(f"site:{site_id}:run:{run_id}:cancel")
         self._delete(f"site:{site_id}:run:{run_id}:pause")
-
-    def set_cleanup_status(self, site_id: str, run_id: str, payload: dict[str, Any]) -> None:
-        self._set(f"site:{site_id}:run:{run_id}:cleanup:status", json.dumps(payload))
-
-    def get_cleanup_status(self, site_id: str, run_id: str) -> dict[str, Any]:
-        raw = self._get(f"site:{site_id}:run:{run_id}:cleanup:status")
-        return json.loads(raw) if raw else {}
-
-    def set_cleanup_items(self, site_id: str, run_id: str, payload: list[dict[str, Any]]) -> None:
-        self._set(f"site:{site_id}:run:{run_id}:cleanup:items", json.dumps(payload))
-
-    def get_cleanup_items(self, site_id: str, run_id: str) -> list[dict[str, Any]]:
-        raw = self._get(f"site:{site_id}:run:{run_id}:cleanup:items")
-        return json.loads(raw) if raw else []
-
-    def push_cleanup_event(self, site_id: str, run_id: str, payload: dict[str, Any]) -> None:
-        self._rpush(f"site:{site_id}:run:{run_id}:cleanup:events", json.dumps(payload))
-
-    def get_cleanup_events(self, site_id: str, run_id: str, max_items: int = 200) -> list[dict[str, Any]]:
-        raw_events = self._lrange(f"site:{site_id}:run:{run_id}:cleanup:events", -max_items, -1)
-        return [json.loads(item) for item in raw_events]
-
-    def set_cleanup_cancel(self, site_id: str, run_id: str, value: bool) -> None:
-        self._set(f"site:{site_id}:run:{run_id}:cleanup:cancel", "1" if value else "0")
-
-    def get_cleanup_cancel(self, site_id: str, run_id: str) -> bool:
-        return self._get(f"site:{site_id}:run:{run_id}:cleanup:cancel") == "1"
-
-    def clear_cleanup_run(self, site_id: str, run_id: str) -> None:
-        self._delete(f"site:{site_id}:run:{run_id}:cleanup:status")
-        self._delete(f"site:{site_id}:run:{run_id}:cleanup:items")
-        self._delete(f"site:{site_id}:run:{run_id}:cleanup:events")
-        self._delete(f"site:{site_id}:run:{run_id}:cleanup:cancel")

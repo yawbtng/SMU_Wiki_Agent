@@ -1,6 +1,0 @@
-tests/test_failure_classifier.py
-tests/test_observability.py
-tests/test_scrape_worker.py
-tests/test_sitemap_discovery.py
-tests/test_url_quality.py
-tests/test_url_scoring.py
