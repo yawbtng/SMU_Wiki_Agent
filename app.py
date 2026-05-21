@@ -6,9 +6,8 @@ import re
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
-from html import escape
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import urlparse
 
 import altair as alt
 import pandas as pd
@@ -823,30 +822,81 @@ def _render_scraped_page_preview() -> None:
     run_id = str(st.query_params.get("run_id", "") or "").strip()
     slug = str(st.query_params.get("page_slug", "") or "").strip()
 
-    st.title("Scraped Page Preview")
+    st.subheader("Scraped page preview")
+    st.link_button("Back to Runs", "./")
     if not site_id or not run_id or not slug:
         st.error("Preview link is missing site, run, or page information.")
+        render_operator_details(
+            "Operator Details",
+            {
+                "Expected query params": "view=scraped_page, site_id, run_id, page_slug",
+                "site_id": site_id or "missing",
+                "run_id": run_id or "missing",
+                "page_slug": slug or "missing",
+            },
+            expanded=True,
+        )
         st.stop()
     if not is_safe_route_part(site_id) or not is_safe_route_part(run_id):
         st.error("Preview link contains invalid site or run information.")
+        render_operator_details(
+            "Operator Details",
+            {
+                "Expected query params": "safe site_id and run_id route parts",
+                "site_id": site_id,
+                "run_id": run_id,
+                "page_slug": slug,
+            },
+            expanded=True,
+        )
         st.stop()
 
     run_root = _run_root(site_id, run_id)
     preview = resolve_scraped_markdown_preview(run_root, slug)
-    if preview.url:
-        st.caption(f"Source: {preview.url}")
-    st.caption(f"Run: `{run_id}`")
+    first_heading = ""
+    for line in preview.markdown.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            first_heading = stripped.lstrip("#").strip()
+            break
+    preview_title = first_heading or Path(preview.url or slug).name or "Untitled scraped page"
 
-    meta_cols = st.columns(3)
-    meta_cols[0].metric("HTTP", preview.http_status if preview.http_status is not None else "n/a")
-    meta_cols[1].metric("Fetch Mode", preview.fetch_mode or "n/a")
-    meta_cols[2].metric("Text Length", preview.text_length if preview.text_length is not None else "n/a")
+    st.markdown(f"### {preview_title}")
+    st.caption(f"Source URL: `{preview.url or 'Not recorded'}`")
+    st.caption(f"Run id: `{run_id}`")
+    st.caption(f"Page slug: `{slug}`")
+
+    meta_cols = st.columns(4)
+    meta_cols[0].metric("Scrape status", "Ready" if preview.ready else "Missing")
+    meta_cols[1].metric("HTTP status", preview.http_status if preview.http_status is not None else "n/a")
+    meta_cols[2].metric("Fetch mode", preview.fetch_mode or "n/a")
+    meta_cols[3].metric("Text length", preview.text_length if preview.text_length is not None else "n/a")
+
+    expected_markdown_path = preview.path or (run_root / "markdown" / f"{slug}.md")
+    render_operator_details(
+        "Operator Details",
+        {
+            "Preview route": "view=scraped_page",
+            "Source URL": preview.url or "Not recorded",
+            "Scrape status": "ready" if preview.ready else "missing",
+            "Run id": run_id,
+            "Page slug": slug,
+            "Expected markdown path": str(expected_markdown_path),
+            "Metadata summary": {
+                "http_status": preview.http_status,
+                "fetch_mode": preview.fetch_mode or "n/a",
+                "text_length": preview.text_length,
+            },
+        },
+        expanded=not preview.ready,
+    )
 
     if not preview.ready:
-        st.info(preview.message)
+        st.warning(preview.message or "Scraped markdown is not ready yet.")
         st.stop()
 
     st.divider()
+    st.markdown("#### Extracted content")
     st.markdown(preview.markdown)
     st.stop()
 
@@ -1543,7 +1593,9 @@ with tabs[2]:
                 st.caption("Recently scraped")
                 successful_pages = latest_pages_by_status(runs_all_page_rows, "success", limit=10)
                 if successful_pages:
-                    preview_links = []
+                    st.markdown("#### Content Inspector")
+                    st.caption("Compact preview actions for recently scraped pages.")
+                    recent_preview_rows = []
                     for row in successful_pages:
                         url = str(row.get("url") or "")
                         href = build_scraped_page_preview_href(
@@ -1551,11 +1603,18 @@ with tabs[2]:
                             run_id=st.session_state["run_id"],
                             url=url,
                         )
-                        preview_links.append(
-                            f'<a href="{escape(href, quote=True)}" target="_blank">Open preview</a> '
-                            f'<span>{escape(url)}</span>'
+                        parsed_url = urlparse(url)
+                        title = str(row.get("title") or parsed_url.path.strip("/") or parsed_url.netloc or "Untitled page")
+                        recent_preview_rows.append(
+                            {
+                                "Title": title[:120],
+                                "Status": str(row.get("status") or "success"),
+                                "Source URL": url,
+                                "Scraped timestamp": str(row.get("finished_at") or row.get("started_at") or "unknown"),
+                                "Preview action": href,
+                            }
                         )
-                    st.markdown("<br>".join(preview_links), unsafe_allow_html=True)
+                    st.dataframe(pd.DataFrame(recent_preview_rows), use_container_width=True, hide_index=True)
                 else:
                     st.info("Successful pages will appear here as soon as markdown is saved.")
 
