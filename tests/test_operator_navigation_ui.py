@@ -6,6 +6,8 @@ from pathlib import Path
 from src.scrape_planner.ui_navigation import WORKFLOW_TABS
 
 
+APP_SOURCE = Path("app.py")
+
 EXPECTED_OPERATOR_TABS = [
     "Overview",
     "Sources",
@@ -91,6 +93,22 @@ def test_runs_tab_owns_concrete_run_controls_and_activity() -> None:
     assert {"Start New Scrape", "Resume", "Pause"}.issubset(literals)
     assert {"Current Run", "Recently scraped"}.issubset(literals)
     assert not any("preserved under Sources" in literal for literal in literals)
+
+
+def test_overview_is_command_center_not_file_path_dump() -> None:
+    app = APP_SOURCE.read_text(encoding="utf-8")
+    start = app.index("with tabs[0]:")
+    end = app.index("with tabs[1]:", start)
+    overview = app[start:end]
+
+    assert 'st.subheader("Overview")' in overview
+    assert "render_status_band" in overview
+    assert "build_operator_run_status" in overview
+    assert "build_operator_source_status" in overview
+    assert "Attention Needed" in overview
+    assert "Registry path:" not in overview
+    assert "tmux session:" not in overview
+    assert "Server command" not in overview
 
 
 def test_retrieval_tab_exposes_graph_build_inspection_search_and_path_controls() -> None:

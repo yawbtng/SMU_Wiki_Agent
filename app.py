@@ -82,6 +82,15 @@ from src.scrape_planner.ui_scrape_realtime import (
     resolve_scraped_markdown_preview,
 )
 from src.scrape_planner.ui_navigation import WORKFLOW_TABS
+from src.scrape_planner.ui_operator_components import (
+    render_metric_strip,
+    render_operator_details,
+    render_status_band,
+)
+from src.scrape_planner.ui_operator_status import (
+    build_operator_run_status,
+    build_operator_source_status,
+)
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT / "data"
@@ -949,31 +958,32 @@ with tabs[0]:
         selected_count = 0
         if isinstance(selected_df_for_setup, pd.DataFrame) and not selected_df_for_setup.empty:
             selected_count = int(selected_df_for_setup["selected"].fillna(False).sum()) if "selected" in selected_df_for_setup.columns else len(selected_df_for_setup)
-        next_hint = "Refresh sitemap URLs"
-        if discovered_count and not selected_count:
-            next_hint = "Add PDF sources"
-        elif selected_count and not st.session_state.get("run_id"):
-            next_hint = "Start Scrape"
-        elif st.session_state.get("run_id"):
-            next_hint = "Clean or Review latest run"
-
-        s1, s2, s3, s4 = st.columns([1.1, 1.8, 1, 1])
-        s1.metric("Workspace", active_ws.get("name", "Workspace"))
-        s2.metric("Site", active_ws.get("url") or st.session_state.get("site_url") or "not set")
-        s3.metric("Discovered", f"{discovered_count:,}")
-        s4.metric("Selected", f"{selected_count:,}")
-        st.info(f"Next: {next_hint}")
 
         site_id = st.session_state.get("site_id", "")
         site_root = DATA_ROOT / "sites" / site_id if site_id else None
         pdf_manifest = read_json(site_root / "sources" / "pdf_manifest.json", []) if site_root else []
         pdf_count = len([row for row in pdf_manifest if isinstance(row, dict)])
+        pdf_page_count = 0
+        pdf_chunk_count = 0
+        if site_root:
+            pdf_ingest_dir = site_root / "sources" / "pdf_ingest"
+            pdf_pages_dir = site_root / "sources" / "pdf_pages"
+            pdf_chunk_count = len(_read_jsonl_rows(pdf_ingest_dir / "pdf_chunks.jsonl"))
+            page_rows = []
+            for pages_index in sorted(pdf_pages_dir.glob("*/pages.json")) if pdf_pages_dir.exists() else []:
+                payload = read_json(pages_index, [])
+                if isinstance(payload, list):
+                    page_rows.extend([row for row in payload if isinstance(row, dict)])
+            pdf_page_count = len(page_rows)
+            if not pdf_page_count and pdf_pages_dir.exists():
+                pdf_page_count = len([path for path in pdf_pages_dir.rglob("*.md") if path.is_file()])
+
         layout = site_layout(site_root) if site_root else None
         raw_status = _raw_source_status(layout) if layout else {"rows": []}
         raw_rows = raw_status.get("rows", [])
         raw_ready_count = len([row for row in raw_rows if str(row.get("status") or "") == "ready"])
         raw_failed_count = len([row for row in raw_rows if str(row.get("status") or "") == "failed"])
-        raw_review_count = len([row for row in raw_rows if str(row.get("status") or "") == "needs-review"])
+        raw_review_count = len([row for row in raw_rows if str(row.get("status") or "") in {"needs-review", "needs_review"}])
 
         run_id = st.session_state.get("run_id", "")
         run_state = "none"
@@ -981,7 +991,7 @@ with tabs[0]:
         total_count = selected_count
         failed_count = 0
         running_count = 0
-        eta_label = "n/a"
+        queued_count = selected_count
         if run_id and site_id:
             run_status, run_pages, _run_events = _load_scrape_runtime(site_id, run_id, max_events=800)
             run_summary = derive_run_summary(status=run_status or {}, pages=run_pages or [], selected_count=selected_count)
@@ -990,37 +1000,64 @@ with tabs[0]:
             total_count = int(run_summary.total)
             failed_count = int(run_summary.failed)
             running_count = int(run_summary.running)
-            try:
-                started = pd.to_datetime((run_status or {}).get("started_at"), utc=True, errors="coerce")
-                started_ts = started.to_pydatetime() if pd.notna(started) else None
-                elapsed_sec = max((datetime.now(timezone.utc) - started_ts).total_seconds(), 0.0) if started_ts else 0.0
-                queued_count = int(run_summary.queued)
-                eta_seconds = (queued_count / (done_count / elapsed_sec)) if elapsed_sec > 0 and done_count > 0 else None
-                eta_label = f"{eta_seconds/60.0:.1f} min" if eta_seconds is not None else "n/a"
-            except Exception:
-                eta_label = "n/a"
+            queued_count = int(run_summary.queued)
 
-        st.markdown("### Pipeline Snapshot")
-        p1, p2, p3, p4, p5 = st.columns(5)
-        p1.metric("Run State", run_state)
-        p2.metric("Run Progress", f"{done_count:,}/{total_count:,}")
-        p3.metric("Running", f"{running_count:,}")
-        p4.metric("Run Failures", f"{failed_count:,}")
-        p5.metric("ETA", eta_label)
+        operator_run = build_operator_run_status(
+            state=run_state,
+            done=done_count,
+            total=total_count,
+            running=running_count,
+            failed=failed_count,
+            queued=queued_count,
+            has_live_runner=bool(run_id and site_id and runner.has_live_run(site_id, run_id)),
+        )
+        operator_sources = build_operator_source_status(
+            selected_url_count=selected_count,
+            pdf_count=pdf_count,
+            raw_source_count=len(raw_rows),
+            raw_ready_count=raw_ready_count,
+            raw_failed_count=raw_failed_count,
+            raw_review_count=raw_review_count,
+            pdf_page_count=pdf_page_count,
+            pdf_chunk_count=pdf_chunk_count,
+        )
 
-        st.markdown("### Source Snapshot")
-        q1, q2, q3, q4, q5 = st.columns(5)
-        q1.metric("Uploaded PDFs", f"{pdf_count:,}")
-        q2.metric("Raw Sources", f"{len(raw_rows):,}")
-        q3.metric("Raw Ready", f"{raw_ready_count:,}")
-        q4.metric("Needs Review", f"{raw_review_count:,}")
-        q5.metric("Raw Failed", f"{raw_failed_count:,}")
+        render_status_band(
+            title=f"{active_ws.get('name', 'Workspace')} operations",
+            subtitle=f"{active_ws.get('url') or st.session_state.get('site_url') or 'No site URL'}",
+            status_label=operator_run.state_label,
+            tone=operator_run.attention_level,
+            action_label=operator_run.primary_action,
+        )
+        render_metric_strip(
+            [
+                {"label": "Run Progress", "value": f"{operator_run.done:,}/{operator_run.total:,}"},
+                {"label": "Running", "value": f"{operator_run.running:,}"},
+                {"label": "Failures", "value": f"{operator_run.failed:,}"},
+                {"label": "Queued", "value": f"{operator_run.queued:,}"},
+            ]
+        )
 
-        if run_id:
-            st.caption(f"Active run: `{run_id}`")
+        source_tone = "ready" if operator_sources.readiness == "ready" else "warning"
+        render_status_band(
+            title="Source readiness",
+            subtitle=operator_sources.message,
+            status_label=operator_sources.readiness.title(),
+            tone=source_tone,
+            action_label="Build wiki" if operator_sources.readiness == "ready" else "Normalize corpus",
+        )
+        render_metric_strip(
+            [
+                {"label": "Selected URLs", "value": f"{operator_sources.selected_url_count:,}"},
+                {"label": "PDF Extraction", "value": operator_sources.pdf_detail},
+                {"label": "Raw Sources", "value": f"{operator_sources.raw_source_count:,}"},
+                {"label": "Needs Review", "value": f"{operator_sources.raw_review_count:,}"},
+            ]
+        )
+
         recent_failures = [
             row for row in (raw_rows or [])
-            if str(row.get("status") or "") in {"failed", "needs-review"} or str(row.get("error_reason") or "").strip()
+            if str(row.get("status") or "") in {"failed", "needs-review", "needs_review"} or str(row.get("error_reason") or "").strip()
         ][:5]
         if recent_failures:
             with st.expander("Attention Needed", expanded=False):
