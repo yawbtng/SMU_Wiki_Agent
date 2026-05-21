@@ -767,46 +767,62 @@ def _apply_compact_ui_styles() -> None:
         """
         <style>
         html, body, [class*="st-"], [data-testid="stAppViewContainer"] {
-            font-size: 13px;
+            font-size: 14px;
+            color: #0f172a;
         }
         .main .block-container {
-            padding-top: 1.2rem;
-            padding-bottom: 1.6rem;
-            max-width: 100%;
+            padding-top: 2.2rem;
+            padding-bottom: 1.8rem;
+            max-width: 1180px;
         }
         h1 {
-            font-size: 1.45rem !important;
+            font-size: 1.7rem !important;
             line-height: 1.2 !important;
-            margin-bottom: 0.35rem !important;
+            margin-bottom: 0.45rem !important;
+            color: #0f172a !important;
+            font-weight: 750 !important;
         }
         h2, h3 {
-            font-size: 1.02rem !important;
+            font-size: 1.08rem !important;
             line-height: 1.25 !important;
-            margin-top: 0.8rem !important;
-            margin-bottom: 0.35rem !important;
+            margin-top: 0.95rem !important;
+            margin-bottom: 0.45rem !important;
+            color: #0f172a !important;
+            font-weight: 750 !important;
         }
         p, label, .stMarkdown, .stCaption, [data-testid="stMarkdownContainer"] {
-            font-size: 0.82rem !important;
-            line-height: 1.35 !important;
+            font-size: 0.88rem !important;
+            line-height: 1.42 !important;
         }
         [data-testid="stMetric"] {
-            padding: 0.15rem 0;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 12px 14px;
+            background: #ffffff;
         }
         [data-testid="stMetricLabel"] p {
-            font-size: 0.72rem !important;
+            font-size: 0.76rem !important;
         }
         [data-testid="stMetricValue"] {
-            font-size: 1.08rem !important;
+            font-size: 1.18rem !important;
             line-height: 1.15 !important;
+            color: #0f172a !important;
+            font-weight: 750 !important;
         }
         button, input, textarea, select, [role="tab"] {
-            font-size: 0.8rem !important;
+            font-size: 0.86rem !important;
+        }
+        [data-testid="stAlert"] {
+            border-radius: 8px;
         }
         [data-testid="stDataFrame"] {
-            font-size: 0.78rem !important;
+            font-size: 0.82rem !important;
+        }
+        div[data-testid="stExpander"] {
+            border-radius: 8px;
         }
         div[data-testid="stExpander"] details summary p {
-            font-size: 0.82rem !important;
+            font-size: 0.86rem !important;
         }
         </style>
         """,
@@ -987,7 +1003,7 @@ store = _get_store()
 runner = _get_runner()
 tmux_runner = _get_tmux_runner()
 
-st.title("LLM Wiki Pipeline")
+st.title("University Knowledge Ops")
 st.caption("Overview -> Sources -> Runs -> Corpus -> Wiki -> Retrieval -> Settings.")
 
 if not st.session_state.get("active_workspace_id"):
@@ -1796,7 +1812,7 @@ with tabs[3]:
             with st.expander("Latest normalization report", expanded=False):
                 st.json(raw_status.get("latest_report") or {})
         else:
-            st.warning("Missing prerequisite: raw data sources have not been normalized yet.")
+            st.warning("Blocked: normalize Corpus sources before reviewing the latest report.")
 
         with st.expander("PDF extraction", expanded=bool(page_rows)):
             p1, p2, p3 = st.columns(3)
@@ -2058,7 +2074,7 @@ with tabs[4]:
         )
 
         if not raw_sources_ready:
-            st.warning("Missing prerequisite: normalize raw data sources before building the LLM Wiki.")
+            st.warning("Blocked: normalize Corpus sources before building the LLM Wiki.")
 
         build_col, refresh_col = st.columns([1, 1])
         if build_col.button("Build LLM Wiki", type="primary", disabled=not raw_sources_ready, key="build_llm_wiki"):
@@ -2138,9 +2154,9 @@ with tabs[5]:
         vectors_exist = bool(embedding_status["raw_index_count"] or embedding_status["wiki_index_count"])
         wiki_ready = _wiki_ready(wiki_status)
         if not _raw_sources_ready(raw_status):
-            st.warning("Missing prerequisite: normalize raw data sources before embedding and reranking.")
+            st.warning("Blocked: normalize Corpus sources before retrieval indexing.")
         elif not wiki_ready:
-            st.warning("Missing prerequisite: build the LLM Wiki before embedding and reranking.")
+            st.warning("Blocked: build the LLM Wiki before retrieval indexing.")
 
         st.markdown("### Chunk quality")
         quality_state_label = (
@@ -2749,13 +2765,13 @@ with tabs[5]:
             retrieval_quality_summary = build_chunk_quality_summary(row for row in chunk_rows if isinstance(row, dict))
         mcp_status = _load_mcp_status(layout)
         if not _raw_sources_ready(raw_status):
-            st.warning("Missing prerequisite: normalize raw data sources before MCP query setup.")
+            st.warning("Blocked: normalize Corpus sources before MCP readiness checks.")
         elif not _wiki_ready(wiki_status):
-            st.warning("Missing prerequisite: build the LLM Wiki before MCP query setup.")
+            st.warning("Blocked: build the LLM Wiki before MCP readiness checks.")
         elif not retrieval_quality_summary.ready_for_retrieval:
             st.warning("Retrieval is blocked until Corpus Content Inspector chunk quality is ready.")
         elif embedding_status["index_health"] != "ready":
-            st.warning("Missing prerequisite: build healthy raw/wiki indexes before MCP query setup.")
+            st.warning("Blocked: build healthy corpus/wiki indexes before MCP readiness checks.")
         elif not mcp_status["server_available"]:
             st.warning("MCP server implementation is pending. Query setup stays unavailable until a real server module is present.")
         else:
