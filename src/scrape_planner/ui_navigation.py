@@ -3,8 +3,8 @@ from __future__ import annotations
 WORKFLOW_TABS = [
     "Setup",
     "Discover",
-    "Choose URLs",
     "Scrape",
+    "Corpus",
     "Graph",
     "Settings",
 ]

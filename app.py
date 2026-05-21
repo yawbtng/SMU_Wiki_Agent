@@ -22,10 +22,6 @@ except Exception:
     st_autorefresh = None
 
 from src.scrape_planner.failure_classifier import classify_failure
-from src.scrape_planner.llm_orchestrator import (
-    choose_top_urls_with_ollama,
-    choose_top_urls_with_openrouter,
-)
 from src.scrape_planner.local_cleanup import CleanupRunner, ollama_available
 from src.scrape_planner.markdown_graph import (
     answer_context as graph_answer_context,
@@ -57,15 +53,19 @@ from src.scrape_planner.run_analytics import (
     summarize_output_volume,
     summarize_pages,
 )
+from src.scrape_planner.scrape_ui_tables import filter_page_rows, page_table_columns
 from src.scrape_planner.scrape_worker import ScrapeRunner
 from src.scrape_planner.sitemap_discovery import apply_manual_urls, discover_site_urls, normalize_site_url
 from src.scrape_planner.state import RunStateStore
 from src.scrape_planner.storage import persist_discovered, read_json, write_json
+from src.scrape_planner.table_pagination import dynamic_page_size_options
 from src.scrape_planner.tavily_retry import retry_failed_with_tavily
 from src.scrape_planner.terminal_skill_runner import TerminalSkillRunner
 from src.scrape_planner.tmux_runner import TmuxRunner
+from src.scrape_planner.ui_claude_plan import render_claude_plan_section
 from src.scrape_planner.ui_navigation import WORKFLOW_TABS
-from src.scrape_planner.url_quality import UrlCriteria, UrlScoringProfile, score_and_filter_rows
+from src.scrape_planner.url_action_insights import build_url_action_dashboard
+from src.scrape_planner.workspace_state import resolve_active_workspace_id
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT / "data"
@@ -655,18 +655,32 @@ def _rows_to_discovered_urls(rows: list[dict]) -> list[DiscoveredURL]:
     return selected_items
 
 
-def _render_paginated_df(df: pd.DataFrame, *, key_prefix: str, default_page_size: int = 100) -> None:
+def _render_paginated_df(
+    df: pd.DataFrame,
+    *,
+    key_prefix: str,
+    default_page_size: int = 100,
+    total_label: str = "rows",
+) -> None:
     if df.empty:
         st.info("No rows to display.")
         return
-    c1, c2 = st.columns([1, 1])
-    page_size = c1.selectbox("Page size", options=[25, 50, 100, 200, 500], index=[25, 50, 100, 200, 500].index(default_page_size) if default_page_size in [25, 50, 100, 200, 500] else 2, key=f"{key_prefix}_page_size")
     total_rows = len(df)
+    page_size_options = dynamic_page_size_options(total_rows, default_page_size=default_page_size)
+    default_index = page_size_options.index(default_page_size) if default_page_size in page_size_options else 0
+    c1, c2 = st.columns([1, 1])
+    page_size = c1.selectbox(
+        "Rows visible",
+        options=page_size_options,
+        index=default_index,
+        key=f"{key_prefix}_page_size",
+        format_func=lambda value: "All" if int(value) >= total_rows else f"{int(value):,}",
+    )
     total_pages = max(1, (total_rows + page_size - 1) // page_size)
     page = c2.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1, key=f"{key_prefix}_page")
     start = (int(page) - 1) * int(page_size)
     end = start + int(page_size)
-    st.caption(f"Showing rows {start + 1}-{min(end, total_rows)} of {total_rows}")
+    st.caption(f"Showing {start + 1:,}-{min(end, total_rows):,} of {total_rows:,} {total_label}.")
     st.dataframe(df.iloc[start:end], use_container_width=True)
 
 
@@ -778,6 +792,60 @@ def _resolve_active_run_id(site_id: str, current_run_id: str) -> str:
     if real_runs:
         return real_runs[-1]
     return run_ids[-1]
+
+
+def _latest_scrape_manifest(site_id: str, current_run_id: str) -> tuple[str, list[dict]]:
+    if not site_id:
+        return "", []
+    candidate_run_ids = []
+    if current_run_id:
+        candidate_run_ids.append(current_run_id)
+    candidate_run_ids.extend(reversed(_site_run_ids(site_id)))
+    seen: set[str] = set()
+    for run_id in candidate_run_ids:
+        if not run_id or run_id in seen or not _is_real_scrape_run(site_id, run_id):
+            continue
+        seen.add(run_id)
+        manifest = read_json(_run_root(site_id, run_id) / "scrape_manifest.json", [])
+        rows = [row for row in manifest if isinstance(row, dict)] if isinstance(manifest, list) else []
+        if rows:
+            return run_id, rows
+    return "", []
+
+
+def _render_url_action_dashboard(dashboard: dict, run_id: str) -> None:
+    summary = dashboard.get("summary", {})
+    st.markdown("#### Core URL Actions")
+    if run_id:
+        st.caption(f"Based on scrape run `{run_id}`.")
+    st.info(dashboard.get("recommended_action", "Review URL readiness before scraping."))
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Markdown ready", f"{int(summary.get('markdown_ready', 0)):,}")
+    m2.metric("Failed", f"{int(summary.get('failed', 0)):,}")
+    m3.metric("Thin pages", f"{int(summary.get('thin_success', 0)):,}")
+    m4.metric("Discovered", f"{int(summary.get('discovered', 0)):,}")
+
+    failure_queue = dashboard.get("failure_queue", [])
+    freshness = dashboard.get("freshness", [])
+    left, right = st.columns([1.35, 1])
+    with left:
+        st.markdown("##### Failure Repair Queue")
+        if failure_queue:
+            st.dataframe(
+                pd.DataFrame(failure_queue)[["failure_reason", "count", "http_statuses", "recommended_action", "sample_url"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.success("No failed URLs in the latest scrape manifest.")
+    with right:
+        st.markdown("##### Last Modified")
+        if freshness:
+            st.dataframe(pd.DataFrame(freshness), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No last-modified metadata available yet.")
+
 
 
 def _save_env_key(path: Path, key: str, value: str) -> None:
@@ -1077,10 +1145,10 @@ if "default_llm_sleep_sec" not in st.session_state:
     st.session_state["default_llm_sleep_sec"] = float(loaded_app_state.get("default_llm_sleep_sec", 0.0))
 if not st.session_state.get("workspaces"):
     st.session_state["workspaces"] = loaded_app_state.get("workspaces", [])
-if not st.session_state.get("active_workspace_id"):
-    st.session_state["active_workspace_id"] = loaded_app_state.get("active_workspace_id", "")
-if not st.session_state.get("active_workspace_id") and len(st.session_state.get("workspaces", [])) == 1:
-    st.session_state["active_workspace_id"] = st.session_state["workspaces"][0].get("id", "")
+st.session_state["active_workspace_id"] = resolve_active_workspace_id(
+    current_active_workspace_id=st.session_state.get("active_workspace_id", ""),
+    loaded_active_workspace_id=loaded_app_state.get("active_workspace_id", ""),
+)
 active_workspace_for_recovery = next(
     (w for w in st.session_state.get("workspaces", []) if w.get("id") == st.session_state.get("active_workspace_id")),
     None,
@@ -1116,7 +1184,7 @@ terminal_skill_runner = _get_terminal_skill_runner()
 tmux_runner = _get_tmux_runner()
 
 st.title("Scrape Pipeline")
-st.caption("Setup -> Discover -> Choose URLs -> Scrape -> Graph.")
+st.caption("Setup -> Discover -> Scrape -> Corpus -> Graph.")
 
 if not st.session_state.get("active_workspace_id"):
     st.subheader("Workspaces")
@@ -1181,9 +1249,7 @@ with tabs[0]:
         if isinstance(selected_df_for_setup, pd.DataFrame) and not selected_df_for_setup.empty:
             selected_count = int(selected_df_for_setup["selected"].fillna(False).sum()) if "selected" in selected_df_for_setup.columns else len(selected_df_for_setup)
         next_hint = "Refresh sitemap URLs"
-        if discovered_count and not selected_count:
-            next_hint = "Run LLM Choose URLs"
-        elif selected_count and not st.session_state.get("run_id"):
+        if discovered_count and not st.session_state.get("run_id"):
             next_hint = "Start Scrape"
         elif st.session_state.get("run_id"):
             next_hint = "Clean or Review latest run"
@@ -1253,287 +1319,16 @@ with tabs[1]:
             st.dataframe(host_counts.rename_axis("host").reset_index(name="urls"), use_container_width=True, hide_index=True)
 
 with tabs[2]:
-    site_id = st.session_state.get("site_id", "")
-    if not site_id:
-        st.info("Create or open a workspace first.")
-    else:
-        if not st.session_state["discovered"]:
-            disk_rows = read_json(_discovered_json_path(site_id), [])
-            if disk_rows:
-                st.session_state["discovered"] = disk_rows
-                st.session_state["selected_df"] = pd.DataFrame(disk_rows)
-
-        site_root = DATA_ROOT / "sites" / site_id
-        site_root.mkdir(parents=True, exist_ok=True)
-        pdf_dir = site_root / "sources" / "pdf_uploads"
-        pdf_manifest_path = site_root / "sources" / "pdf_manifest.json"
-        score_file = site_root / "selected_urls_llm.json"
-        profile_path = site_root / "url_scoring_profile.json"
-        scoring_profile = UrlScoringProfile.from_dict(read_json(profile_path, {}))
-        rows = [row for row in st.session_state.get("discovered", []) if isinstance(row, dict)]
-
-        st.subheader("Choose URLs")
-        st.caption("Pick high-signal student pages. Keep spam, archives, login/search pages, and stale content out of the scrape.")
-
-        quick_add, quick_docs = st.columns([1.15, 1])
-        with quick_add:
-            manual_input = st.text_area(
-                "Add manual links",
-                value=st.session_state.get("manual_urls", ""),
-                height=96,
-                placeholder="https://admissions.smu.edu/...\n/registrar/...",
-                key="choose_manual_urls_input",
-            )
-            st.session_state["manual_urls"] = manual_input
-            add_links_col, clear_links_col = st.columns([1, 1])
-            if add_links_col.button("Add links", type="primary", use_container_width=True):
-                items = apply_manual_urls(st.session_state["site_url"], manual_input.splitlines())
-                merged = {row.get("url"): row for row in rows if row.get("url")}
-                accepted = 0
-                excluded = 0
-                for item in items:
-                    row = item.to_dict()
-                    if row.get("excluded_reason"):
-                        excluded += 1
-                    else:
-                        accepted += 1
-                    merged[item.url] = row
-                st.session_state["discovered"] = list(merged.values())
-                st.session_state["selected_df"] = pd.DataFrame(st.session_state["discovered"])
-                write_json(_discovered_json_path(site_id), st.session_state["discovered"])
-                _save_app_state()
-                st.success(f"Added {accepted:,} in-scope link(s). Excluded {excluded:,} off-domain link(s).")
-                st.rerun()
-            if clear_links_col.button("Clear input", use_container_width=True):
-                st.session_state["manual_urls"] = ""
-                _save_app_state()
-                st.rerun()
-
-        with quick_docs:
-            uploaded_pdfs = st.file_uploader(
-                "Add PDFs for wiki",
-                type=["pdf"],
-                accept_multiple_files=True,
-                key="choose_pdf_uploads",
-            )
-            pdf_manifest = read_json(pdf_manifest_path, [])
-            if uploaded_pdfs:
-                pdf_dir.mkdir(parents=True, exist_ok=True)
-                existing = {row.get("path"): row for row in pdf_manifest if isinstance(row, dict)}
-                for uploaded in uploaded_pdfs:
-                    target = pdf_dir / _safe_uploaded_filename(uploaded.name)
-                    target.write_bytes(uploaded.getbuffer())
-                    existing[str(target)] = {
-                        "name": uploaded.name,
-                        "path": str(target),
-                        "size_bytes": int(target.stat().st_size),
-                        "added_at": datetime.now(timezone.utc).isoformat(),
-                        "status": "ready_for_wiki_ingest",
-                    }
-                pdf_manifest = sorted(existing.values(), key=lambda row: row.get("name", ""))
-                write_json(pdf_manifest_path, pdf_manifest)
-                st.success(f"Saved {len(uploaded_pdfs):,} PDF(s).")
-            st.metric("PDF Sources", f"{len(pdf_manifest):,}")
-            if pdf_manifest:
-                st.caption("PDFs are included as first-class wiki sources.")
-
-        # Local scoring profile stays as a fallback only when OpenRouter is unavailable.
-
-        if not rows:
-            st.info("Discover URLs or add manual links to start selection.")
-        else:
-            current_df = pd.DataFrame(rows)
-            if "url" not in current_df.columns:
-                st.info("Discovered rows do not contain URLs yet.")
-            else:
-                current_df["host"] = current_df["url"].astype(str).map(lambda value: urlparse(value).netloc.lower())
-                host_options = sorted([host for host in current_df["host"].dropna().unique().tolist() if host])
-                filter_box = st.container(border=True)
-                with filter_box:
-                    f1, f2, f3, f4 = st.columns([1, 1, 1, 1])
-                    threshold = int(f1.slider("Usefulness", min_value=0, max_value=100, value=int(st.session_state.get("score_threshold", 70)), step=5))
-                    st.session_state["score_threshold"] = threshold
-                    max_urls = int(f2.number_input("Max URLs", min_value=1, max_value=50000, value=int(st.session_state.get("choose_max_urls", 500)), step=50))
-                    st.session_state["choose_max_urls"] = max_urls
-                    include_pdfs = f3.toggle("Include PDF links", value=bool(st.session_state.get("choose_include_pdfs", True)))
-                    st.session_state["choose_include_pdfs"] = include_pdfs
-                    apply_now = f4.button("Apply", type="primary", use_container_width=True)
-                    f5, f6 = st.columns([1, 1])
-                    if not st.session_state.get("choose_include_text_prefilled"):
-                        st.session_state["choose_include_text"] = ", ".join(scoring_profile.high_value_terms)
-                        st.session_state["choose_include_text_prefilled"] = True
-                    include_text = f5.text_input(
-                        "Must contain",
-                        value=st.session_state.get("choose_include_text", ""),
-                        placeholder="admission, registrar, tuition",
-                    )
-                    exclude_text = f6.text_input(
-                        "Exclude contains",
-                        value=st.session_state.get("choose_exclude_text", ""),
-                    )
-                    st.session_state["choose_include_text"] = include_text
-                    st.session_state["choose_exclude_text"] = exclude_text
-                    selected_hosts = st.multiselect(
-                        "Hosts/subdomains",
-                        options=host_options,
-                        default=st.session_state.get("choose_hosts", []),
-                        placeholder="All hosts",
-                    )
-                    st.session_state["choose_hosts"] = selected_hosts
-
-                llm_box = st.container(border=True)
-                with llm_box:
-                    llm_cols = st.columns([2, 1])
-                    url_reasoning_provider = st.session_state.get("url_reasoning_provider", "openrouter")
-                    if url_reasoning_provider == "ollama":
-                        llm_model = st.session_state.get("url_reasoning_ollama_model") or st.session_state.get("ollama_model") or "qwen2.5:3b"
-                    else:
-                        llm_model = st.session_state.get("url_reasoning_openrouter_model") or st.session_state.get("default_or_model", "deepseek/deepseek-v4-flash")
-                    llm_batch_size = int(st.session_state.get("default_llm_batch_size", 250))
-                    llm_max_urls = max_urls
-                    llm_cols[0].metric(f"{url_reasoning_provider.title()} URL reasoning", llm_model)
-                    run_llm = llm_cols[1].button("LLM Choose URLs", type="primary", use_container_width=True)
-                    st.caption("The LLM scores URLs with reasons, then the threshold below controls what gets scraped.")
-
-                if run_llm:
-                    api_key = st.session_state.get("openrouter_api_key", "").strip() or loaded_env.get("OPENROUTER_API_KEY", "").strip()
-                    if url_reasoning_provider == "openrouter" and not api_key:
-                        st.error("OpenRouter API key missing. Add it in Settings first.")
-                    else:
-                        with st.spinner(f"{url_reasoning_provider.title()} is reasoning over {len(rows):,} URLs..."):
-                            if url_reasoning_provider == "ollama":
-                                llm_payload = choose_top_urls_with_ollama(
-                                    site_url=st.session_state.get("site_url", ""),
-                                    discovered_rows=rows,
-                                    out_path=score_file,
-                                    max_urls=llm_max_urls,
-                                    model=llm_model,
-                                    base_url=st.session_state.get("ollama_base_url", OLLAMA_BASE_URL),
-                                    batch_size=llm_batch_size,
-                                    sleep_between_batches_sec=float(st.session_state.get("default_llm_sleep_sec", 0.0)),
-                                )
-                            else:
-                                llm_payload = choose_top_urls_with_openrouter(
-                                    site_url=st.session_state.get("site_url", ""),
-                                    discovered_rows=rows,
-                                    out_path=score_file,
-                                    max_urls=llm_max_urls,
-                                    model=llm_model,
-                                    api_key=api_key,
-                                    batch_size=llm_batch_size,
-                                    sleep_between_batches_sec=float(st.session_state.get("default_llm_sleep_sec", 0.0)),
-                                )
-                        if not (llm_payload.get("used_openrouter") or llm_payload.get("used_ollama")):
-                            st.error(
-                                f"{url_reasoning_provider.title()} URL reasoning failed: "
-                                f"{llm_payload.get('openrouter_error') or llm_payload.get('ollama_error') or 'unknown error'}"
-                            )
-                        else:
-                            llm_threshold = int(llm_payload.get("default_threshold", threshold) or threshold)
-                            score_lookup = {row.get("url"): row for row in llm_payload.get("scored_urls", []) if isinstance(row, dict) and row.get("url")}
-                            merged_rows = []
-                            for row in rows:
-                                url = row.get("url")
-                                score_row = score_lookup.get(url, {})
-                                score = int(score_row.get("score") or 0)
-                                merged_rows.append(
-                                    {
-                                        **row,
-                                        "score": score,
-                                        "reason": score_row.get("reason", ""),
-                                        "student_value": score_row.get("student_value"),
-                                        "freshness": score_row.get("freshness"),
-                                        "source_quality": score_row.get("source_quality"),
-                                        "scrape_value": score_row.get("scrape_value"),
-                                        "selected": score >= llm_threshold,
-                                        "selection_source": url_reasoning_provider,
-                                    }
-                                )
-                            scored_llm_df = pd.DataFrame(merged_rows).sort_values("score", ascending=False)
-                            st.session_state["score_threshold"] = llm_threshold
-                            st.session_state["last_selection_payload"] = llm_payload
-                            st.session_state["discovered"] = scored_llm_df.to_dict("records")
-                            st.session_state["selected_df"] = scored_llm_df
-                            write_json(_discovered_json_path(site_id), scored_llm_df.to_dict("records"))
-                            write_json(score_file, llm_payload)
-                            _save_app_state()
-                            st.success(f"{url_reasoning_provider.title()} selected {int(scored_llm_df['selected'].sum()):,} URL(s) with reasons.")
-                            st.rerun()
-
-                criteria = UrlCriteria(
-                    include_text=include_text,
-                    exclude_text=exclude_text,
-                    include_hosts=tuple(selected_hosts),
-                    max_urls=max_urls,
-                    threshold=threshold,
-                    include_pdfs=include_pdfs,
-                )
-                if rows and all(str(row.get("selection_source") or "") == "openrouter" for row in rows):
-                    scored_df = pd.DataFrame(rows).sort_values("score", ascending=False)
-                    counts = {
-                        "total": len(scored_df),
-                        "filtered": 0,
-                        "selected": int(scored_df.get("selected", pd.Series(dtype=bool)).fillna(False).sum()),
-                        "spammy": int((scored_df.get("score", pd.Series(dtype=int)).fillna(0).astype(int) < int(threshold)).sum()),
-                        "pdfs": int(scored_df.get("is_pdf", pd.Series(dtype=bool)).fillna(False).sum()) if "is_pdf" in scored_df.columns else 0,
-                    }
-                else:
-                    scored_rows, counts = score_and_filter_rows(rows, criteria, profile=scoring_profile)
-                    scored_df = pd.DataFrame(scored_rows)
-                if scored_df.empty:
-                    st.warning("No URLs match the current criteria.")
-                else:
-                    st.session_state["discovered"] = scored_df.to_dict("records")
-                    st.session_state["selected_df"] = scored_df
-                    selected_df = scored_df[scored_df["selected"] == True].copy()  # noqa: E712
-                    spammy_df = scored_df[(scored_df.get("spammy", False) == True) | (scored_df["selected"] == False)].copy()  # noqa: E712
-                    payload = {
-                        "selection_method": "llm_scored" if "selection_source" in scored_df.columns and scored_df["selection_source"].isin(["openrouter", "ollama"]).any() else "local_rules_choose_urls",
-                        "default_threshold": threshold,
-                        "criteria": {
-                            "include_text": include_text,
-                            "exclude_text": exclude_text,
-                            "hosts": selected_hosts,
-                            "max_urls": max_urls,
-                            "include_pdfs": include_pdfs,
-                        },
-                        "scoring_profile": scoring_profile.to_dict(),
-                        "scored_urls": scored_df[[col for col in ["url", "score", "reason", "student_value", "freshness", "source_quality", "scrape_value", "host", "is_pdf"] if col in scored_df.columns]].to_dict("records"),
-                        "selected_urls": selected_df[[col for col in ["url", "score", "reason"] if col in selected_df.columns]].rename(columns={"score": "priority"}).to_dict("records"),
-                    }
-                    st.session_state["last_selection_payload"] = payload
-                    if apply_now:
-                        write_json(score_file, payload)
-                        write_json(_discovered_json_path(site_id), scored_df.to_dict("records"))
-                        _save_app_state()
-                        st.success(f"Selection saved: {len(selected_df):,} URL(s) will be scraped.")
-
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("Selected", f"{len(selected_df):,}")
-                    m2.metric("Spammy/Low", f"{len(spammy_df):,}")
-                    m3.metric("Filtered", f"{counts.get('filtered', 0):,}")
-                    m4.metric("PDF Links", f"{counts.get('pdfs', 0):,}")
-                    m5.metric("Total", f"{counts.get('total', 0):,}")
-
-                    display_cols = [col for col in ["score", "url", "host", "reason", "student_value", "freshness", "scrape_value"] if col in selected_df.columns]
-                    st.dataframe(
-                        selected_df.sort_values("score", ascending=False)[display_cols].head(max_urls),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                    if not spammy_df.empty:
-                        st.caption("Excluded summary")
-                        excluded_cols = [col for col in ["score", "url", "host", "reason"] if col in spammy_df.columns]
-                        st.dataframe(
-                            spammy_df.sort_values("score", ascending=True)[excluded_cols].head(25),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-
-with tabs[3]:
     if not st.session_state["site_id"]:
         st.info("Create site workspace first.")
     else:
+        rows = [row for row in st.session_state.get("discovered", []) if isinstance(row, dict)]
+        manifest_run_id, manifest_rows = _latest_scrape_manifest(
+            st.session_state["site_id"],
+            st.session_state.get("run_id", ""),
+        )
+        url_action_dashboard = build_url_action_dashboard(rows, manifest_rows, sample_limit=8)
+
         selected_rows = st.session_state.get("selected_df", pd.DataFrame())
         if isinstance(selected_rows, pd.DataFrame) and not selected_rows.empty:
             if "selected" in selected_rows.columns:
@@ -1546,47 +1341,23 @@ with tabs[3]:
         selected_url_strings = [u for u in selected_url_strings if u.strip()]
         selected_url_set = set(selected_url_strings)
 
-        c1, c2, c3, c4, c5, c6, c7 = st.columns([1, 1, 1, 1, 1, 1, 2.2])
-        concurrency = c3.number_input("Concurrency", min_value=1, max_value=16, value=4, step=1)
-        if c1.button("Start Scrape", type="primary"):
-            run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
-            st.session_state["run_id"] = run_id
-            st.session_state["last_run_by_site"][st.session_state["site_id"]] = run_id
-            _save_app_state()
-            selected_urls = _rows_to_discovered_urls(st.session_state["selected_df"].to_dict("records"))
-            if not selected_urls:
-                st.error("No URLs selected. Lower the importance threshold or choose URLs before starting a scrape.")
-            else:
-                runner.start(
-                    st.session_state["site_id"],
-                    run_id,
-                    selected_urls,
-                    concurrency=int(concurrency),
-                )
-                st.success(f"Started scrape for {len(selected_urls):,} selected URLs.")
-                st.rerun()
-        if c4.button("Pause Run", disabled=not st.session_state["run_id"]):
-            runner.pause(st.session_state["site_id"], st.session_state["run_id"])
-        if c5.button("Resume Run", disabled=not st.session_state["run_id"]):
-            resumed = runner.resume(
-                st.session_state["site_id"],
-                st.session_state["run_id"],
-                concurrency=int(concurrency),
-            )
-            if resumed:
-                st.success("Resumed unfinished queued/cancelled pages for this run.")
-            else:
-                runner.unpause(st.session_state["site_id"], st.session_state["run_id"])
-        if c2.button("Cancel Run", disabled=not st.session_state["run_id"]):
-            runner.cancel(st.session_state["site_id"], st.session_state["run_id"])
-        if c6.button("Refresh", use_container_width=True):
-            st.rerun()
-        autorefresh = c7.checkbox("Auto-refresh every 1s", value=False)
-        if autorefresh and st_autorefresh is None:
-            c7.caption("Install `streamlit-autorefresh` to enable this without blocking. Use Refresh for now.")
-        st.caption(
-            f"Selected URLs: `{len(selected_url_strings):,}`   |   Active run: `{st.session_state.get('run_id') or 'none'}`"
-        )
+        scrape_view_tabs = st.tabs(["Overview", "Scraped", "Failures"])
+        status: dict = {}
+        pages: list = []
+        run_state = "ready"
+        success = 0
+        failed = 0
+        cancelled = 0
+        running_count = 0
+        total = len(selected_url_strings)
+        done = 0
+        queued = len(selected_url_strings)
+        throughput = 0.0
+        elapsed_label = "n/a"
+        eta_label = "n/a"
+        page_rows_by_url: dict[str, dict] = {}
+        pages_df = pd.DataFrame()
+        failed_urls_current: list[str] = []
 
         if st.session_state["run_id"]:
             status, pages, events = _load_scrape_runtime(
@@ -1614,22 +1385,6 @@ with tabs[3]:
             elapsed_label = f"{elapsed_seconds/60.0:.1f} min" if elapsed_seconds > 0 else "n/a"
             eta_label = f"{eta_seconds/60.0:.1f} min" if eta_seconds is not None else "n/a"
 
-            st.subheader("Run Health")
-            k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
-            k1.metric("Total", f"{total:,}")
-            k2.metric("Queued", f"{queued:,}")
-            k3.metric("Running", f"{running_count:,}")
-            k4.metric("Success", f"{success:,}")
-            k5.metric("Failed", f"{failed:,}")
-            k6.metric("Cancelled", f"{cancelled:,}")
-            k7.metric("Pages/Min", f"{throughput:.1f}")
-            hdr1, hdr2, hdr3, hdr4 = st.columns([2, 3, 2, 2])
-            hdr1.caption(f"State: `{run_state}`")
-            hdr2.caption(f"Current URL: `{status.get('current_url') or 'pending initialization'}`")
-            hdr3.caption(f"Elapsed: `{elapsed_label}`")
-            hdr4.caption(f"ETA: `{eta_label}`")
-
-            page_rows_by_url: dict[str, dict] = {}
             if isinstance(pages, list):
                 for row in pages:
                     if not isinstance(row, dict):
@@ -1653,12 +1408,172 @@ with tabs[3]:
                     }
             pages_df = pd.DataFrame(list(page_rows_by_url.values()))
 
+            if not pages_df.empty:
+                pages_df["started_at"] = pd.to_datetime(pages_df.get("started_at"), errors="coerce", utc=True)
+                pages_df["finished_at"] = pd.to_datetime(pages_df.get("finished_at"), errors="coerce", utc=True)
+                pages_df["duration_sec"] = ((pages_df["finished_at"] - pages_df["started_at"]).dt.total_seconds()).round(2)
+                pages_df["duration_sec"] = pages_df["duration_sec"].fillna(0.0)
+                pages_df["status"] = pages_df.get("status", pd.Series(dtype=str)).fillna("queued").astype(str)
+                attempt_series = pages_df["attempt"] if "attempt" in pages_df.columns else pd.Series(0, index=pages_df.index)
+                pages_df["attempt"] = pd.to_numeric(attempt_series, errors="coerce").fillna(0).astype(int)
+                pages_df["updated_at"] = pages_df["finished_at"].fillna(pages_df["started_at"])
+                pages_df["updated_at_str"] = pages_df["updated_at"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                pages_df["updated_at_str"] = pages_df["updated_at_str"].fillna("pending")
+                status_rank = {"running": 0, "failed": 1, "success": 2, "cancelled": 3, "queued": 4}
+                pages_df["status_rank"] = pages_df["status"].map(lambda s: status_rank.get(str(s).lower(), 5))
+
             failed_urls_current = [
                 str(row.get("url") or "").strip()
                 for row in page_rows_by_url.values()
                 if str(row.get("status") or "").lower() == "failed" and str(row.get("url") or "").strip()
             ]
             failed_urls_current = sorted(set(failed_urls_current))
+
+        def _render_focused_page_table(*, focus_status: str, key_prefix: str, empty_message: str, total_label: str) -> None:
+            if pages_df.empty:
+                st.info("Run initializing. Waiting for queue state to be published.")
+                return
+
+            f1, f2, f3, f4 = st.columns([2, 2, 3, 2])
+            status_options = sorted(set(pages_df["status"].dropna().astype(str).unique().tolist()) | {focus_status})
+            selected_statuses = f1.multiselect(
+                "Status filter",
+                options=status_options,
+                default=[focus_status],
+                key=f"{key_prefix}_status_filter",
+            )
+            slow_threshold = f2.number_input(
+                "Slow threshold (sec)",
+                min_value=0,
+                max_value=600,
+                value=10,
+                step=1,
+                key=f"{key_prefix}_slow_threshold",
+            )
+            url_query = f3.text_input("URL contains", value="", key=f"{key_prefix}_url_query")
+            latest_only = f4.checkbox("Show latest activity only", value=False, key=f"{key_prefix}_latest_only")
+            visible_df = filter_page_rows(
+                pages_df,
+                selected_statuses=selected_statuses,
+                url_query=url_query,
+                slow_threshold=float(slow_threshold),
+                latest_only=bool(latest_only),
+            )
+            display_columns = page_table_columns(visible_df)
+
+            if visible_df.empty or not display_columns:
+                st.info(empty_message)
+                return
+
+            _render_paginated_df(
+                visible_df[display_columns],
+                key_prefix=key_prefix,
+                default_page_size=min(1000, len(visible_df)),
+                total_label=total_label,
+            )
+            if focus_status == "success" and bool(total > 0 and done == 0):
+                st.caption("Waiting for first page completion. Queue and worker activity are live.")
+
+        with scrape_view_tabs[0]:
+            _render_url_action_dashboard(url_action_dashboard, manifest_run_id)
+
+            c1, c2, c3, c4, c5, c6, c7 = st.columns([1, 1, 1, 1, 1, 1, 2.2])
+            concurrency = c3.number_input("Concurrency", min_value=1, max_value=16, value=4, step=1)
+            if c1.button("Start Scrape", type="primary"):
+                run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
+                st.session_state["run_id"] = run_id
+                st.session_state["last_run_by_site"][st.session_state["site_id"]] = run_id
+                _save_app_state()
+                selected_urls = _rows_to_discovered_urls(st.session_state["selected_df"].to_dict("records"))
+                if not selected_urls:
+                    st.error("No discovered URLs to scrape. Refresh sitemap URLs or add official URLs in Discover first.")
+                else:
+                    runner.start(
+                        st.session_state["site_id"],
+                        run_id,
+                        selected_urls,
+                        concurrency=int(concurrency),
+                    )
+                    st.success(f"Started scrape for {len(selected_urls):,} selected URLs.")
+                    st.rerun()
+            if c4.button("Pause Run", disabled=not st.session_state["run_id"]):
+                runner.pause(st.session_state["site_id"], st.session_state["run_id"])
+            if c5.button("Resume Run", disabled=not st.session_state["run_id"]):
+                resumed = runner.resume(
+                    st.session_state["site_id"],
+                    st.session_state["run_id"],
+                    concurrency=int(concurrency),
+                )
+                if resumed:
+                    st.success("Resumed unfinished queued/cancelled pages for this run.")
+                else:
+                    runner.unpause(st.session_state["site_id"], st.session_state["run_id"])
+            if c2.button("Cancel Run", disabled=not st.session_state["run_id"]):
+                runner.cancel(st.session_state["site_id"], st.session_state["run_id"])
+            if c6.button("Refresh", use_container_width=True):
+                st.rerun()
+            autorefresh = c7.checkbox("Auto-refresh every 1s", value=False)
+            if autorefresh and st_autorefresh is None:
+                c7.caption("Install `streamlit-autorefresh` to enable this without blocking. Use Refresh for now.")
+            st.caption(
+                f"Selected URLs: `{len(selected_url_strings):,}`   |   Active run: `{st.session_state.get('run_id') or 'none'}`"
+            )
+
+            st.subheader("Run Health")
+            if st.session_state["run_id"]:
+                k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
+                k1.metric("Total", f"{total:,}")
+                k2.metric("Queued", f"{queued:,}")
+                k3.metric("Running", f"{running_count:,}")
+                k4.metric("Success", f"{success:,}")
+                k5.metric("Failed", f"{failed:,}")
+                k6.metric("Cancelled", f"{cancelled:,}")
+                k7.metric("Pages/Min", f"{throughput:.1f}")
+                hdr1, hdr2, hdr3, hdr4 = st.columns([2, 3, 2, 2])
+                hdr1.caption(f"State: `{run_state}`")
+                hdr2.caption(f"Current URL: `{status.get('current_url') or 'pending initialization'}`")
+                hdr3.caption(f"Elapsed: `{elapsed_label}`")
+                hdr4.caption(f"ETA: `{eta_label}`")
+            else:
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Total", f"{len(selected_url_strings):,}")
+                k2.metric("Queued", f"{len(selected_url_strings):,}")
+                k3.metric("Running", "0")
+                k4.metric("State", "ready")
+                st.info(
+                    "No run yet. Select URLs and click Start Run to begin live scraping. "
+                    "This cockpit will show queue, activity, and timeline immediately."
+                )
+                if selected_url_strings:
+                    st.caption(f"Ready to scrape {len(selected_url_strings):,} selected URL(s).")
+                else:
+                    st.info("No selected URLs yet.")
+
+        with scrape_view_tabs[1]:
+            st.subheader("Scraped Pages")
+            if not st.session_state["run_id"]:
+                st.info("No run yet. Successful pages will appear here after scraping starts.")
+            else:
+                _render_focused_page_table(
+                    focus_status="success",
+                    key_prefix="scrape_success_pages",
+                    empty_message="No successful pages match the current filters.",
+                    total_label="successful/filtered page rows",
+                )
+
+        with scrape_view_tabs[2]:
+            st.subheader("Failure Repair Queue")
+            failure_queue = url_action_dashboard.get("failure_queue", [])
+            if failure_queue:
+                failure_df = pd.DataFrame(failure_queue)
+                failure_columns = [
+                    column
+                    for column in ["failure_reason", "count", "http_statuses", "recommended_action", "sample_url"]
+                    if column in failure_df.columns
+                ]
+                st.dataframe(failure_df[failure_columns], use_container_width=True, hide_index=True)
+            else:
+                st.success("No failed URLs in the latest scrape manifest.")
 
             st.subheader("Retry Failed URLs")
             if not failed_urls_current:
@@ -1739,105 +1654,24 @@ with tabs[3]:
                 else:
                     quick_retry_cols[2].caption("Tavily retry is available from Settings-enabled recovery.")
 
-            st.subheader("Running Pages")
-            if pages_df.empty:
-                st.info("Run initializing. Waiting for queue state to be published.")
+            st.subheader("Failed Pages")
+            if not st.session_state["run_id"]:
+                st.info("No run yet. Failed pages will appear here after scraping starts.")
             else:
-                pages_df["started_at"] = pd.to_datetime(pages_df.get("started_at"), errors="coerce", utc=True)
-                pages_df["finished_at"] = pd.to_datetime(pages_df.get("finished_at"), errors="coerce", utc=True)
-                pages_df["duration_sec"] = ((pages_df["finished_at"] - pages_df["started_at"]).dt.total_seconds()).round(2)
-                pages_df["duration_sec"] = pages_df["duration_sec"].fillna(0.0)
-                pages_df["status"] = pages_df.get("status", pd.Series(dtype=str)).fillna("queued").astype(str)
-                attempt_series = pages_df["attempt"] if "attempt" in pages_df.columns else pd.Series(0, index=pages_df.index)
-                pages_df["attempt"] = pd.to_numeric(attempt_series, errors="coerce").fillna(0).astype(int)
-                pages_df["updated_at"] = pages_df["finished_at"].fillna(pages_df["started_at"])
-                pages_df["updated_at_str"] = pages_df["updated_at"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-                pages_df["updated_at_str"] = pages_df["updated_at_str"].fillna("pending")
-                status_rank = {"running": 0, "failed": 1, "success": 2, "cancelled": 3, "queued": 4}
-                pages_df["status_rank"] = pages_df["status"].map(lambda s: status_rank.get(str(s).lower(), 5))
-
-                f1, f2, f3, f4 = st.columns([2, 2, 3, 2])
-                status_options = sorted(pages_df["status"].dropna().astype(str).unique().tolist())
-                default_statuses = ["running"] if "running" in status_options else []
-                selected_statuses = f1.multiselect(
-                    "Status filter",
-                    options=status_options,
-                    default=default_statuses,
-                    key="scrape_live_status_filter",
+                _render_focused_page_table(
+                    focus_status="failed",
+                    key_prefix="scrape_failed_pages",
+                    empty_message="No failed pages match the current filters.",
+                    total_label="failed/filtered page rows",
                 )
-                slow_threshold = f2.number_input("Slow threshold (sec)", min_value=0, max_value=600, value=10, step=1)
-                url_query = f3.text_input("URL contains", value="", key="scrape_live_url_query")
-                latest_only = f4.checkbox("Show latest activity only", value=False, key="scrape_live_latest_only")
 
-                visible_df = pages_df.copy()
-                if selected_statuses:
-                    visible_df = visible_df[visible_df["status"].isin(selected_statuses)]
-                if url_query.strip():
-                    visible_df = visible_df[
-                        visible_df["url"].astype(str).str.contains(url_query.strip(), case=False, na=False)
-                    ]
-                visible_df["is_slow"] = visible_df["duration_sec"] >= float(slow_threshold)
-                if latest_only:
-                    visible_df = visible_df.sort_values(
-                        ["status_rank", "updated_at"], ascending=[True, False], na_position="last"
-                    ).head(250)
-                else:
-                    visible_df = visible_df.sort_values(
-                        ["status_rank", "updated_at", "url"], ascending=[True, False, True], na_position="last"
-                    )
-
-                if visible_df.empty:
-                    st.info("No pages match the current filters.")
-                else:
-                    _render_paginated_df(
-                        visible_df[
-                            [
-                                c
-                                for c in [
-                                    "status",
-                                    "url",
-                                    "worker_id",
-                                    "fetch_mode",
-                                    "http_status",
-                                    "failure_reason",
-                                    "attempt",
-                                    "duration_sec",
-                                    "is_slow",
-                                    "updated_at_str",
-                                ]
-                                if c in visible_df.columns
-                            ]
-                        ],
-                        key_prefix="scrape_live_pages",
-                        default_page_size=100,
-                    )
-                    waiting_for_first = bool(total > 0 and done == 0)
-                    if waiting_for_first:
-                        st.caption("Waiting for first page completion. Queue and worker activity are live.")
-
-            # V1 keeps scrape focused on progress, current URL, counts, and quick retry.
-
+        if st.session_state["run_id"]:
             _schedule_live_refresh(
                 key="scrape_live_autorefresh_tick",
                 enabled=autorefresh,
                 active=run_state in {"running", "pausing", "paused", "initializing"},
                 interval_seconds=1.0,
             )
-        else:
-            st.subheader("Run Health")
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Total", f"{len(selected_url_strings):,}")
-            k2.metric("Queued", f"{len(selected_url_strings):,}")
-            k3.metric("Running", "0")
-            k4.metric("State", "ready")
-            st.info(
-                "No run yet. Select URLs and click Start Run to begin live scraping. "
-                "This cockpit will show queue, activity, and timeline immediately."
-            )
-            if selected_url_strings:
-                st.caption(f"Ready to scrape {len(selected_url_strings):,} selected URL(s).")
-            else:
-                st.info("No selected URLs yet.")
 
 if st.session_state.get("_show_legacy_cleanup_ui", False):
     cleanup_site_id = st.session_state.get("site_id", "")
@@ -2440,6 +2274,34 @@ if st.session_state.get("_show_legacy_review_ui", False):
                 else:
                     st.info("No trace events for this run yet.")
 
+with tabs[3]:
+    st.subheader("Corpus")
+    if not st.session_state.get("site_id"):
+        st.info("Select or create a site first.")
+    else:
+        corpus_site_id = st.session_state["site_id"]
+        corpus_run_id = _resolve_active_run_id(corpus_site_id, st.session_state.get("run_id", ""))
+        if corpus_run_id and corpus_run_id != st.session_state.get("run_id", ""):
+            st.session_state["run_id"] = corpus_run_id
+            st.session_state.setdefault("last_run_by_site", {})[corpus_site_id] = corpus_run_id
+
+        corpus_run_choices = [rid for rid in _site_run_ids(corpus_site_id) if _is_real_scrape_run(corpus_site_id, rid)]
+        if not corpus_run_choices:
+            st.info("No scrape-backed corpus is available yet. Run a scrape first, then build the wiki corpus from cleaned pages and document sources.")
+        else:
+            selected_corpus_run = st.selectbox(
+                "Run",
+                options=corpus_run_choices,
+                index=corpus_run_choices.index(corpus_run_id) if corpus_run_id in corpus_run_choices else len(corpus_run_choices) - 1,
+                key="corpus_run",
+                format_func=lambda run_name: f"Run {_run_human_timestamp(run_name)}",
+            )
+            render_claude_plan_section(
+                run_root=_run_root(corpus_site_id, selected_corpus_run),
+                site_url=st.session_state.get("site_url", ""),
+                run_id=selected_corpus_run,
+            )
+
 with tabs[4]:
     st.subheader("Knowledge Graph")
     if not st.session_state.get("site_id"):
@@ -2660,23 +2522,6 @@ with tabs[5]:
         st.success("Saved Tavily key")
 
     st.write("Task Providers")
-    tr1, tr2, tr3 = st.columns([1, 1.5, 1.5])
-    current_url_provider = st.session_state.get("url_reasoning_provider", "openrouter")
-    st.session_state["url_reasoning_provider"] = tr1.selectbox(
-        "URL reasoning",
-        options=["openrouter", "ollama"],
-        index=["openrouter", "ollama"].index(current_url_provider) if current_url_provider in {"openrouter", "ollama"} else 0,
-    )
-    st.session_state["url_reasoning_openrouter_model"] = tr2.text_input(
-        "URL OpenRouter model",
-        value=st.session_state.get("url_reasoning_openrouter_model")
-        or st.session_state.get("url_reasoning_model")
-        or st.session_state.get("default_or_model", "deepseek/deepseek-v4-flash"),
-    )
-    st.session_state["url_reasoning_ollama_model"] = tr3.text_input(
-        "URL Ollama model",
-        value=st.session_state.get("url_reasoning_ollama_model") or st.session_state.get("ollama_model") or "qwen2.5:3b",
-    )
 
     tg1, tg2, tg3 = st.columns([1, 1.5, 1.5])
     current_graph_provider = st.session_state.get("graph_enrichment_provider", "ollama")
