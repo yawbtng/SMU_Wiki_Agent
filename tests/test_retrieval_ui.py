@@ -15,6 +15,17 @@ def test_retrieval_tab_combines_metrics_and_mcp_readiness() -> None:
     assert "Index Health" in retrieval
     assert "Chunk quality" in retrieval
     assert "ready_for_retrieval" in retrieval
+    assert "from src.scrape_planner.ui_preview_quality import" in app
+    assert "build_chunk_quality_summary" in app
+    assert (
+        'chunk_rows = _read_jsonl_rows(layout.site_root / "sources" / "pdf_ingest" / "pdf_chunks.jsonl")'
+        in retrieval
+    )
+    assert "build_chunk_quality_summary(row for row in chunk_rows if isinstance(row, dict))" in retrieval
+    assert '"Blocked"' in retrieval
+    assert "Chunk quality is unknown" in retrieval
+    assert "Corpus Content Inspector" in retrieval
+    assert '"Unknown"' not in retrieval
     assert "MCP readiness" in retrieval
     assert "Server command" in retrieval
     assert "Operator Details" in retrieval

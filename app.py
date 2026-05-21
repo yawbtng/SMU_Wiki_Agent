@@ -2144,7 +2144,7 @@ with tabs[5]:
 
         st.markdown("### Chunk quality")
         quality_state_label = (
-            "Unknown"
+            "Blocked"
             if retrieval_quality_summary.total == 0
             else ("Ready" if retrieval_quality_summary.ready_for_retrieval else "Needs review")
         )
@@ -2161,7 +2161,9 @@ with tabs[5]:
             ),
             status_label=quality_state_label,
             tone="ready" if retrieval_quality_summary.ready_for_retrieval else "warning",
-            action_label="Content Inspector" if not retrieval_quality_summary.ready_for_retrieval else "Query retrieval",
+            action_label=(
+                "Corpus Content Inspector" if not retrieval_quality_summary.ready_for_retrieval else "Query retrieval"
+            ),
         )
         render_metric_strip(
             [
