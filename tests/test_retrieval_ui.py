@@ -12,6 +12,9 @@ def test_retrieval_tab_combines_metrics_and_mcp_readiness() -> None:
 
     assert 'st.subheader("Retrieval")' in retrieval
     assert "Scrape Analytics Charts" in retrieval
+    assert 'key="retrieval_load_run_metrics"' in retrieval
+    assert retrieval.index('key="retrieval_load_run_metrics"') < retrieval.index("Scrape Analytics Charts")
+    assert retrieval.index('key="retrieval_load_run_metrics"') < retrieval.index("_load_run_analytics_inputs")
     assert "Index Health" in retrieval
     assert "Chunk quality" in retrieval
     assert "ready_for_retrieval" in retrieval

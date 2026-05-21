@@ -13,6 +13,8 @@ def test_scraped_page_preview_route_has_real_content_contract() -> None:
     assert "scraped_page" in source
     assert "page_slug" in source
     assert "Back to Runs" in source or "Back to Corpus" in source or "st.page_link" in source
+    assert 'st.button("Back to Runs")' in source
+    assert "st.query_params.clear()" in source
     assert "Source URL" in source
     assert "Extracted content" in source or "Markdown preview" in source
     assert "Scraped page preview" in source

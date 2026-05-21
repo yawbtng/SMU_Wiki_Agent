@@ -839,7 +839,9 @@ def _render_scraped_page_preview() -> None:
     slug = str(st.query_params.get("page_slug", "") or "").strip()
 
     st.subheader("Scraped page preview")
-    st.link_button("Back to Runs", "./")
+    if st.button("Back to Runs"):
+        st.query_params.clear()
+        st.rerun()
     if not site_id or not run_id or not slug:
         st.error("Preview link is missing site, run, or page information.")
         render_operator_details(
@@ -2409,7 +2411,9 @@ with tabs[5]:
                         st.info("HTML graph view will appear after build.")
     st.divider()
     st.markdown("### Run Metrics")
-    if not st.session_state.get("site_id"):
+    if not st.toggle("Load detailed run metrics", value=False, key="retrieval_load_run_metrics"):
+        st.info("Detailed run analytics are available on demand so retrieval readiness and Settings stay responsive.")
+    elif not st.session_state.get("site_id"):
         st.info("Select or create a site first.")
     else:
         site_root = DATA_ROOT / "sites" / st.session_state["site_id"]
