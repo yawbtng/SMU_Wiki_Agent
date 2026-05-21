@@ -7,25 +7,32 @@ APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
 NAV_PATH = Path(__file__).resolve().parents[1] / "src" / "scrape_planner" / "ui_navigation.py"
 
 
-def _choose_tab_source() -> str:
+def _sources_tab_source() -> str:
     text = APP_PATH.read_text(encoding="utf-8")
-    start = text.index("with tabs[2]:")
-    end = text.index("with tabs[3]:", start)
+    start = text.index("with tabs[1]:")
+    end = text.index("with tabs[2]:", start)
     return text[start:end]
 
 
-def test_choose_tab_is_pdf_sources_not_url_selection() -> None:
+def _corpus_tab_source() -> str:
+    text = APP_PATH.read_text(encoding="utf-8")
+    start = text.index("with tabs[3]:")
+    end = text.index("with tabs[4]:", start)
+    return text[start:end]
+
+
+def test_sources_tab_keeps_pdf_sources_not_url_selection() -> None:
     app_source = APP_PATH.read_text(encoding="utf-8")
-    source = _choose_tab_source()
+    source = _sources_tab_source()
     navigation_source = NAV_PATH.read_text(encoding="utf-8")
 
-    assert '"PDF Sources"' in navigation_source
+    assert '"Sources"' in navigation_source
     assert '"Choose URLs"' not in navigation_source
     assert "Choose URLs" not in app_source
     assert "Run LLM Choose URLs" not in app_source
-    assert 'st.subheader("PDF Sources")' in source
-    assert "Add PDFs for embedding" in source
-    assert "Ready for Docling parsing and Zvec embedding." in source
+    assert '"Documents"' in source
+    assert "Upload PDFs" in source
+    assert "Extract / Re-extract PDFs" in source
 
     removed_url_selection_copy = [
         "Choose URLs",
@@ -42,3 +49,27 @@ def test_choose_tab_is_pdf_sources_not_url_selection() -> None:
     ]
     for old_copy in removed_url_selection_copy:
         assert old_copy not in source
+
+
+def test_sources_tab_uses_lightweight_page_preview_controls() -> None:
+    source = _corpus_tab_source()
+
+    assert '"PDF extraction details"' in source
+    assert '"Page-by-page markdown"' in source
+    source = _sources_tab_source()
+
+    assert '"Page number"' not in source
+    assert '"Load preview"' not in source
+    assert 'st.number_input(' not in source
+    assert 'Click a path to preview:' not in source
+    assert 'st.button(markdown_path, key=f"open_pdf_md_preview_{idx}"' not in source
+    assert '"Preview page"' not in source
+
+
+def test_pdf_extract_actions_handle_missing_docling_without_crashing() -> None:
+    app_source = APP_PATH.read_text(encoding="utf-8")
+
+    assert "PdfParserUnavailableError" in app_source
+    assert "def _render_pdf_parser_unavailable_error(" in app_source
+    assert "PDF extraction is unavailable until Docling is installed." in app_source
+    assert 'Install `requirements-pdf.txt` in this environment' in app_source
