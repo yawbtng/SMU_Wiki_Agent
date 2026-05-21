@@ -54,7 +54,7 @@ def build_operator_run_status(
             state_label="Paused",
             primary_action="Resume run",
             attention_level="warning",
-            message="This run is not actively scraping. Resume it to continue from saved progress.",
+            message="This run is paused in the UI. Resume it to continue from saved progress.",
             done=done,
             total=total,
             running=0,

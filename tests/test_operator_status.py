@@ -21,7 +21,8 @@ def test_stale_running_status_becomes_paused_when_no_live_runner_exists() -> Non
     assert status.state_label == "Paused"
     assert status.primary_action == "Resume run"
     assert status.attention_level == "warning"
-    assert "not actively scraping" in status.message
+    assert status.message == "This run is paused in the UI. Resume it to continue from saved progress."
+    assert "not actively scraping" not in status.message
 
 
 def test_active_running_status_stays_running_when_live_runner_exists() -> None:
