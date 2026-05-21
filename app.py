@@ -2048,6 +2048,14 @@ with tabs[4]:
         raw_status = _raw_source_status(layout)
         raw_sources_ready = _raw_sources_ready(raw_status)
         wiki_status = _load_wiki_status(layout, raw_status)
+        wiki_tone = "ready" if _wiki_ready(wiki_status) else "warning"
+        render_status_band(
+            title="Wiki build",
+            subtitle="Build grounded pages from prepared corpus sources.",
+            status_label=str(wiki_status["job_status"]).replace("-", " ").title(),
+            tone=wiki_tone,
+            action_label="Build wiki" if raw_sources_ready else "Prepare corpus",
+        )
 
         if not raw_sources_ready:
             st.warning("Missing prerequisite: normalize raw data sources before building the LLM Wiki.")
@@ -2056,9 +2064,16 @@ with tabs[4]:
         if build_col.button("Build LLM Wiki", type="primary", disabled=not raw_sources_ready, key="build_llm_wiki"):
             launch_result = launch_wiki_builder(layout.site_root, runner=tmux_runner, resume=True, runtime="pi")
             if launch_result.get("ok"):
-                st.success(f"Started tmux session `{launch_result['session_name']}`.")
-                st.caption(f"Report path: `{launch_result['report_path']}`")
+                st.success("Started wiki build.")
                 st.caption(f"Runtime: `{launch_result.get('runtime', 'python')}`")
+                render_operator_details(
+                    "Operator Details",
+                    {
+                        "tmux_session": launch_result["session_name"],
+                        "report_path": launch_result["report_path"],
+                        "runtime": launch_result.get("runtime", "python"),
+                    },
+                )
             else:
                 st.error(launch_result.get("error") or "Failed to start LLM Wiki builder.")
         if refresh_col.button("Refresh Wiki Status", key="refresh_llm_wiki_status"):
@@ -2069,12 +2084,18 @@ with tabs[4]:
         w2.metric("Pages Created", f"{wiki_status['pages_created']:,}")
         w3.metric("Pages Updated", f"{wiki_status['pages_updated']:,}")
         w4.metric("Review Queue", f"{wiki_status['review_queue_count']:,}")
-        st.caption(f"tmux session: `{wiki_status['tmux_session']}`")
-        st.caption(f"Log path: `{wiki_status['log_path']}`")
         st.caption(f"Last progress update: `{wiki_status['last_progress'] or 'not reported'}`")
-        st.caption(f"Wiki index: `{wiki_status['index_path']}`")
-        st.caption(f"Review queue: `{wiki_status['review_queue_path']}`")
         st.metric("Integrated Sources", f"{wiki_status['integrated_sources']:,}")
+        render_operator_details(
+            "Operator Details",
+            {
+                "tmux_session": wiki_status["tmux_session"],
+                "log_path": wiki_status["log_path"],
+                "index_path": wiki_status["index_path"],
+                "review_queue_path": wiki_status["review_queue_path"],
+                "latest_report_path": wiki_status.get("latest_report_path") or "",
+            },
+        )
 
         live_col1, live_col2 = st.columns([1, 1.2])
         live_logs = live_col1.checkbox("Auto-refresh live logs (1s)", value=False, key="wiki_live_logs_autorefresh")
@@ -2088,7 +2109,7 @@ with tabs[4]:
 
         wiki_log_text = _tail_text(Path(wiki_status["log_path"]), max_lines=120)
         tmux_text = tmux_runner.capture(str(wiki_status["tmux_session"]), lines=120) if show_tmux else ""
-        with st.expander("Live wiki build logs", expanded=True):
+        with st.expander("Live wiki build logs", expanded=False):
             st.caption("Streaming latest wiki log and tmux pane output.")
             st.markdown("**wiki/log.md (tail)**")
             st.code(wiki_log_text or "(no wiki log yet)", language="text")
@@ -2098,7 +2119,6 @@ with tabs[4]:
 
         latest_report_path = wiki_status.get("latest_report_path")
         if latest_report_path:
-            st.caption(f"Latest wiki report: `{latest_report_path}`")
             with st.expander("Latest wiki report", expanded=False):
                 st.json(wiki_status.get("latest_report") or {})
         else:
