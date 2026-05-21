@@ -14,6 +14,7 @@ import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
@@ -21,17 +22,23 @@ except Exception:
 
 from src.scrape_planner.failure_classifier import classify_failure
 from src.scrape_planner.markdown_graph import (
+    answer_context as graph_answer_context,
     build_graph as build_markdown_graph,
     discover_raw_markdown_files,
+    get_unit_pages as graph_get_unit_pages,
     graph_stats as load_graph_stats,
     knowledge_graph_dir,
     list_units as graph_list_units,
     load_edges as load_graph_edges,
+    load_page_nodes as load_graph_page_nodes,
     load_tags as load_graph_tags,
     orphan_pages as load_graph_orphan_pages,
     pages_without_unit_tags as load_pages_without_unit_tags,
     rebuild_query_index as rebuild_graph_query_index,
     run_graphify_enrichment_for_unit,
+    search_pages as graph_search_pages,
+    shortest_path as graph_shortest_path,
+    traverse_from_page as graph_traverse_from_page,
     unit_distribution as load_unit_distribution,
 )
 from src.scrape_planner.models import DiscoveredURL
@@ -1528,7 +1535,182 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Runs")
-    st.info("Run controls and live scrape activity are preserved under Sources for this pass. Run metrics are available under Retrieval.")
+    runs_site_id = st.session_state.get("site_id", "")
+    runs_selected_url_strings = _selected_url_strings_from_state()
+    st.markdown("Current Run")
+    if not runs_site_id:
+        st.info("Create or open a workspace first.")
+    else:
+        runs_cols = st.columns([1, 1, 1, 1])
+        runs_settings = st.columns([1, 1, 2])
+        runs_concurrency = runs_settings[0].number_input(
+            "Concurrency",
+            min_value=1,
+            max_value=16,
+            value=int(st.session_state.get("scrape_concurrency", 10)),
+            step=1,
+            key="runs_scrape_concurrency",
+        )
+        st.session_state["scrape_concurrency"] = int(runs_concurrency)
+        if runs_cols[0].button("Start New Scrape", type="primary", key="runs_start_new_scrape"):
+            selected_urls = _rows_to_discovered_urls(st.session_state["selected_df"].to_dict("records"))
+            selected_urls = [
+                item
+                for item in selected_urls
+                if (urlparse(item.url.strip()).scheme in {"http", "https"} and urlparse(item.url.strip()).netloc)
+            ]
+            if not selected_urls:
+                st.session_state["scrape_status_message"] = "No URLs selected. Add selected URLs before starting a scrape."
+                st.error("No URLs selected. Add selected URLs before starting a scrape.")
+            else:
+                run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
+                st.session_state["run_id"] = run_id
+                st.session_state["last_run_by_site"][runs_site_id] = run_id
+                _save_app_state()
+                st.session_state["scrape_status_message"] = "Starting new scrape run..."
+                with st.spinner("Starting new scrape run..."):
+                    runner.start(
+                        runs_site_id,
+                        run_id,
+                        selected_urls,
+                        concurrency=int(runs_concurrency),
+                        browser_mode=st.session_state.get("scrape_browser_mode", "none"),
+                        lightpanda_cdp_url=st.session_state.get("lightpanda_cdp_url", ""),
+                    )
+                st.session_state["scrape_status_message"] = f"Started scrape for {len(selected_urls):,} selected URLs."
+                st.success(f"Started scrape for {len(selected_urls):,} selected URLs.")
+                st.rerun()
+        if runs_cols[1].button("Resume", disabled=not st.session_state["run_id"], key="runs_resume_scrape"):
+            live_run = runner.has_live_run(runs_site_id, st.session_state["run_id"])
+            resumed = runner.resume(
+                runs_site_id,
+                st.session_state["run_id"],
+                concurrency=int(runs_concurrency),
+                browser_mode=st.session_state.get("scrape_browser_mode", "none"),
+                lightpanda_cdp_url=st.session_state.get("lightpanda_cdp_url", ""),
+            )
+            if not resumed and live_run:
+                runner.unpause(runs_site_id, st.session_state["run_id"])
+                st.session_state["scrape_status_message"] = "Continuing paused in-memory run..."
+            elif resumed:
+                st.session_state["scrape_status_message"] = "Resuming saved run from disk state..."
+            else:
+                st.session_state["scrape_status_message"] = "No resumable pages were found for this run."
+            st.rerun()
+        if runs_cols[2].button("Pause", disabled=not st.session_state["run_id"], key="runs_pause_scrape"):
+            runner.pause(runs_site_id, st.session_state["run_id"])
+            st.session_state["scrape_status_message"] = "Pausing after in-flight pages finish..."
+            st.rerun()
+        if runs_cols[3].button("Cancel", disabled=not st.session_state["run_id"], key="runs_cancel_scrape"):
+            runner.cancel(runs_site_id, st.session_state["run_id"])
+            st.session_state["scrape_status_message"] = "Cancel requested. Stopping after in-flight pages finish..."
+            st.rerun()
+        if runs_settings[1].button("Refresh", use_container_width=True, key="runs_refresh"):
+            st.rerun()
+        runs_autorefresh = runs_settings[2].checkbox("Auto-refresh every 1s", value=False, key="runs_autorefresh")
+        if runs_autorefresh and st_autorefresh is None:
+            runs_settings[2].caption("Install `streamlit-autorefresh` to enable this without blocking. Use Refresh for now.")
+        st.caption(
+            f"Selected URLs: `{len(runs_selected_url_strings):,}`   |   Active run: `{st.session_state.get('run_id') or 'none'}`"
+        )
+
+        if st.session_state["run_id"]:
+            runs_status, runs_pages, _runs_events = _load_scrape_runtime(runs_site_id, st.session_state["run_id"], max_events=1500)
+            runs_status = runs_status or {}
+            runs_pages = runs_pages if isinstance(runs_pages, list) else []
+            runs_summary = derive_run_summary(
+                status=runs_status,
+                pages=runs_pages,
+                selected_count=len(runs_selected_url_strings),
+            )
+            runs_status_stale = runs_summary.state in {"running", "pausing", "initializing"} and not runner.has_live_run(
+                runs_site_id,
+                st.session_state["run_id"],
+            )
+            if runs_status_stale:
+                runs_status["state"] = "stopped"
+                runs_summary = derive_run_summary(
+                    status=runs_status,
+                    pages=runs_pages,
+                    selected_count=len(runs_selected_url_strings),
+                )
+            runs_message = st.session_state.get("scrape_status_message")
+            if runs_message and runs_summary.state not in {"completed", "cancelled", "failed"}:
+                st.status(runs_message, state="running", expanded=False)
+            progress_total = runs_summary.total if runs_summary.total > 0 else 1
+            progress_done = min(runs_summary.success + runs_summary.failed, progress_total)
+            st.progress(progress_done / progress_total, text=runs_summary.progress_label)
+            r1, r2, r3, r4, r5 = st.columns(5)
+            r1.metric("State", runs_summary.state)
+            r2.metric("Success", f"{runs_summary.success:,}")
+            r3.metric("Failed", f"{runs_summary.failed:,}")
+            r4.metric("Remaining", f"{runs_summary.remaining:,}")
+            r5.metric("Running", f"{runs_summary.running:,}")
+            if runs_status_stale:
+                st.warning("This run is not actively scraping right now. Click Resume to continue from the saved disk state.")
+
+            with st.expander("Scrape activity details", expanded=True):
+                st.caption(f"Current URL: `{runs_status.get('current_url') or 'pending initialization'}`")
+                st.caption("Current activity")
+                running_pages = latest_pages_by_status(runs_pages, "running", limit=8)
+                if running_pages:
+                    running_df = pd.DataFrame(running_pages)
+                    st.dataframe(
+                        running_df[[c for c in ["url", "worker_id", "fetch_mode", "attempt", "started_at"] if c in running_df.columns]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.info("No pages are running right now. The queue may be waiting, paused, or already complete.")
+
+                st.caption("Recently scraped")
+                successful_pages = latest_pages_by_status(runs_pages, "success", limit=10)
+                if successful_pages:
+                    preview_links = []
+                    for row in successful_pages:
+                        url = str(row.get("url") or "")
+                        href = build_scraped_page_preview_href(
+                            site_id=runs_site_id,
+                            run_id=st.session_state["run_id"],
+                            url=url,
+                        )
+                        preview_links.append(
+                            f'<a href="{escape(href, quote=True)}" target="_blank">Open preview</a> '
+                            f'<span>{escape(url)}</span>'
+                        )
+                    st.markdown("<br>".join(preview_links), unsafe_allow_html=True)
+                else:
+                    st.info("Successful pages will appear here as soon as markdown is saved.")
+
+                st.caption("Current failures")
+                failed_pages = latest_pages_by_status(runs_pages, "failed", limit=10)
+                if failed_pages:
+                    failed_df = pd.DataFrame(failed_pages)
+                    st.dataframe(
+                        failed_df[[c for c in ["url", "failure_reason", "http_status", "attempt", "finished_at"] if c in failed_df.columns]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.info("No failed pages in this run yet.")
+
+            _schedule_live_refresh(
+                key="runs_live_autorefresh_tick",
+                enabled=runs_autorefresh,
+                active=runs_summary.state in {"running", "pausing", "paused", "initializing"},
+                interval_seconds=1.0,
+            )
+        else:
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Total", f"{len(runs_selected_url_strings):,}")
+            r2.metric("Queued", f"{len(runs_selected_url_strings):,}")
+            r3.metric("Running", "0")
+            r4.metric("State", "ready")
+            st.progress(0.0, text="No active run")
+            if runs_selected_url_strings:
+                st.info(f"Ready to scrape {len(runs_selected_url_strings):,} selected URL(s).")
+            else:
+                st.info("No selected URLs yet.")
 
 with tabs[3]:
     st.subheader("Corpus")
@@ -1872,6 +2054,195 @@ with tabs[5]:
                 st.json(embedding_status.get("latest_report") or {})
         else:
             st.info("Embedding and reranker reports will appear under `indexes/` after the index build runs.")
+    st.divider()
+    st.markdown("### Knowledge Graph")
+    site_id = st.session_state.get("site_id", "")
+    if not site_id:
+        st.info("Select or create a site first.")
+    else:
+        site_root = DATA_ROOT / "sites" / site_id
+        graph_run_choices = sorted([d.name for d in site_root.iterdir() if d.is_dir() and d.name != "meta"]) if site_root.exists() else []
+        graph_real_runs = [name for name in graph_run_choices if _is_real_scrape_run(site_id, name)]
+        if not graph_real_runs:
+            st.info("No raw markdown run is available yet. Scrape pages first, then build the graph.")
+        else:
+            latest_graph_run = graph_real_runs[-1]
+            current_graph_run = st.session_state.get("graph_run", "")
+            selected_graph_run = current_graph_run if current_graph_run in graph_real_runs else latest_graph_run
+            selected_graph_index = graph_real_runs.index(selected_graph_run)
+            graph_run = st.selectbox(
+                "Graph run",
+                options=graph_real_runs,
+                index=selected_graph_index,
+                key="graph_run",
+                format_func=lambda run_name: f"Run {_run_human_timestamp(run_name)}",
+            )
+            graph_run_root = site_root / graph_run
+            graph_dir = knowledge_graph_dir(graph_run_root)
+            stats = load_graph_stats(graph_run_root)
+            raw_files = discover_raw_markdown_files(graph_run_root)
+            raw_count = len(raw_files)
+            page_count = int(stats.get("page_nodes") or 0)
+            unit_count = int(stats.get("unit_nodes") or 0)
+            edge_count = int(stats.get("edges") or 0)
+            status_label = "ready" if stats.get("status") == "ready" else "missing"
+            if stats.get("counts_match") is False:
+                status_label = "count mismatch"
+
+            g1, g2, g3, g4, g5 = st.columns([1, 1, 1, 1, 1.4])
+            g1.metric("Raw Files", f"{raw_count:,}")
+            g2.metric("Page Nodes", f"{page_count:,}")
+            g3.metric("Units", f"{unit_count:,}")
+            g4.metric("Edges", f"{edge_count:,}")
+            g5.metric("Graph Status", status_label)
+            st.caption(f"Primary retrieval graph: `{graph_dir / 'graph.json'}`")
+
+            b1, b2, b3, b4 = st.columns([1.4, 1.6, 1.2, 2.8])
+            if b1.button("Build Deterministic Graph", type="primary", key="build_deterministic_kg"):
+                try:
+                    graph = build_markdown_graph(graph_run_root, site_id, graph_run)
+                    st.success(
+                        f"Built graph with {graph['counts']['page_nodes']:,} page nodes and {graph['counts']['edges']:,} edges."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Graph build failed: {exc}")
+
+            selected_unit_for_enrich = b2.selectbox(
+                "Semantic enrichment unit",
+                options=[row.get("unit_key") for row in graph_list_units(graph_run_root) if row.get("page_count", 0) > 0] or [""],
+                help="Optional bounded enrichment merged into knowledge_graph/graph.json. Deterministic graph does not require it.",
+                key="semantic_enrichment_unit",
+            )
+            if b3.button("Rebuild Query Index", disabled=stats.get("status") != "ready", key="rebuild_kg_query_index"):
+                try:
+                    st.json(rebuild_graph_query_index(graph_run_root))
+                except Exception as exc:
+                    st.error(f"Query index rebuild failed: {exc}")
+            b4.caption(
+                "Use Build Deterministic Graph for the real retrieval graph. Optional semantic enrichment can add concept edges after the deterministic build."
+            )
+            if st.button(
+                "Run Semantic Enrichment for Selected Unit",
+                disabled=stats.get("status") != "ready" or not selected_unit_for_enrich,
+                key="run_semantic_enrichment_unit",
+            ):
+                try:
+                    st.json(run_graphify_enrichment_for_unit(graph_run_root, str(selected_unit_for_enrich)))
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Semantic enrichment failed: {exc}")
+
+            if stats.get("status") != "ready":
+                st.info("Build the deterministic graph to enable inspection and retrieval controls.")
+            else:
+                dist = load_unit_distribution(graph_run_root)
+                no_unit = load_pages_without_unit_tags(graph_run_root)
+                orphaned = load_graph_orphan_pages(graph_run_root)
+                tags = load_graph_tags(graph_run_root)
+                edges = load_graph_edges(graph_run_root)
+                pages = load_graph_page_nodes(graph_run_root)
+
+                st.caption("Coverage")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Tagged Pages", f"{len({t.get('page_id') for t in tags}):,}")
+                c2.metric("Pages Without Unit", f"{len(no_unit):,}")
+                c3.metric("Orphan Pages", f"{len(orphaned):,}")
+                c4.metric("Graph Count Match", "yes" if stats.get("counts_match") else "no")
+
+                left, right = st.columns([1.2, 1])
+                with left:
+                    st.caption("Unit Distribution")
+                    if dist:
+                        st.dataframe(pd.DataFrame(dist), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No unit tags found.")
+                with right:
+                    st.caption("Edge Types")
+                    edge_counts = pd.DataFrame(
+                        [{"type": key, "count": val} for key, val in Counter([edge.get("type") for edge in edges]).items()]
+                    ).sort_values("count", ascending=False)
+                    st.dataframe(edge_counts, use_container_width=True, hide_index=True)
+
+                with st.expander("Pages without unit tags", expanded=False):
+                    if no_unit:
+                        st.dataframe(
+                            pd.DataFrame(no_unit)[[c for c in ["id", "title", "source_url", "path"] if c in no_unit[0]]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.success("Every page has at least one unit tag.")
+                with st.expander("Orphan pages and isolated nodes", expanded=False):
+                    if orphaned:
+                        st.dataframe(
+                            pd.DataFrame(orphaned)[[c for c in ["id", "title", "source_url", "path"] if c in orphaned[0]]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.success("No orphan pages.")
+
+                inspect_tabs = st.tabs(["Query", "Path", "Explain", "Knowledge Graph HTML"])
+                with inspect_tabs[0]:
+                    st.markdown("#### Ask the markdown graph")
+                    unit_options = [""] + [str(row.get("unit_key")) for row in graph_list_units(graph_run_root) if row.get("page_count", 0) > 0]
+                    graph_query = st.text_area(
+                        "Ask a question",
+                        value="I-20 international students",
+                        height=90,
+                        key="kg_query",
+                        help="This queries the deterministic raw-markdown graph and returns source markdown evidence for the LLM.",
+                    )
+                    q1, q2, q3 = st.columns([1.6, 1, 1])
+                    graph_unit = q1.selectbox("Unit filter", options=unit_options, index=0, key="kg_query_unit")
+                    graph_limit = int(q2.number_input("Page result limit", min_value=1, max_value=50, value=10, key="kg_query_limit"))
+                    context_budget = int(q3.number_input("Evidence budget", min_value=1000, max_value=50000, value=12000, step=1000, key="kg_context_budget"))
+                    ask_col, search_col = st.columns([1, 1])
+                    ask_clicked = ask_col.button("Ask Graph / Get Evidence", type="primary", key="kg_build_context")
+                    search_clicked = search_col.button("Search Matching Pages", key="kg_search_pages")
+                    if ask_clicked:
+                        context = graph_answer_context(graph_run_root, graph_query, unit=graph_unit or None, budget_chars=context_budget)
+                        st.success(f"Found {len(context.get('evidence', []))} evidence item(s), {context.get('used_chars', 0)} chars.")
+                        for item in context.get("evidence", []):
+                            with st.container(border=True):
+                                st.markdown(f"**{item.get('title') or item.get('page_id')}**")
+                                st.caption(f"{item.get('source_url')} | `{item.get('path')}`")
+                                st.code(item.get("markdown_excerpt", ""), language="markdown")
+                        with st.expander("Raw MCP-style answer_context payload", expanded=False):
+                            st.json({k: v for k, v in context.items() if k != "evidence"})
+                    if search_clicked:
+                        results = graph_search_pages(graph_run_root, graph_query, unit=graph_unit or None, limit=graph_limit)
+                        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+                with inspect_tabs[1]:
+                    page_options = [page.get("id") for page in pages if page.get("id")]
+                    safe_page_options = page_options or [""]
+                    p1, p2, p3 = st.columns([1.5, 1.5, 1])
+                    from_page = p1.selectbox("From page", options=safe_page_options, index=0, key="kg_path_from")
+                    to_page = p2.selectbox("To page", options=safe_page_options, index=min(1, len(safe_page_options) - 1), key="kg_path_to")
+                    depth = int(p3.number_input("Depth", min_value=1, max_value=4, value=1, key="kg_traverse_depth"))
+                    if st.button("Traverse From Page", disabled=not from_page, key="kg_traverse"):
+                        st.json(graph_traverse_from_page(graph_run_root, str(from_page), depth=depth))
+                    if st.button("Shortest Path", disabled=not from_page or not to_page, key="kg_shortest_path"):
+                        st.json(graph_shortest_path(graph_run_root, str(from_page), str(to_page)))
+                with inspect_tabs[2]:
+                    selected_unit = st.selectbox("Unit pages", options=unit_options, key="kg_explain_unit")
+                    if selected_unit:
+                        rows = graph_get_unit_pages(graph_run_root, selected_unit, limit=200)
+                        st.dataframe(
+                            pd.DataFrame(rows)[[c for c in ["id", "title", "source_url", "path"] if rows and c in rows[0]]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    with st.expander("Build status JSON", expanded=False):
+                        st.json(read_json(graph_dir / "build_status.json", {}))
+                with inspect_tabs[3]:
+                    graph_html = graph_dir / "graph.html"
+                    if graph_html.exists():
+                        st.caption(f"Rendered from `{graph_html}`. This is the deterministic knowledge graph summary.")
+                        components.html(graph_html.read_text(encoding="utf-8", errors="replace"), height=650, scrolling=True)
+                    else:
+                        st.info("HTML graph view will appear after build.")
     st.divider()
     st.markdown("### Run Metrics")
     if not st.session_state.get("site_id"):
