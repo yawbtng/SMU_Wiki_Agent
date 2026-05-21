@@ -74,6 +74,32 @@ def build_operator_run_status(
             failed=failed,
             queued=queued,
         )
+    if normalized == "initializing":
+        return OperatorRunStatus(
+            state="initializing",
+            state_label="Initializing",
+            primary_action="Monitor startup",
+            attention_level="active",
+            message="Scrape startup is preparing workers before queued sources begin processing.",
+            done=done,
+            total=total,
+            running=running,
+            failed=failed,
+            queued=queued,
+        )
+    if normalized == "pausing":
+        return OperatorRunStatus(
+            state="pausing",
+            state_label="Pausing",
+            primary_action="Monitor run",
+            attention_level="warning",
+            message="Pause is in progress. Monitor the run until workers finish their current pages.",
+            done=done,
+            total=total,
+            running=running,
+            failed=failed,
+            queued=queued,
+        )
     if normalized in {"completed", "complete"}:
         return OperatorRunStatus(
             state="completed",

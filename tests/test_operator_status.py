@@ -41,6 +41,44 @@ def test_active_running_status_stays_running_when_live_runner_exists() -> None:
     assert status.attention_level == "active"
 
 
+def test_live_initializing_status_reports_startup_in_progress() -> None:
+    status = build_operator_run_status(
+        state="initializing",
+        done=0,
+        total=25376,
+        running=0,
+        failed=0,
+        queued=25376,
+        has_live_runner=True,
+    )
+
+    assert status.state == "initializing"
+    assert status.state_label == "Initializing"
+    assert status.attention_level == "active"
+    assert status.primary_action in {"Monitor run", "Monitor startup"}
+    assert status.primary_action != "Start run"
+    assert any(term in status.message.lower() for term in ("workers", "startup", "preparing"))
+
+
+def test_live_pausing_status_reports_pause_in_progress() -> None:
+    status = build_operator_run_status(
+        state="pausing",
+        done=18725,
+        total=25376,
+        running=2,
+        failed=1341,
+        queued=6651,
+        has_live_runner=True,
+    )
+
+    assert status.state == "pausing"
+    assert status.state_label == "Pausing"
+    assert status.attention_level in {"warning", "active"}
+    assert status.primary_action == "Monitor run"
+    assert status.primary_action != "Start run"
+    assert "pause" in status.message.lower()
+
+
 def test_pdf_extraction_counts_promote_real_progress_even_without_registry() -> None:
     status = build_operator_source_status(
         selected_url_count=25379,
