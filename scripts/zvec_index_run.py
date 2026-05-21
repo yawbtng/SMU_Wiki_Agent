@@ -11,13 +11,6 @@ from typing import Any
 import requests
 
 
-def _read_json(path: Path, default: Any) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     try:
@@ -68,21 +61,8 @@ def _chunks(text: str, *, chunk_chars: int = 1800, overlap: int = 200) -> list[s
     return chunks
 
 
-def _load_cleaned_docs(run_root: Path) -> list[dict[str, str]]:
-    manifest = _read_json(run_root / "cleanup_manifest.json", [])
+def _load_wiki_docs(run_root: Path) -> list[dict[str, str]]:
     docs: list[dict[str, str]] = []
-    for row in manifest if isinstance(manifest, list) else []:
-        if not isinstance(row, dict) or row.get("status") != "cleaned":
-            continue
-        path = Path(str(row.get("cleaned_markdown_path") or ""))
-        if not path.exists():
-            continue
-        docs.append({
-            "url": str(row.get("url") or ""),
-            "title": str(row.get("title") or path.stem),
-            "path": str(path),
-            "text": path.read_text(encoding="utf-8", errors="replace"),
-        })
     wiki_root = run_root / "wiki"
     if wiki_root.exists():
         for path in sorted(wiki_root.rglob("*.md")):
@@ -115,7 +95,7 @@ def _load_pdf_chunk_docs(run_root: Path) -> list[dict[str, str]]:
 
 
 def _load_docs_for_indexing(run_root: Path) -> list[dict[str, str]]:
-    return _load_cleaned_docs(run_root) + _load_pdf_chunk_docs(run_root)
+    return _load_wiki_docs(run_root) + _load_pdf_chunk_docs(run_root)
 
 
 def _create_schema(zvec: Any, *, dimension: int) -> Any:
@@ -139,7 +119,7 @@ def _create_schema(zvec: Any, *, dimension: int) -> Any:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Index cleaned run/wiki markdown into Zvec with Ollama embeddings.")
+    parser = argparse.ArgumentParser(description="Index wiki markdown and PDF chunks into Zvec with Ollama embeddings.")
     parser.add_argument("run_root", type=Path)
     parser.add_argument("--db", type=Path, default=None)
     parser.add_argument("--model", default="nomic-embed-text:latest")
@@ -156,7 +136,7 @@ def main() -> None:
     db_path = (args.db or (run_root / "zvec_index")).resolve()
     docs = _load_docs_for_indexing(run_root)
     if not docs:
-        raise SystemExit(f"No cleaned markdown/wiki docs found under {run_root}")
+        raise SystemExit(f"No wiki markdown or PDF chunks found under {run_root}")
 
     first_text = docs[0]["text"][: args.chunk_chars]
     first_embedding = _ollama_embed(first_text, model=args.model, base_url=args.ollama)

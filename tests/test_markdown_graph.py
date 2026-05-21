@@ -111,7 +111,7 @@ def test_url_title_and_content_unit_tagging() -> None:
 
 def test_edge_creation_and_artifact_roundtrip(tmp_path: Path) -> None:
     run_root, site_id, run_id = _write_fixture_run(tmp_path)
-    build_graph(run_root, site_id, run_id)
+    graph = build_graph(run_root, site_id, run_id)
 
     stats = graph_stats(run_root)
     edges = load_edges(run_root)
@@ -123,7 +123,11 @@ def test_edge_creation_and_artifact_roundtrip(tmp_path: Path) -> None:
     assert any(edge["type"] == "page_links_to_page" for edge in edges)
     assert any(edge["type"] == "source_url" for edge in edges)
     assert tags
+    assert graph["counts"]["dynamic_profile_units"] > 0
+    assert any(edge["type"] == "unit_has_child" for edge in edges)
+    assert any(str(tag["unit_key"]).startswith("root-lyle") for tag in tags)
     assert (run_root / "knowledge_graph" / "graph.json").exists()
+    assert (run_root / "knowledge_graph" / "graph_profile.json").exists()
     assert (run_root / "knowledge_graph" / "graph_report.md").exists()
 
 

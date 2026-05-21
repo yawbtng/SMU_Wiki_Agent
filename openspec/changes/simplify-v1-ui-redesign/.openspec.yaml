@@ -1,9 +1,0 @@
-name: simplify-v1-ui-redesign
-summary: Redesign the Streamlit app into a minimal V1 operator workflow focused on URL reasoning, scraping, cleaning, wiki generation, embeddings, and query.
-status: proposed
-artifacts:
-  - proposal
-  - design
-  - tasks
-applyRequires:
-  - tasks

@@ -80,7 +80,7 @@ def test_execute_pdf_url_downloads_and_writes_pdf_chunks(monkeypatch, tmp_path: 
 
     monkeypatch.setattr(
         "src.scrape_planner.scrape_worker.requests.get",
-        lambda url, timeout: _FakeResponse(text="%PDF-1.7", content_type="application/pdf"),
+        lambda url, timeout, stream=False: _FakeResponse(text="%PDF-1.7", content_type="application/pdf"),
     )
 
     class Source:
@@ -117,6 +117,8 @@ def test_execute_pdf_url_downloads_and_writes_pdf_chunks(monkeypatch, tmp_path: 
 
 def test_execute_retry_then_success(monkeypatch, tmp_path: Path):
     runner, state = _make_runner(tmp_path)
+    monkeypatch.setenv("SCRAPE_BROWSER_MODE", "lightpanda")
+    monkeypatch.setenv("LIGHTPANDA_CDP_URL", "ws://127.0.0.1:9222")
     calls: list[str] = []
 
     def fake_fetch(mode: str, url: str):
@@ -134,10 +136,10 @@ def test_execute_retry_then_success(monkeypatch, tmp_path: Path):
     runner._execute("site-a", "run-2", _selected_urls("https://example.com/retry"))
     events = state.get_events("site-a", "run-2")
     pages = state.get_pages("site-a", "run-2")
-    assert calls[:2] == ["fetcher", "dynamic"]
+    assert calls[:2] == ["fetcher", "lightpanda"]
     assert any(e["event"] == "fetch_retrying_next_mode" for e in events)
     assert pages[0]["status"] == "success"
-    assert pages[0]["fetch_mode"] == "dynamic"
+    assert pages[0]["fetch_mode"] == "lightpanda"
 
 
 def test_execute_failed_path_and_grouped_failures(monkeypatch, tmp_path: Path):
@@ -212,9 +214,9 @@ def test_cancel_mid_run(monkeypatch, tmp_path: Path):
     pages = state.get_pages("site-a", "run-5")
 
     assert status["state"] == "cancelled"
-    assert status["success"] == 1
+    assert status["success"] == 0
     assert len(pages) == 2
-    assert [page["status"] for page in pages] == ["success", "cancelled"]
+    assert [page["status"] for page in pages] == ["cancelled", "cancelled"]
 
 
 def test_pause_then_unpause_blocks_new_queue_items(monkeypatch, tmp_path: Path):
@@ -304,3 +306,117 @@ def test_resume_reuses_existing_success_pages(monkeypatch, tmp_path: Path):
     assert by_url["https://example.com/1"]["status"] == "success"
     assert by_url["https://example.com/2"]["status"] == "success"
     assert status["state"] == "completed"
+
+
+def test_has_live_run_reflects_background_thread_liveness(monkeypatch, tmp_path: Path):
+    runner, _state = _make_runner(tmp_path)
+    release = threading.Event()
+
+    def fake_fetch(mode: str, url: str):
+        release.wait(timeout=2.0)
+        return _FakeResponse()
+
+    monkeypatch.setattr(runner, "_fetch_with_mode", fake_fetch)
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape_worker.extract_content",
+        lambda html: ("text", "# ok", 1000, 0.01),
+    )
+
+    runner.start("site-a", "run-live", _selected_urls("https://example.com/1"), concurrency=1)
+    time.sleep(0.1)
+    assert runner.has_live_run("site-a", "run-live") is True
+
+    release.set()
+    time.sleep(0.25)
+    assert runner.has_live_run("site-a", "run-live") is False
+
+
+def test_execute_batches_durable_page_state_writes(monkeypatch, tmp_path: Path):
+    runner, _state = _make_runner(tmp_path)
+    page_state_writes: list[int] = []
+    run_status_writes: list[str] = []
+
+    monkeypatch.setattr(runner, "_fetch_with_mode", lambda mode, url: _FakeResponse())
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape_worker.extract_content",
+        lambda html: ("text", "# ok", 1000, 0.01),
+    )
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape_worker.write_page_states",
+        lambda run_root, pages: page_state_writes.append(len(pages)),
+    )
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape_worker.write_run_status",
+        lambda run_root, status: run_status_writes.append(str(status.get("state") or "")),
+    )
+
+    runner._execute(
+        "site-a",
+        "run-batched",
+        _selected_urls("https://example.com/1", "https://example.com/2", "https://example.com/3"),
+        concurrency=1,
+    )
+
+    assert len(page_state_writes) <= 3
+    assert len(run_status_writes) <= 3
+
+
+def test_pause_interrupts_inflight_request_and_resume_finishes(monkeypatch, tmp_path: Path):
+    runner, state = _make_runner(tmp_path)
+    selected = _selected_urls("https://example.com/interrupt-me")
+    first_chunk_seen = threading.Event()
+    request_calls = {"count": 0}
+
+    class _StreamingResponse:
+        def __init__(self, body_parts: list[bytes]):
+            self.status_code = 200
+            self.headers = {"content-type": "text/html; charset=utf-8"}
+            self._body_parts = body_parts
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+        def iter_content(self, chunk_size: int = 65536):
+            for idx, part in enumerate(self._body_parts):
+                if idx == 0:
+                    first_chunk_seen.set()
+                    yield part
+                    continue
+                time.sleep(0.2)
+                yield part
+
+    def fake_get(url: str, timeout=None, stream: bool = False):
+        request_calls["count"] += 1
+        if request_calls["count"] == 1:
+            return _StreamingResponse([b"<html>", b"body</html>"])
+        return _StreamingResponse([b"<html>body</html>"])
+
+    monkeypatch.setattr("src.scrape_planner.scrape_worker.requests.get", fake_get)
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape_worker.extract_content",
+        lambda html: ("text", "# ok", 1000, 0.01),
+    )
+
+    runner.start("site-a", "run-interrupt", selected, concurrency=1, browser_mode="none")
+    assert first_chunk_seen.wait(timeout=2.0)
+
+    runner.pause("site-a", "run-interrupt")
+    time.sleep(0.25)
+    paused_status = state.get_status("site-a", "run-interrupt")
+    paused_pages = state.get_pages("site-a", "run-interrupt")
+
+    assert paused_status["state"] in {"pausing", "paused"}
+    assert paused_pages[0]["status"] == "queued"
+
+    resumed = runner.resume("site-a", "run-interrupt", concurrency=1, browser_mode="none")
+    if not resumed:
+        runner.unpause("site-a", "run-interrupt")
+    time.sleep(0.35)
+
+    final_status = state.get_status("site-a", "run-interrupt")
+    final_pages = state.get_pages("site-a", "run-interrupt")
+
+    assert request_calls["count"] >= 2
+    assert final_status["state"] == "completed"
+    assert final_pages[0]["status"] == "success"

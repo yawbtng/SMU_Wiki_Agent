@@ -59,7 +59,6 @@ def load_index_docs(run_root: Path, *, ingest_uploaded_pdfs: bool = True) -> lis
     run_root = run_root.resolve()
     docs: list[IndexDoc] = []
     docs.extend(_load_raw_scrape_docs(run_root))
-    docs.extend(_load_cleaned_docs(run_root))
     docs.extend(_load_wiki_docs(run_root))
     docs.extend(_load_pdf_chunk_docs(run_root, ingest_uploaded_pdfs=ingest_uploaded_pdfs))
     return _dedupe_docs(docs)
@@ -87,7 +86,7 @@ def build_zvec_index(
     db_path = (db_path or (run_root / "zvec_index")).resolve()
     docs = load_index_docs(run_root)
     if not docs:
-        raise ValueError(f"No raw scrape, cleaned, wiki, or PDF docs found under {run_root}")
+        raise ValueError(f"No raw scrape, wiki, or PDF docs found under {run_root}")
 
     embed = embed_fn or (lambda text: ollama_embed(text, model=model, base_url=ollama_base_url))
     first_text = docs[0].text[:chunk_chars]
@@ -160,29 +159,6 @@ def _load_raw_scrape_docs(run_root: Path) -> list[IndexDoc]:
     return docs
 
 
-def _load_cleaned_docs(run_root: Path) -> list[IndexDoc]:
-    manifest = read_json(run_root / "cleanup_manifest.json", [])
-    docs: list[IndexDoc] = []
-    for row in manifest if isinstance(manifest, list) else []:
-        if not isinstance(row, dict) or row.get("status") != "cleaned":
-            continue
-        path = Path(str(row.get("cleaned_markdown_path") or ""))
-        if not path.exists():
-            continue
-        url = str(row.get("url") or "")
-        docs.append(
-            IndexDoc(
-                source_kind="cleaned",
-                source_id=_stable_source_id("cleaned", str(path), url),
-                title=str(row.get("title") or _title_from_path_or_url(path, url)),
-                url=url,
-                path=str(path),
-                text=path.read_text(encoding="utf-8", errors="replace"),
-            )
-        )
-    return docs
-
-
 def _load_wiki_docs(run_root: Path) -> list[IndexDoc]:
     wiki_root = run_root / "wiki"
     docs: list[IndexDoc] = []
@@ -236,13 +212,21 @@ def _load_pdf_chunk_docs(run_root: Path, *, ingest_uploaded_pdfs: bool) -> list[
 
 
 def _materialize_uploaded_pdf_chunks(run_root: Path) -> None:
-    manifest_path = run_root.parent / "sources" / "pdf_manifest.json"
+    sources_root = run_root.parent / "sources"
+    pre_extracted = sources_root / "pdf_ingest"
+    s05 = run_root / "s05"
+    if (pre_extracted / "pdf_sources.jsonl").exists() or (pre_extracted / "pdf_chunks.jsonl").exists():
+        _merge_jsonl(s05 / "pdf_sources.jsonl", _read_jsonl(pre_extracted / "pdf_sources.jsonl"), key="pdf_source_id")
+        _merge_jsonl(s05 / "pdf_chunks.jsonl", _read_jsonl(pre_extracted / "pdf_chunks.jsonl"), key="chunk_id")
+        _merge_jsonl(s05 / "pdf_quarantine.jsonl", _read_jsonl(pre_extracted / "pdf_quarantine.jsonl"), key="pdf_source_id")
+        return
+
+    manifest_path = sources_root / "pdf_manifest.json"
     manifest = read_json(manifest_path, [])
     paths = [row.get("path") for row in manifest if isinstance(row, dict) and row.get("path")]
     if not paths:
         return
     result = ingest_pdfs([Path(str(path)) for path in paths], PdfIngestConfig())
-    s05 = run_root / "s05"
     _merge_jsonl(s05 / "pdf_sources.jsonl", [row.to_dict() for row in result.sources], key="pdf_source_id")
     _merge_jsonl(s05 / "pdf_chunks.jsonl", [row.to_dict() for row in result.chunks], key="chunk_id")
     _merge_jsonl(s05 / "pdf_quarantine.jsonl", [row.to_dict() for row in result.quarantine], key="pdf_source_id")

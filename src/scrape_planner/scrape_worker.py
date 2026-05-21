@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -22,11 +23,16 @@ from .state import RunStateStore
 from .storage import ensure_run_dirs, write_json
 
 try:
-    from scrapling.fetchers import Fetcher, PlayWrightFetcher, StealthyFetcher
+    from scrapling.fetchers import Fetcher, PlayWrightFetcher
 except Exception:  # pragma: no cover - optional import
     Fetcher = None
     PlayWrightFetcher = None
-    StealthyFetcher = None
+
+
+class ScrapeInterrupted(RuntimeError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def _slug_from_url(url: str) -> str:
@@ -92,12 +98,28 @@ class ScrapeRunner:
     def _run_key(self, site_id: str, run_id: str) -> str:
         return f"{site_id}:{run_id}"
 
-    def start(self, site_id: str, run_id: str, urls: list[DiscoveredURL], concurrency: int = 4) -> None:
+    def has_live_run(self, site_id: str, run_id: str) -> bool:
+        thread = self._threads.get(self._run_key(site_id, run_id))
+        return bool(thread is not None and thread.is_alive())
+
+    def start(
+        self,
+        site_id: str,
+        run_id: str,
+        urls: list[DiscoveredURL],
+        concurrency: int = 4,
+        browser_mode: str | None = None,
+        lightpanda_cdp_url: str | None = None,
+    ) -> None:
         key = self._run_key(site_id, run_id)
         if key in self._threads and self._threads[key].is_alive():
             return
         self.state.set_cancel(site_id, run_id, False)
-        thread = threading.Thread(target=self._execute, args=(site_id, run_id, urls, concurrency), daemon=True)
+        thread = threading.Thread(
+            target=self._execute,
+            args=(site_id, run_id, urls, concurrency, browser_mode, lightpanda_cdp_url),
+            daemon=True,
+        )
         self._threads[key] = thread
         thread.start()
 
@@ -131,7 +153,14 @@ class ScrapeRunner:
             {"ts": _utc_now_iso(), "event": "run_unpaused", "status": "running", "url": None},
         )
 
-    def resume(self, site_id: str, run_id: str, concurrency: int = 4) -> bool:
+    def resume(
+        self,
+        site_id: str,
+        run_id: str,
+        concurrency: int = 4,
+        browser_mode: str | None = None,
+        lightpanda_cdp_url: str | None = None,
+    ) -> bool:
         key = self._run_key(site_id, run_id)
         thread = self._threads.get(key)
         if thread is not None and thread.is_alive():
@@ -183,39 +212,110 @@ class ScrapeRunner:
 
         self.state.set_cancel(site_id, run_id, False)
         self.state.set_pause(site_id, run_id, False)
-        self.start(site_id, run_id, urls, concurrency=concurrency)
+        self.start(
+            site_id,
+            run_id,
+            urls,
+            concurrency=concurrency,
+            browser_mode=browser_mode,
+            lightpanda_cdp_url=lightpanda_cdp_url,
+        )
         return True
 
-    def _fetch_with_mode(self, mode: str, url: str) -> Any:
-        if mode == "fetcher" and Fetcher is not None:
-            return Fetcher.get(url, timeout=20, retries=2)
-        if mode == "dynamic" and PlayWrightFetcher is not None:
-            return PlayWrightFetcher.fetch(url, headless=True, timeout=30000, network_idle=True)
-        if mode == "stealthy" and StealthyFetcher is not None:
-            return StealthyFetcher.fetch(url, headless=True, timeout=30000, network_idle=True)
-        return requests.get(url, timeout=20)
+    def _lightpanda_cdp_url(self, configured_url: str | None = None) -> str:
+        return str(configured_url or os.getenv("LIGHTPANDA_CDP_URL") or os.getenv("LIGHTPANDA_WS_ENDPOINT") or "").strip()
 
-    def _download_pdf(self, url: str, target: Path) -> tuple[int | None, str | None, int]:
-        resp = requests.get(url, timeout=60)
+    def _fetch_modes(self, browser_mode: str | None = None, lightpanda_cdp_url: str | None = None) -> tuple[str, ...]:
+        # Default to lightweight HTTP fetching. Browser rendering is opt-in and
+        # only connects to an external Lightpanda CDP endpoint; never launch Chrome/Chromium.
+        mode = str(browser_mode or os.getenv("SCRAPE_BROWSER_MODE") or "none").strip().lower()
+        if mode in {"none", "off", "disabled", "http", "fetcher"}:
+            return ("fetcher",)
+        if mode == "lightpanda":
+            if self._lightpanda_cdp_url(lightpanda_cdp_url) and PlayWrightFetcher is not None:
+                return ("fetcher", "lightpanda")
+            return ("fetcher",)
+        return ("fetcher",)
+
+    def _fetch_with_mode(self, mode: str, url: str, lightpanda_cdp_url: str | None = None) -> Any:
+        if mode == "fetcher":
+            return requests.get(url, timeout=(5, 10), stream=True)
+        if mode == "lightpanda" and PlayWrightFetcher is not None:
+            cdp_url = self._lightpanda_cdp_url(lightpanda_cdp_url)
+            if not cdp_url:
+                raise RuntimeError("LIGHTPANDA_CDP_URL is required for lightpanda fetch mode")
+            return PlayWrightFetcher.fetch(url, headless=True, timeout=30000, network_idle=True, cdp_url=cdp_url)
+        return requests.get(url, timeout=(5, 10), stream=True)
+
+    def _interrupt_reason(self, site_id: str, run_id: str) -> str | None:
+        if self.state.get_cancel(site_id, run_id):
+            return "cancelled"
+        if self.state.get_pause(site_id, run_id):
+            return "paused"
+        return None
+
+    def _read_response_body(self, resp: Any, *, site_id: str, run_id: str) -> bytes:
+        reason = self._interrupt_reason(site_id, run_id)
+        if reason:
+            close_fn = getattr(resp, "close", None)
+            if callable(close_fn):
+                close_fn()
+            raise ScrapeInterrupted(reason)
+        iter_content = getattr(resp, "iter_content", None)
+        if not callable(iter_content):
+            content = getattr(resp, "content", None)
+            if isinstance(content, bytes):
+                return content
+            return _response_text(content).encode("utf-8", errors="ignore") if content is not None else b""
+        chunks: list[bytes] = []
+        for chunk in iter_content(chunk_size=65536):
+            reason = self._interrupt_reason(site_id, run_id)
+            if reason:
+                close_fn = getattr(resp, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                raise ScrapeInterrupted(reason)
+            if not chunk:
+                continue
+            chunks.append(bytes(chunk))
+        return b"".join(chunks)
+
+    def _download_pdf(self, url: str, target: Path, *, site_id: str, run_id: str) -> tuple[int | None, str | None, int]:
+        resp = requests.get(url, timeout=(5, 15), stream=True)
         content_type = resp.headers.get("content-type") if isinstance(resp.headers, dict) else None
         resp.raise_for_status()
+        content = self._read_response_body(resp, site_id=site_id, run_id=run_id)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(resp.content)
-        return getattr(resp, "status_code", None), content_type, len(resp.content)
+        target.write_bytes(content)
+        return getattr(resp, "status_code", None), content_type, len(content)
 
-    def _execute(self, site_id: str, run_id: str, urls: list[DiscoveredURL], concurrency: int = 4) -> None:
+    def _execute(
+        self,
+        site_id: str,
+        run_id: str,
+        urls: list[DiscoveredURL],
+        concurrency: int = 4,
+        browser_mode: str | None = None,
+        lightpanda_cdp_url: str | None = None,
+    ) -> None:
         selected_urls = [item for item in urls if item.selected and not item.excluded_reason]
         run_root = self.base_data_dir / "sites" / site_id / run_id
         dirs = ensure_run_dirs(run_root)
         write_json(run_root / "selected_urls.json", [item.to_dict() for item in selected_urls])
 
         worker_count = max(1, min(int(concurrency or 4), 16))
+        page_snapshot_flush_every = max(25, worker_count * 2)
+        page_snapshot_flush_interval_sec = 1.0
         status_lock = threading.Lock()
         failures_lock = threading.Lock()
         pdf_lock = threading.Lock()
         failures: list[dict[str, Any]] = []
         pages_order = [item.url for item in selected_urls]
         pages_by_url: dict[str, dict[str, Any]] = {}
+        pages_dirty = False
+        status_dirty = False
+        completed_since_flush = 0
+        last_flush_monotonic = time.monotonic()
         status: dict[str, Any] = {
             "state": "running",
             "total": len(selected_urls),
@@ -233,7 +333,29 @@ class ScrapeRunner:
         def _pages_snapshot_locked() -> list[dict[str, Any]]:
             return [pages_by_url[url].copy() for url in pages_order]
 
-        def _set_state_locked() -> None:
+        def _persist_snapshots_locked(*, force: bool = False) -> None:
+            nonlocal pages_dirty, status_dirty, completed_since_flush, last_flush_monotonic
+            if not pages_dirty and not status_dirty:
+                return
+            now_monotonic = time.monotonic()
+            should_flush = force or completed_since_flush >= page_snapshot_flush_every
+            if not should_flush and (now_monotonic - last_flush_monotonic) >= page_snapshot_flush_interval_sec:
+                should_flush = True
+            if not should_flush:
+                return
+            if status_dirty:
+                write_run_status(run_root, status.copy())
+                status_dirty = False
+            if pages_dirty:
+                pages_snapshot = _pages_snapshot_locked()
+                self.state.set_pages(site_id, run_id, pages_snapshot)
+                write_page_states(run_root, pages_snapshot)
+                pages_dirty = False
+            completed_since_flush = 0
+            last_flush_monotonic = now_monotonic
+
+        def _set_state_locked(*, force_persist: bool = False, completed_delta: int = 0) -> None:
+            nonlocal pages_dirty, status_dirty, completed_since_flush
             counts = {"queued": 0, "running": 0, "success": 0, "failed": 0, "cancelled": 0}
             current_url = None
             for url in pages_order:
@@ -250,10 +372,11 @@ class ScrapeRunner:
                     status["state"] = "pausing" if counts["running"] > 0 else "paused"
                 elif str(status.get("state") or "").lower() in {"paused", "pausing", "initializing"}:
                     status["state"] = "running"
-            self.state.set_pages(site_id, run_id, _pages_snapshot_locked())
             self.state.set_status(site_id, run_id, status.copy())
-            write_run_status(run_root, status.copy())
-            write_page_states(run_root, _pages_snapshot_locked())
+            pages_dirty = True
+            status_dirty = True
+            completed_since_flush += max(0, int(completed_delta or 0))
+            _persist_snapshots_locked(force=force_persist)
 
         existing_pages = {
             str(page.get("url") or ""): page
@@ -298,7 +421,7 @@ class ScrapeRunner:
             )
 
         with status_lock:
-            _set_state_locked()
+            _set_state_locked(force_persist=True)
 
         work_queue: Queue[DiscoveredURL] = Queue()
         for item in selected_urls:
@@ -368,7 +491,12 @@ class ScrapeRunner:
 
                 if _is_pdf_url(item):
                     try:
-                        http_status, content_type, size_bytes = self._download_pdf(item.url, pdf_path)
+                        http_status, content_type, size_bytes = self._download_pdf(
+                            item.url,
+                            pdf_path,
+                            site_id=site_id,
+                            run_id=run_id,
+                        )
                         pdf_result = ingest_pdfs([pdf_path], PdfIngestConfig())
                         with pdf_lock:
                             _merge_jsonl_rows(
@@ -450,6 +578,36 @@ class ScrapeRunner:
                             )
                     except Exception as exc:
                         last_error = exc
+                        if isinstance(exc, ScrapeInterrupted):
+                            with status_lock:
+                                page = pages_by_url[item.url]
+                                page["status"] = "cancelled" if exc.reason == "cancelled" else "queued"
+                                page["failure_reason"] = None
+                                page["worker_id"] = None
+                                page["fetch_mode"] = "pdf"
+                                page["started_at"] = None if exc.reason == "paused" else page.get("started_at")
+                                page["finished_at"] = _utc_now_iso() if exc.reason == "cancelled" else None
+                                pages_by_url[item.url] = page
+                                _set_state_locked(force_persist=True)
+                            if exc.reason == "paused":
+                                work_queue.put(item)
+                            self.state.push_event(
+                                site_id,
+                                run_id,
+                                {
+                                    "ts": _utc_now_iso(),
+                                    "event": "pdf_fetch_interrupted",
+                                    "status": exc.reason,
+                                    "url": item.url,
+                                    "worker_id": worker_id,
+                                    "attempt": 1,
+                                    "fetch_mode": "pdf",
+                                },
+                            )
+                            work_queue.task_done()
+                            if exc.reason == "cancelled":
+                                break
+                            continue
                         failure_reason = classify_failure(
                             http_status=None,
                             content_type="application/pdf",
@@ -481,14 +639,15 @@ class ScrapeRunner:
                             },
                         )
                 else:
-                    for attempt, mode in enumerate(("fetcher", "dynamic", "stealthy"), start=1):
+                    fetch_modes = self._fetch_modes(browser_mode, lightpanda_cdp_url)
+                    interrupted_reason: str | None = None
+                    for attempt, mode in enumerate(fetch_modes, start=1):
                         try:
                             with status_lock:
                                 page = pages_by_url[item.url]
                                 page["attempt"] = attempt
                                 page["fetch_mode"] = mode
                                 pages_by_url[item.url] = page
-                                self.state.set_pages(site_id, run_id, _pages_snapshot_locked())
                             self.state.push_event(
                                 site_id,
                                 run_id,
@@ -502,8 +661,16 @@ class ScrapeRunner:
                                     "fetch_mode": mode,
                                 },
                             )
-                            response = self._fetch_with_mode(mode, item.url)
+                            try:
+                                response = self._fetch_with_mode(mode, item.url, lightpanda_cdp_url)
+                            except TypeError:
+                                # Backward-compatible for tests/extensions monkeypatching _fetch_with_mode(mode, url).
+                                response = self._fetch_with_mode(mode, item.url)  # type: ignore[misc]
                             http_status, content_type, html = _extract_response_parts(response)
+                            if mode == "fetcher":
+                                body = self._read_response_body(response, site_id=site_id, run_id=run_id)
+                                encoding = getattr(response, "encoding", None) or "utf-8"
+                                html = body.decode(encoding, errors="replace")
                             _, markdown, text_length, link_density = extract_content(html)
                             reason = classify_failure(
                                 http_status=http_status,
@@ -566,8 +733,7 @@ class ScrapeRunner:
                                 page["text_length"] = text_length
                                 page["link_density"] = link_density
                                 pages_by_url[item.url] = page
-                                self.state.set_pages(site_id, run_id, _pages_snapshot_locked())
-                            if reason in {"blocked", "timeout", "parse_error"} and mode != "stealthy":
+                            if reason in {"blocked", "timeout", "parse_error"} and mode != fetch_modes[-1]:
                                 self.state.push_event(
                                     site_id,
                                     run_id,
@@ -584,6 +750,35 @@ class ScrapeRunner:
                                 )
                                 continue
                             break
+                        except ScrapeInterrupted as exc:
+                            interrupted_reason = exc.reason
+                            with status_lock:
+                                page = pages_by_url[item.url]
+                                page["status"] = "cancelled" if exc.reason == "cancelled" else "queued"
+                                page["failure_reason"] = None
+                                page["worker_id"] = None
+                                page["fetch_mode"] = mode
+                                page["started_at"] = None if exc.reason == "paused" else page.get("started_at")
+                                page["finished_at"] = _utc_now_iso() if exc.reason == "cancelled" else None
+                                pages_by_url[item.url] = page
+                                _set_state_locked(force_persist=True)
+                            if exc.reason == "paused":
+                                work_queue.put(item)
+                            self.state.push_event(
+                                site_id,
+                                run_id,
+                                {
+                                    "ts": _utc_now_iso(),
+                                    "event": "fetch_interrupted",
+                                    "status": exc.reason,
+                                    "url": item.url,
+                                    "worker_id": worker_id,
+                                    "attempt": attempt,
+                                    "fetch_mode": mode,
+                                },
+                            )
+                            work_queue.task_done()
+                            break
                         except Exception as exc:
                             last_error = exc
                             failure_reason = classify_failure(
@@ -599,7 +794,6 @@ class ScrapeRunner:
                                 page["failure_reason"] = failure_reason
                                 page["fetch_mode"] = mode
                                 pages_by_url[item.url] = page
-                                self.state.set_pages(site_id, run_id, _pages_snapshot_locked())
                             self.state.push_event(
                                 site_id,
                                 run_id,
@@ -615,8 +809,12 @@ class ScrapeRunner:
                                     "error": str(exc),
                                 },
                             )
-                            if mode != "stealthy":
+                            if mode != fetch_modes[-1]:
                                 continue
+                    if interrupted_reason == "cancelled":
+                        break
+                    if interrupted_reason == "paused":
+                        continue
 
                 with status_lock:
                     page = pages_by_url[item.url]
@@ -625,7 +823,7 @@ class ScrapeRunner:
                     if not page.get("finished_at"):
                         page["finished_at"] = _utc_now_iso()
                     pages_by_url[item.url] = page
-                    _set_state_locked()
+                    _set_state_locked(completed_delta=1)
                     page_snapshot = page.copy()
 
                 if page_snapshot.get("status") == "failed":
@@ -679,7 +877,7 @@ class ScrapeRunner:
                         page["finished_at"] = _utc_now_iso()
                         pages_by_url[url] = page
                 status["state"] = "cancelled"
-                _set_state_locked()
+                _set_state_locked(force_persist=True)
             self.state.push_event(
                 site_id,
                 run_id,
@@ -695,7 +893,7 @@ class ScrapeRunner:
         if status.get("state") != "cancelled":
             status["state"] = "completed"
         with status_lock:
-            _set_state_locked()
+            _set_state_locked(force_persist=True)
             self.state.set_status(site_id, run_id, status.copy())
 
         self.state.push_event(

@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from scrape_planner.run_persistence import persist_stale_artifacts_and_packet
-from scrape_planner.tracer_dependencies import build_tracer_maintenance_job_packet, evaluate_stale_dependencies
+from src.scrape_planner.run_persistence import persist_stale_artifacts_and_packet
+from src.scrape_planner.tracer_dependencies import build_tracer_maintenance_job_packet, evaluate_stale_dependencies
 
 
 def run_proof(run_root: Path) -> dict[str, object]:
