@@ -6,6 +6,10 @@
 .pi/skills/*
 !.pi/skills/content-organizer/
 !.pi/skills/content-organizer/SKILL.md
+!.pi/skills/llm-wiki-noninteractive/
+!.pi/skills/llm-wiki-noninteractive/SKILL.md
+!.pi/skills/llm-wiki-noninteractive/scripts/
+!.pi/skills/llm-wiki-noninteractive/scripts/build_wiki.sh
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -44,3 +48,6 @@ vendor/
 coverage/
 .cache/
 tmp/
+$TMPDIR/
+.logs/
+.codegraph/

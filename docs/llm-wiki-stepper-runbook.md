@@ -15,6 +15,29 @@ For each site, the stepper uses this layout:
 
 Raw sources are the source of truth. Wiki and index files are derived artifacts and can be rebuilt.
 
+## One-Command Ingestion
+
+Use this non-interactive command to run the complete durable path: normalize raw sources, build/update the wiki, rebuild the local index, and optionally run a smoke query.
+
+```bash
+python -m src.scrape_planner.wiki_ingestion_pipeline \
+  --site-root data/sites/<site_id> \
+  --run-root data/sites/<site_id>/<run_id> \
+  --kind auto \
+  --query "What are the admissions deadlines?"
+```
+
+Useful variants:
+
+- `--kind web --run-root ...` for a scrape run.
+- `--kind pdf` for previously extracted PDF page markdown under `sources/pdf_pages/` or `sources/pdf_ingest/`.
+- `--kind excel --tabular-path /absolute/path/to/source.csv` for tabular sources.
+- `--kind all --run-root ... --tabular-path ...` for every source family.
+- `--rebuild` for a full derived-wiki rebuild; otherwise the command resumes incrementally.
+- `--skip-normalize`, `--skip-wiki`, or `--skip-index` to restart from a later stage.
+
+The command prints a JSON report with normalization counts, registry readiness, wiki build report, index report, and optional query evidence.
+
 ## Add New Sources
 
 Use the existing app flows for scraping pages, uploading PDFs, or adding CSV/Excel files. Then normalize into the raw source database.
