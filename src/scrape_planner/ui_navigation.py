@@ -4,8 +4,9 @@ WORKFLOW_TABS = [
     "Overview",
     "Sources",
     "Runs",
-    "Corpus",
+    "Documents",
     "Wiki",
-    "Retrieval",
+    "Embeddings",
+    "Metrics",
     "Settings",
 ]

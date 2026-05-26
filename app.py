@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import threading
+import time
 import uuid
-from collections import Counter
 from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import altair as alt
 import pandas as pd
@@ -63,7 +66,6 @@ from src.scrape_planner.site_layout import site_layout
 from src.scrape_planner.state import RunStateStore
 from src.scrape_planner.stepper_status import (
     load_embedding_status as _stepper_load_embedding_status,
-    load_mcp_status as _stepper_load_mcp_status,
     load_wiki_status as _stepper_load_wiki_status,
     raw_source_status as _stepper_raw_source_status,
     raw_sources_ready as _stepper_raw_sources_ready,
@@ -73,6 +75,9 @@ from src.scrape_planner.stepper_status import (
 from src.scrape_planner.storage import persist_discovered, read_json, write_json
 from src.scrape_planner.tmux_runner import TmuxRunner
 from src.scrape_planner.llm_wiki_builder import launch_wiki_builder
+from src.scrape_planner.llm_wiki_index import build_llm_wiki_index
+from src.scrape_planner.manual_url_pipeline import run_manual_url_pipeline
+from src.scrape_planner.raw_source_normalizer import normalize_pdf_pages
 from src.scrape_planner.ui_scrape_realtime import (
     build_scraped_page_preview_href,
     derive_run_summary,
@@ -105,6 +110,13 @@ APP_STATE_PATH = DATA_ROOT / "app_state.json"
 
 def _site_slug(url: str) -> str:
     return normalize_site_url(url).replace("https://", "").replace("http://", "").replace("/", "_")
+
+
+def _safe_text(value: object, default: str = "") -> str:
+    if value is None:
+        return default
+    text = str(value)
+    return text if text else default
 
 
 def _init_state() -> None:
@@ -243,12 +255,50 @@ def _safe_uploaded_filename(name: str) -> str:
     return cleaned[:160] or "document.pdf"
 
 
+def _path_fingerprint(path: Path) -> tuple[int, int, int]:
+    """Small cache key for local artifact reads."""
+    try:
+        candidate = Path(path)
+        if candidate.is_file():
+            stat = candidate.stat()
+            return (int(stat.st_mtime_ns), int(stat.st_size), 1)
+        if candidate.is_dir():
+            latest_mtime = 0
+            total_size = 0
+            file_count = 0
+            for child in candidate.glob("*"):
+                if child.is_file():
+                    stat = child.stat()
+                    latest_mtime = max(latest_mtime, int(stat.st_mtime_ns))
+                    total_size += int(stat.st_size)
+                    file_count += 1
+            return (latest_mtime, total_size, file_count)
+    except OSError:
+        return (0, 0, 0)
+    return (0, 0, 0)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_jsonl_rows(path: str, fingerprint: tuple[int, int, int]) -> list[dict]:
+    return _stepper_read_jsonl_rows(Path(path))
+
+
 def _read_jsonl_rows(path: Path) -> list[dict]:
-    return _stepper_read_jsonl_rows(path)
+    return _cached_jsonl_rows(str(path), _path_fingerprint(path))
+
+
+@st.cache_data(show_spinner=False)
+def _cached_raw_source_status(site_root: str, registry_fingerprint: tuple[int, int, int], reports_fingerprint: tuple[int, int, int]) -> dict:
+    del registry_fingerprint, reports_fingerprint
+    return _stepper_raw_source_status(site_layout(Path(site_root)))
 
 
 def _raw_source_status(layout) -> dict:
-    return _stepper_raw_source_status(layout)
+    return _cached_raw_source_status(
+        str(layout.site_root),
+        _path_fingerprint(layout.registry_path),
+        _path_fingerprint(layout.raw_reports_dir),
+    )
 
 
 def _raw_sources_ready(raw_status: dict) -> bool:
@@ -263,12 +313,25 @@ def _wiki_ready(wiki_status: dict) -> bool:
     return _stepper_wiki_ready(wiki_status)
 
 
+def _wiki_primary_action_label(wiki_status: dict) -> str:
+    integrated = int(wiki_status.get("integrated_sources") or 0)
+    pending = int(wiki_status.get("pending_source_count") or 0)
+    changed = int(wiki_status.get("changed_source_count") or 0)
+    if integrated <= 0:
+        return "Build Wiki"
+    if pending > 0 or changed > 0:
+        return "Update Wiki"
+    return "Wiki Current"
+
+
+@st.cache_data(show_spinner=False)
+def _cached_embedding_status(site_root: str, indexes_fingerprint: tuple[int, int, int]) -> dict:
+    del indexes_fingerprint
+    return _stepper_load_embedding_status(site_layout(Path(site_root)))
+
+
 def _load_embedding_status(layout) -> dict:
-    return _stepper_load_embedding_status(layout)
-
-
-def _load_mcp_status(layout) -> dict:
-    return _stepper_load_mcp_status(layout)
+    return _cached_embedding_status(str(layout.site_root), _path_fingerprint(layout.indexes_dir))
 
 
 def _merge_jsonl_rows_app(path: Path, rows: list[dict], *, key: str) -> None:
@@ -280,28 +343,382 @@ def _merge_jsonl_rows_app(path: Path, rows: list[dict], *, key: str) -> None:
     path.write_text("".join(json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n" for row in existing.values()), encoding="utf-8")
 
 
-def _extract_uploaded_pdfs_to_site_sources(site_root: Path, pdf_manifest: list[dict]) -> dict:
-    paths = [Path(str(row.get("path"))) for row in pdf_manifest if isinstance(row, dict) and row.get("path")]
-    result = ingest_pdfs(paths, PdfIngestConfig(page_markdown_dir=site_root / "sources" / "pdf_pages"))
-    out_dir = site_root / "sources" / "pdf_ingest"
-    _merge_jsonl_rows_app(out_dir / "pdf_sources.jsonl", [row.to_dict() for row in result.sources], key="pdf_source_id")
-    _merge_jsonl_rows_app(out_dir / "pdf_chunks.jsonl", [row.to_dict() for row in result.chunks], key="chunk_id")
-    _merge_jsonl_rows_app(out_dir / "pdf_quarantine.jsonl", [row.to_dict() for row in result.quarantine], key="pdf_source_id")
+def _count_pdf_page_artifacts(pages_dir: Path) -> int:
+    count = 0
+    for pages_index in sorted(pages_dir.glob("*/pages.json")) if pages_dir.exists() else []:
+        payload = read_json(pages_index, [])
+        if isinstance(payload, list):
+            count += len([row for row in payload if isinstance(row, dict)])
+    return count
+
+
+def _summarize_pdf_rows(source_rows: list[dict], page_rows: list[dict], chunk_rows: list[dict], quarantine_rows: list[dict]) -> dict:
+    accepted = [row for row in source_rows if bool(row.get("accepted"))]
+    pages_done = sum(int(row.get("page_count") or 0) for row in accepted)
+    unknown_page_sources = len([row for row in accepted if row.get("page_count") is None])
     return {
-        "sources": len(result.sources),
-        "accepted": len([row for row in result.sources if row.accepted]),
-        "chunks": len(result.chunks),
-        "quarantine": len(result.quarantine),
-        "output_dir": str(out_dir),
+        "documents": len(source_rows),
+        "accepted": len(accepted),
+        "pages_done": pages_done,
+        "unknown_page_sources": unknown_page_sources,
+        "page_artifacts": len(page_rows),
+        "chunks": len(chunk_rows),
+        "quarantine": len(quarantine_rows),
     }
 
 
-def _render_pdf_parser_unavailable_error(exc: PdfParserUnavailableError) -> None:
-    st.error(
-        "PDF extraction is unavailable until Docling is installed. "
-        "Install `requirements-pdf.txt` in this environment, then try extraction again."
+def _quick_pdf_page_count(path: Path) -> int | None:
+    try:
+        import pypdfium2 as pdfium
+    except Exception:
+        return None
+    try:
+        pdf = pdfium.PdfDocument(str(path))
+        try:
+            return int(len(pdf))
+        finally:
+            pdf.close()
+    except Exception:
+        return None
+
+
+def _summarize_pdf_manifest_queue(pdf_manifest: list[dict]) -> dict:
+    total_pages = 0
+    unknown_pages = 0
+    for row in pdf_manifest:
+        if not isinstance(row, dict):
+            continue
+        page_count = row.get("page_count")
+        if page_count is None and row.get("path"):
+            page_count = _quick_pdf_page_count(Path(str(row.get("path"))))
+            if page_count is not None:
+                row["page_count"] = int(page_count)
+        if page_count is None:
+            unknown_pages += 1
+        else:
+            total_pages += int(page_count or 0)
+    return {"pdfs": len([row for row in pdf_manifest if isinstance(row, dict)]), "pages": total_pages, "unknown_pages": unknown_pages}
+
+
+def _render_pdf_extraction_metrics(*, pdfs_done: int, pdfs_total: int, pages_done: int, pages_total: int | None, chunks: int, review: int) -> None:
+    page_value = f"{pages_done:,}" if pages_total is None else f"{pages_done:,}/{pages_total:,}"
+    render_metric_strip(
+        [
+            {"label": "PDFs Done", "value": f"{pdfs_done:,}/{pdfs_total:,}"},
+            {"label": "Pages Done", "value": page_value},
+            {"label": "Search Chunks", "value": f"{chunks:,}"},
+            {"label": "Needs Review", "value": f"{review:,}"},
+        ]
     )
-    st.caption(f"Parser setup detail: `{exc}`")
+
+
+def _pdf_extraction_status_path(site_root: Path) -> Path:
+    return site_root / "sources" / "pdf_ingest" / "pdf_extraction_status.json"
+
+
+def _read_pdf_extraction_status(site_root: Path) -> dict:
+    status = read_json(_pdf_extraction_status_path(site_root), {})
+    if not isinstance(status, dict):
+        return {}
+    if status.get("state") == "running" and status.get("pid") != os.getpid():
+        status = dict(status)
+        status["state"] = "interrupted"
+        status["error"] = "Previous extraction worker is no longer attached to this app process."
+    return status
+
+
+def _write_pdf_extraction_status(site_root: Path, status: dict) -> None:
+    status_path = _pdf_extraction_status_path(site_root)
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(status_path, status)
+
+
+def _pdf_upload_signature(uploaded_pdfs: list) -> str:
+    parts = []
+    for uploaded in uploaded_pdfs or []:
+        parts.append(f"{getattr(uploaded, 'name', '')}:{getattr(uploaded, 'size', '')}")
+    return "|".join(parts)
+
+
+def _start_pdf_extraction_job(site_root: Path, pdf_manifest: list[dict]) -> dict:
+    queue_summary = _summarize_pdf_manifest_queue(pdf_manifest)
+    status = {
+        "job_id": uuid.uuid4().hex,
+        "pid": os.getpid(),
+        "state": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "pdfs_total": queue_summary["pdfs"],
+        "pdfs_done": 0,
+        "pages_total": queue_summary["pages"] if not queue_summary["unknown_pages"] else None,
+        "pages_done": 0,
+        "chunks": 0,
+        "review": 0,
+        "raw_ready": 0,
+        "page_artifacts": 0,
+        "current_pdf": "",
+        "error": "",
+    }
+    _write_pdf_extraction_status(site_root, status)
+
+    manifest_snapshot = [dict(row) for row in pdf_manifest if isinstance(row, dict)]
+    thread = threading.Thread(
+        target=_run_pdf_extraction_job,
+        args=(site_root, manifest_snapshot, status),
+        daemon=True,
+    )
+    thread.start()
+    return status
+
+
+def _render_pdf_live_status_loop(site_root: Path, *, poll_seconds: float = 1.0, max_seconds: int = 60 * 60) -> None:
+    metrics_slot = st.empty()
+    message_slot = st.empty()
+    started = time.monotonic()
+    while True:
+        status = _read_pdf_extraction_status(site_root)
+        state = str(status.get("state") or "")
+        with metrics_slot.container():
+            _render_pdf_extraction_metrics(
+                pdfs_done=int(status.get("pdfs_done") or 0),
+                pdfs_total=int(status.get("pdfs_total") or 0),
+                pages_done=int(status.get("pages_done") or 0),
+                pages_total=status.get("pages_total"),
+                chunks=int(status.get("chunks") or 0),
+                review=int(status.get("review") or 0),
+            )
+        if state == "running":
+            current_pdf = str(status.get("current_pdf") or "PDF")
+            parser = str(status.get("parser") or "hybrid selector")
+            reason = str(status.get("parser_reason") or "choosing best extractor")
+            message_slot.info(f"Extracting {current_pdf} with {parser} ({reason})… live updates without page refresh.")
+            if time.monotonic() - started > max_seconds:
+                message_slot.warning("Extraction is still running in the background. You can leave this page and return later.")
+                break
+            time.sleep(poll_seconds)
+            continue
+        if state == "complete":
+            message_slot.success(
+                f"PDF extraction complete: {int(status.get('pages_done') or 0):,} page(s), "
+                f"{int(status.get('chunks') or 0):,} search chunks, "
+                f"{int(status.get('review') or 0):,} needing review."
+            )
+        elif state in {"failed", "parser_unavailable"}:
+            message_slot.error(f"PDF extraction failed: {status.get('error') or 'unknown error'}")
+        break
+
+
+def _pdf_source_id(path: Path) -> str:
+    return hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def _chunk_pdf_text(source_id: str, page_number: int, text: str, *, chunk_size: int = 1200, overlap: int = 200) -> list[dict]:
+    if not text:
+        return []
+    step = max(1, chunk_size - overlap)
+    chunks = []
+    for chunk_index, start in enumerate(range(0, len(text), step)):
+        chunk_text = text[start : start + chunk_size]
+        if not chunk_text.strip():
+            continue
+        digest = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()[:16]
+        chunks.append(
+            {
+                "chunk_id": f"{source_id}-p{page_number:04d}-c{chunk_index:04d}-{digest}",
+                "pdf_source_id": source_id,
+                "page_number": page_number,
+                "chunk_index": chunk_index,
+                "text": chunk_text,
+                "char_count": len(chunk_text),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "parser": "pypdfium2-pagewise",
+                "source_path": "",
+            }
+        )
+    return chunks
+
+
+def _docling_pdf_result(path: Path, pages_dir: Path, status: dict, *, reason: str) -> dict:
+    status["parser"] = "docling"
+    status["parser_reason"] = reason
+    status["updated_at"] = datetime.now(timezone.utc).isoformat()
+    result = ingest_pdfs([path], PdfIngestConfig(page_markdown_dir=pages_dir))
+    sources = [row.to_dict() for row in result.sources]
+    chunks = [row.to_dict() for row in result.chunks]
+    quarantine = [row.to_dict() for row in result.quarantine]
+    for source in sources:
+        if source.get("accepted") and source.get("page_count") is not None:
+            status["pages_done"] = int(status.get("pages_done") or 0) + int(source.get("page_count") or 0)
+    status["chunks"] = int(status.get("chunks") or 0) + len(chunks)
+    return {"sources": sources, "chunks": chunks, "quarantine": quarantine}
+
+
+def _page_text_from_pdfium_page(page: object) -> str:
+    textpage = page.get_textpage()
+    return str(textpage.get_text_range() or "").strip()
+
+
+def _pdf_text_strategy(pdf: object, *, max_sample_pages: int = 40) -> dict:
+    page_count = int(len(pdf))
+    if page_count <= 0:
+        return {"strategy": "docling", "reason": "empty_pdf", "page_count": 0}
+    sample_count = min(page_count, max_sample_pages)
+    char_counts: list[int] = []
+    table_like = 0
+    for page_index in range(sample_count):
+        page = pdf[page_index]
+        try:
+            text = _page_text_from_pdfium_page(page)
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+        meaningful = len(re.findall(r"[A-Za-z0-9]", text))
+        char_counts.append(meaningful)
+        lines = [line for line in text.splitlines() if line.strip()]
+        multi_column_lines = len([line for line in lines if re.search(r"\S\s{3,}\S", line)])
+        numeric_dense_lines = len([line for line in lines if len(re.findall(r"\d", line)) >= 8])
+        if lines and (multi_column_lines / max(1, len(lines)) > 0.35 or numeric_dense_lines / max(1, len(lines)) > 0.45):
+            table_like += 1
+    text_coverage = len([count for count in char_counts if count >= 120]) / max(1, sample_count)
+    avg_chars = sum(char_counts) / max(1, sample_count)
+    table_like_ratio = table_like / max(1, sample_count)
+    if text_coverage < 0.85:
+        return {"strategy": "docling", "reason": f"low_text_coverage={text_coverage:.0%}", "page_count": page_count}
+    if avg_chars < 500:
+        return {"strategy": "docling", "reason": f"low_average_text={avg_chars:.0f}_chars", "page_count": page_count}
+    if table_like_ratio > 0.40:
+        return {"strategy": "docling", "reason": f"layout_table_heavy={table_like_ratio:.0%}", "page_count": page_count}
+    return {"strategy": "pypdfium2-pagewise", "reason": f"text_heavy coverage={text_coverage:.0%} avg_chars={avg_chars:.0f}", "page_count": page_count}
+
+
+def _extract_pdf_pagewise(path: Path, pages_dir: Path, site_root: Path, status: dict) -> dict:
+    forced_mode = os.getenv("PDF_EXTRACTION_MODE", "hybrid").strip().lower()
+    try:
+        import pypdfium2 as pdfium
+    except Exception:
+        return _docling_pdf_result(path, pages_dir, status, reason="pypdfium2_unavailable")
+
+    source_id = _pdf_source_id(path)
+    now = datetime.now(timezone.utc).isoformat()
+    if not path.exists() or not path.is_file():
+        return {
+            "sources": [{"pdf_source_id": source_id, "path": str(path), "size_bytes": 0, "page_count": None, "accepted": False, "created_at": now}],
+            "chunks": [],
+            "quarantine": [{"pdf_source_id": source_id, "path": str(path), "reason": "malformed", "detail": "File does not exist", "quarantined_at": now}],
+        }
+
+    if forced_mode == "docling":
+        return _docling_pdf_result(path, pages_dir, status, reason="forced_docling")
+
+    pdf = pdfium.PdfDocument(str(path))
+    try:
+        page_count = int(len(pdf))
+        if forced_mode != "pagewise":
+            strategy = _pdf_text_strategy(pdf)
+            status["parser"] = str(strategy.get("strategy") or "")
+            status["parser_reason"] = str(strategy.get("reason") or "")
+            status["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _write_pdf_extraction_status(site_root, status)
+            if strategy.get("strategy") == "docling":
+                pdf.close()
+                return _docling_pdf_result(path, pages_dir, status, reason=str(strategy.get("reason") or "hybrid_selected_docling"))
+        else:
+            status["parser"] = "pypdfium2-pagewise"
+            status["parser_reason"] = "forced_pagewise"
+            status["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _write_pdf_extraction_status(site_root, status)
+        source_dir = pages_dir / source_id
+        source_dir.mkdir(parents=True, exist_ok=True)
+        index_rows = []
+        chunks = []
+        total_chars = 0
+        for page_number in range(1, page_count + 1):
+            page = pdf[page_number - 1]
+            try:
+                text = _page_text_from_pdfium_page(page)
+            finally:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            page_chunks = []
+            if text:
+                markdown = f"# Page {page_number}\n\n{text}\n"
+                page_path = source_dir / f"page-{page_number:04d}.md"
+                page_path.write_text(markdown, encoding="utf-8")
+                index_rows.append(
+                    {
+                        "pdf_source_id": source_id,
+                        "source_path": str(path),
+                        "page_number": page_number,
+                        "parser": "pypdfium2-pagewise",
+                        "markdown_path": str(page_path),
+                        "char_count": len(text),
+                    }
+                )
+                page_chunks = _chunk_pdf_text(source_id, page_number, text)
+                for chunk in page_chunks:
+                    chunk["source_path"] = str(path)
+                chunks.extend(page_chunks)
+                total_chars += len(re.findall(r"[A-Za-z0-9]", text))
+            status["pages_done"] = int(status.get("pages_done") or 0) + 1
+            status["chunks"] = int(status.get("chunks") or 0) + len(page_chunks)
+            status["page_artifacts"] = len(index_rows)
+            status["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _write_pdf_extraction_status(site_root, status)
+        if index_rows:
+            (source_dir / "pages.json").write_text(json.dumps(index_rows, indent=2), encoding="utf-8")
+        accepted = total_chars >= 80
+        quarantine = [] if accepted else [{"pdf_source_id": source_id, "path": str(path), "reason": "low_text", "detail": f"meaningful_chars={total_chars} pages={page_count}", "quarantined_at": datetime.now(timezone.utc).isoformat()}]
+        return {
+            "sources": [{"pdf_source_id": source_id, "path": str(path), "size_bytes": int(path.stat().st_size), "page_count": page_count, "accepted": accepted, "created_at": now}],
+            "chunks": chunks if accepted else [],
+            "quarantine": quarantine,
+        }
+    finally:
+        pdf.close()
+
+
+def _run_pdf_extraction_job(site_root: Path, pdf_manifest: list[dict], status: dict) -> None:
+    out_dir = site_root / "sources" / "pdf_ingest"
+    pages_dir = site_root / "sources" / "pdf_pages"
+    try:
+        for row in pdf_manifest:
+            path = Path(str(row.get("path") or ""))
+            status["current_pdf"] = str(row.get("name") or path.name)
+            status["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _write_pdf_extraction_status(site_root, status)
+
+            result = _extract_pdf_pagewise(path, pages_dir, site_root, status)
+            _merge_jsonl_rows_app(out_dir / "pdf_sources.jsonl", result["sources"], key="pdf_source_id")
+            _merge_jsonl_rows_app(out_dir / "pdf_chunks.jsonl", result["chunks"], key="chunk_id")
+            _merge_jsonl_rows_app(out_dir / "pdf_quarantine.jsonl", result["quarantine"], key="pdf_source_id")
+
+            status["pdfs_done"] = int(status.get("pdfs_done") or 0) + 1
+            status["review"] = int(status.get("review") or 0) + len(result["quarantine"])
+            status["page_artifacts"] = _count_pdf_page_artifacts(pages_dir)
+            status["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _write_pdf_extraction_status(site_root, status)
+
+        normalization_report = normalize_pdf_pages(site_root)
+        status["raw_ready"] = int(normalization_report.counts.get("ready", 0))
+        status["state"] = "complete"
+        status["current_pdf"] = ""
+        status["completed_at"] = datetime.now(timezone.utc).isoformat()
+        status["updated_at"] = status["completed_at"]
+        _write_pdf_extraction_status(site_root, status)
+    except PdfParserUnavailableError as exc:
+        status["state"] = "parser_unavailable"
+        status["error"] = str(exc)
+        status["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _write_pdf_extraction_status(site_root, status)
+    except Exception as exc:
+        status["state"] = "failed"
+        status["error"] = str(exc)
+        status["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _write_pdf_extraction_status(site_root, status)
 
 
 def _selected_url_strings_from_state() -> list[str]:
@@ -720,6 +1137,597 @@ def _tail_text(path: Path, max_lines: int = 120) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+def _shorten_middle(text: object, *, max_chars: int = 86) -> str:
+    value = str(text or "").strip()
+    if len(value) <= max_chars:
+        return value
+    head = max(12, (max_chars - 1) // 2)
+    tail = max(8, max_chars - head - 1)
+    return f"{value[:head].rstrip()}…{value[-tail:].lstrip()}"
+
+
+def _format_document_title(title: object) -> str:
+    value = str(title or "Untitled source").strip()
+    value = re.sub(r"\.pdf\s+p\.\s*(\d+)", r".pdf — page \1", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+", " ", value)
+    return value or "Untitled source"
+
+
+def _looks_like_url(value: object) -> bool:
+    return str(value or "").strip().lower().startswith(("http://", "https://"))
+
+
+def _coerce_int(value: object, default: int = 0) -> int:
+    try:
+        if value in (None, ""):
+            return default
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _widget_key_token(value: object) -> str:
+    token = re.sub(r"[^A-Za-z0-9_]+", "_", str(value or "item").lower()).strip("_")
+    return token[:96] or "item"
+
+
+def _url_path_segments(value: object) -> list[str]:
+    source = str(value or "").strip()
+    if not _looks_like_url(source):
+        return []
+    parsed = urlparse(source)
+    path = unquote(parsed.path or "").strip("/")
+    return [segment for segment in path.split("/") if segment]
+
+
+def _url_path_label(value: object, *, max_chars: int = 96) -> str:
+    source = str(value or "").strip()
+    if not source:
+        return "No source path"
+    if _looks_like_url(source):
+        parsed = urlparse(source)
+        path = unquote(parsed.path or "").strip("/")
+        label = f"/{path}" if path else "/"
+        query = unquote(parsed.query or "").strip()
+        if query:
+            label = f"{label}?{query}"
+        return _shorten_middle(label, max_chars=max_chars)
+    return _shorten_middle(Path(source).name or source, max_chars=max_chars)
+
+
+def _web_path_category(source: object) -> tuple[str, str]:
+    segments = _url_path_segments(source)
+    if not segments:
+        return "web:/", "Home"
+    group_path = f"/{segments[0]}"
+    return f"web:{group_path.lower()}", group_path
+
+
+def _pdf_document_label(row: dict) -> str:
+    source = str(row.get("original_path") or row.get("source_path") or row.get("url_or_path") or "").strip()
+    name = ""
+    if source:
+        if _looks_like_url(source):
+            name = Path(unquote(urlparse(source).path or "")).name
+        else:
+            name = Path(source).name
+    if not name:
+        name = _format_document_title(row.get("title"))
+        name = re.sub(r"\s+—\s+page\s+\d+.*$", "", name, flags=re.IGNORECASE).strip()
+        name = re.sub(r"\s+p\.\s*\d+.*$", "", name, flags=re.IGNORECASE).strip()
+    return name or "Uploaded PDF"
+
+
+def _document_page_number(row: dict) -> int:
+    for key in ("page_number", "raw_page_number"):
+        page_number = _coerce_int(row.get(key), 0)
+        if page_number:
+            return page_number
+    match = re.search(r"(?:page|p\.)\s*(\d+)", str(row.get("title") or ""), flags=re.IGNORECASE)
+    return _coerce_int(match.group(1), 0) if match else 0
+
+
+def _document_row_display_fields(row: dict) -> dict[str, object]:
+    kind = str(row.get("kind") or row.get("source_kind") or "unknown").lower()
+    source = str(row.get("original_url") or row.get("url_or_path") or row.get("original_path") or row.get("source_path") or "")
+    source_id = str(row.get("source_id") or "")
+    if kind == "web":
+        category_key, category_label = _web_path_category(source)
+        display_path = _url_path_label(source, max_chars=128)
+        return {
+            "category_key": category_key,
+            "category_label": category_label,
+            "collection_label": category_label,
+            "display_path": display_path,
+            "sort_path": display_path.lower(),
+        }
+    if kind == "pdf":
+        document_label = _pdf_document_label(row)
+        pdf_source_id = str(row.get("pdf_source_id") or "")
+        category_identity = pdf_source_id or document_label.lower()
+        category_key = f"pdf:{category_identity}"
+        page_number = _document_page_number(row)
+        display_path = f"{document_label} · page {page_number}" if page_number else document_label
+        return {
+            "category_key": category_key,
+            "category_label": document_label,
+            "collection_label": document_label,
+            "display_path": display_path,
+            "sort_path": f"{document_label.lower()}::{page_number:08d}::{source_id}",
+        }
+    display_path = _url_path_label(source or row.get("title"), max_chars=128)
+    category_label = display_path or "Other documents"
+    return {
+        "category_key": f"other:{category_label.lower()}",
+        "category_label": category_label,
+        "collection_label": category_label,
+        "display_path": display_path,
+        "sort_path": display_path.lower(),
+    }
+
+
+def _compact_source_rows(rows: list[dict], layout) -> list[dict]:
+    del layout
+    compact_rows: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+        markdown_path = str(row.get("markdown_path") or "").strip()
+        title = str(row.get("title") or row.get("source_id") or "Untitled source")
+        original_url = str(row.get("original_url") or "").strip()
+        original_path = str(row.get("original_path") or row.get("source_path") or row.get("path") or "").strip()
+        source_path = str(row.get("source_path") or row.get("path") or original_path).strip()
+        compact_row = {
+            "kind": str(row.get("source_kind") or "unknown").lower(),
+            "status": str(row.get("status") or "unknown"),
+            "title": title,
+            "url_or_path": str(original_url or original_path or source_path),
+            "original_url": original_url,
+            "original_path": original_path,
+            "source_path": source_path,
+            "markdown": markdown_path,
+            "source_id": str(row.get("source_id") or ""),
+            "pdf_source_id": str(provenance.get("pdf_source_id") or ""),
+            "page_number": _coerce_int(provenance.get("raw_page_number") or provenance.get("page_number") or row.get("page_number"), 0),
+            "part_index": _coerce_int(provenance.get("part_index") or row.get("part_index"), 0),
+        }
+        compact_row.update(_document_row_display_fields(compact_row))
+        compact_rows.append(compact_row)
+    return compact_rows
+
+
+def _source_website_label(row: dict) -> str:
+    source = str(row.get("url_or_path") or "").strip()
+    if _looks_like_url(source):
+        parsed = urlparse(source)
+        return parsed.netloc or source
+    if source:
+        return Path(source).name or source
+    return "Uploaded document"
+
+
+def _documents_for_group(docs_df: pd.DataFrame, source_group: str) -> pd.DataFrame:
+    if source_group == "Scraped URLs":
+        return docs_df[docs_df["kind"] == "web"].copy()
+    if source_group == "PDF pages":
+        return docs_df[docs_df["kind"] == "pdf"].copy()
+    return docs_df[~docs_df["kind"].isin(["web", "pdf"])].copy()
+
+
+def _document_category_axis_label(source_group: str) -> str:
+    if source_group == "Scraped URLs":
+        return "Section"
+    if source_group == "PDF pages":
+        return "PDF document"
+    return "Source"
+
+
+def _document_all_category_label(source_group: str) -> str:
+    if source_group == "Scraped URLs":
+        return "All sections"
+    if source_group == "PDF pages":
+        return "All PDF pages"
+    return "All sources"
+
+
+def _document_category_records(group_docs: pd.DataFrame) -> list[dict]:
+    if group_docs.empty or "category_key" not in group_docs.columns:
+        return []
+    records: list[dict] = []
+    for category_key, frame in group_docs.groupby("category_key", sort=True, dropna=False):
+        if frame.empty:
+            continue
+        first = frame.iloc[0]
+        label = str(first.get("category_label") or category_key or "Uncategorized")
+        records.append({"key": str(category_key), "label": label, "count": int(len(frame))})
+    return sorted(records, key=lambda item: str(item["label"]).lower())
+
+
+def _document_category_display_label(label: object, source_group: str) -> str:
+    value = str(label or "Uncategorized").strip()
+    if source_group == "Scraped URLs":
+        return _document_index_label(value) or "Home"
+    return value or "Uncategorized"
+
+
+def _document_search_label(source_group: str) -> str:
+    if source_group == "Scraped URLs":
+        return "Search scraped URLs"
+    if source_group == "PDF pages":
+        return "Search PDF pages"
+    return "Search sources"
+
+
+def _document_search_placeholder(source_group: str) -> str:
+    if source_group == "Scraped URLs":
+        return "Title, URL path, or section"
+    if source_group == "PDF pages":
+        return "Document, page number, or source id"
+    return "Title, path, or source id"
+
+
+def _document_search_blob(row: pd.Series, source_group: str) -> str:
+    field_names = [
+        "title",
+        "display_path",
+        "category_label",
+        "collection_label",
+        "url_or_path",
+        "original_url",
+        "original_path",
+        "source_path",
+        "markdown",
+        "source_id",
+        "pdf_source_id",
+        "page_number",
+    ]
+    values = [str(row.get(field) or "") for field in field_names]
+    if source_group == "Scraped URLs":
+        segments = _url_path_segments(row.get("url_or_path"))
+        values.extend(segments)
+        values.extend(_document_index_label(segment) for segment in segments)
+    elif source_group == "PDF pages":
+        page_number = _coerce_int(row.get("page_number"), 0)
+        if page_number:
+            values.extend([f"page {page_number}", f"p {page_number}"])
+    return " ".join(value for value in values if value).lower()
+
+
+def _filter_document_rows_by_search(visible_docs: pd.DataFrame, query: str, source_group: str) -> pd.DataFrame:
+    tokens = [token.lower() for token in re.split(r"\s+", query.strip()) if token.strip()]
+    if visible_docs.empty or not tokens:
+        return visible_docs
+    searchable = visible_docs.apply(lambda row: _document_search_blob(row, source_group), axis=1)
+    mask = pd.Series(True, index=visible_docs.index)
+    for token in tokens:
+        mask = mask & searchable.str.contains(re.escape(token), case=False, na=False, regex=True)
+    return visible_docs[mask]
+
+
+def _document_category_selector(group_docs: pd.DataFrame, *, source_group: str) -> str:
+    records = _document_category_records(group_docs)
+    total_count = int(len(group_docs))
+    all_key = "__all__"
+    options = [all_key] + [record["key"] for record in records]
+    labels = {all_key: f"{_document_all_category_label(source_group)} ({total_count:,})"}
+    labels.update(
+        {
+            record["key"]: f"{_document_category_display_label(record['label'], source_group)} ({record['count']:,})"
+            for record in records
+        }
+    )
+    widget_key = f"documents_category_{_widget_key_token(source_group)}"
+    if st.session_state.get(widget_key) not in options:
+        st.session_state[widget_key] = all_key
+    selected = st.selectbox(
+        _document_category_axis_label(source_group),
+        options=options,
+        format_func=lambda value: labels.get(str(value), str(value)),
+        key=widget_key,
+        disabled=len(records) <= 1,
+    )
+    return str(selected or all_key)
+
+
+def _sort_document_rows(visible_docs: pd.DataFrame) -> pd.DataFrame:
+    if visible_docs.empty:
+        return visible_docs
+    sortable = visible_docs.copy()
+    for column in ("category_label", "sort_path", "display_path", "title", "source_id"):
+        if column not in sortable.columns:
+            sortable[column] = ""
+    if "page_number" in sortable.columns:
+        sortable["_page_sort"] = pd.to_numeric(sortable["page_number"], errors="coerce").fillna(0).astype(int)
+    else:
+        sortable["_page_sort"] = 0
+    return sortable.sort_values(
+        ["category_label", "_page_sort", "sort_path", "title", "source_id"],
+        ascending=[True, True, True, True, True],
+        kind="stable",
+    ).drop(columns=["_page_sort"], errors="ignore")
+
+
+def _document_index_label(value: object) -> str:
+    label = unquote(str(value or "").strip())
+    label = re.sub(r"\s+", " ", label).strip(" /\t\n\r")
+    if not label:
+        return ""
+    label = re.sub(r"\.(?:aspx?|html?|md)$", "", label, flags=re.IGNORECASE)
+    label = re.sub(r"[-_]+", " ", label)
+    label = re.sub(r"\s+", " ", label).strip()
+    if label and label == label.lower():
+        label = label.title()
+    return label
+
+
+def _document_web_index_title(row: dict) -> str:
+    title = _document_index_label(row.get("title"))
+    if title and not title.lower().startswith("web "):
+        return title
+    segments = _url_path_segments(row.get("url_or_path"))
+    if not segments:
+        return "Home"
+    return _document_index_label(segments[-1]) or segments[-1]
+
+
+def _document_source_title(row: dict, source_group: str) -> str:
+    if source_group == "Scraped URLs":
+        return _shorten_middle(_document_web_index_title(row), max_chars=58)
+    if source_group == "PDF pages":
+        page_number = _document_page_number(row)
+        part_index = _coerce_int(row.get("part_index"), 0)
+        title = f"Page {page_number}" if page_number else _format_document_title(row.get("title"))
+        if part_index:
+            title = f"{title} · part {part_index}"
+        return _shorten_middle(title, max_chars=58)
+    return _shorten_middle(_format_document_title(row.get("title")), max_chars=58)
+
+
+def _document_source_subtitle(row: dict, source_group: str) -> str:
+    status = str(row.get("status") or "unknown").replace("-", " ")
+    status_note = "" if status == "ready" else status
+    if source_group == "Scraped URLs":
+        return status_note
+    if source_group == "PDF pages":
+        part_index = _coerce_int(row.get("part_index"), 0)
+        notes = [f"part {part_index}"] if part_index else []
+        if status_note:
+            notes.append(status_note)
+        return " · ".join(notes)
+    return status_note
+
+
+def _mark_source_index_loading(selected_key: str, loading_key: str, item_id: str) -> None:
+    st.session_state[selected_key] = item_id
+    st.session_state[loading_key] = item_id
+
+
+def _source_index_picker(
+    records: list[dict],
+    *,
+    group_token: str,
+    selected_key: str,
+    loading_key: str,
+    item_id_func,
+    title_func,
+    category_func,
+    subtitle_func=None,
+    max_items: int = 220,
+    default_id: str | None = None,
+    overflow_hint: str = "Refine by section or search.",
+) -> dict | None:
+    if not records:
+        return None
+    rendered_records = records[:max_items]
+    valid_ids = [str(item_id_func(row, idx) or idx) for idx, row in enumerate(rendered_records)]
+    if st.session_state.get(selected_key) not in valid_ids:
+        st.session_state[selected_key] = default_id if default_id in valid_ids else valid_ids[0]
+
+    if len(records) > len(rendered_records):
+        st.caption(f"Showing first {len(rendered_records):,} of {len(records):,}. {overflow_hint}")
+    with st.container(height=620, border=False, key=f"source_index_list_{group_token}"):
+        last_category = ""
+        for idx, row in enumerate(rendered_records):
+            item_id = valid_ids[idx]
+            category_label = str(category_func(row) or "")
+            if category_label and category_label != last_category:
+                st.markdown(f'<div class="document-index-section">{escape(category_label)}</div>', unsafe_allow_html=True)
+                last_category = category_label
+            title = str(title_func(row) or "Untitled")
+            subtitle = str(subtitle_func(row) or "") if subtitle_func else ""
+            selected = item_id == st.session_state.get(selected_key)
+            card_state = "selected" if selected else "item"
+            with st.container(
+                border=False,
+                key=f"source_index_card_{card_state}_{group_token}_{_widget_key_token(item_id)}_{idx}",
+            ):
+                st.button(
+                    title,
+                    key=f"source_index_button_{group_token}_{_widget_key_token(item_id)}_{idx}",
+                    use_container_width=True,
+                    type="primary" if selected else "secondary",
+                    on_click=_mark_source_index_loading,
+                    args=(selected_key, loading_key, item_id),
+                )
+                if subtitle:
+                    st.markdown(
+                        f'<div class="document-index-note">{escape(_shorten_middle(subtitle, max_chars=72))}</div>',
+                        unsafe_allow_html=True,
+                    )
+    selected_id = str(st.session_state.get(selected_key) or valid_ids[0])
+    selected_index = valid_ids.index(selected_id) if selected_id in valid_ids else 0
+    return rendered_records[selected_index]
+
+
+def _document_source_picker(visible_docs: pd.DataFrame, *, source_group: str, max_cards: int = 220) -> dict | None:
+    visible_docs = _sort_document_rows(visible_docs)
+    all_records = visible_docs.to_dict("records")
+    group_token = _widget_key_token(source_group)
+    return _source_index_picker(
+        all_records,
+        group_token=f"documents_{group_token}",
+        selected_key=f"documents_selected_source_{group_token}",
+        loading_key=f"documents_loading_source_{group_token}",
+        item_id_func=lambda row, idx: str(row.get("source_id") or idx),
+        title_func=lambda row: _document_source_title(row, source_group),
+        category_func=lambda row: _document_category_display_label(str(row.get("category_label") or ""), source_group),
+        subtitle_func=lambda row: _document_source_subtitle(row, source_group),
+        max_items=max_cards,
+    )
+
+
+def _render_markdown_preview(markdown_text: str, title: object = "Preview", *, source_label: object = "") -> None:
+    if source_label:
+        st.caption(f"Source: {_shorten_middle(source_label, max_chars=120)}")
+    st.markdown(f"#### {_format_document_title(title)}")
+    with st.container(border=True, key="documents_markdown_preview"):
+        st.markdown(markdown_text or "_No markdown content was extracted._")
+
+
+def _read_source_markdown(layout, markdown_path: str, *, max_chars: int | None = None) -> tuple[str, str]:
+    if not markdown_path:
+        return "", "No markdown path is recorded for this source."
+    candidate = Path(markdown_path)
+    if not candidate.is_absolute():
+        candidate = layout.site_root / markdown_path
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(layout.site_root.resolve())
+    except ValueError:
+        return "", "Source markdown path is outside this workspace."
+    if not resolved.exists() or not resolved.is_file():
+        return "", "Source markdown file was not found."
+    text = resolved.read_text(encoding="utf-8", errors="replace")
+    return (text[:max_chars] if max_chars is not None else text), ""
+
+
+def _list_wiki_markdown_files(wiki_dir: Path) -> list[str]:
+    if not wiki_dir.exists():
+        return []
+    paths: list[str] = []
+    for path in sorted(wiki_dir.rglob("*.md")):
+        try:
+            rel = path.relative_to(wiki_dir)
+        except ValueError:
+            continue
+        if rel.parts and rel.parts[0] == "reports":
+            continue
+        paths.append(str(rel))
+    return paths
+
+
+def _wiki_markdown_title(rel_path: str) -> str:
+    path = Path(rel_path)
+    stem = path.stem
+    if stem.lower() == "index":
+        if len(path.parts) <= 1:
+            return "Overview"
+        return _document_index_label(path.parts[-2]) or path.parts[-2]
+    return _document_index_label(stem) or stem or rel_path
+
+
+def _wiki_markdown_category(rel_path: str) -> str:
+    path = Path(rel_path)
+    if len(path.parts) <= 1:
+        return "Overview"
+    return _document_index_label(path.parts[0]) or path.parts[0]
+
+
+def _wiki_markdown_records(wiki_markdown_files: list[str]) -> list[dict]:
+    records = [
+        {
+            "path": rel_path,
+            "title": _wiki_markdown_title(rel_path),
+            "category": _wiki_markdown_category(rel_path),
+            "search_text": " ".join(
+                [
+                    rel_path,
+                    _wiki_markdown_title(rel_path),
+                    _wiki_markdown_category(rel_path),
+                    " ".join(_document_index_label(part) for part in Path(rel_path).parts),
+                ]
+            ).lower(),
+        }
+        for rel_path in wiki_markdown_files
+    ]
+    return sorted(
+        records,
+        key=lambda row: (
+            str(row["category"]).lower() != "overview",
+            str(row["category"]).lower(),
+            str(row["title"]).lower(),
+            str(row["path"]).lower(),
+        ),
+    )
+
+
+def _filter_wiki_markdown_records(records: list[dict], query: str) -> list[dict]:
+    tokens = [token.lower() for token in re.split(r"\s+", query.strip()) if token.strip()]
+    if not tokens:
+        return records
+    filtered: list[dict] = []
+    for record in records:
+        haystack = str(record.get("search_text") or "").lower()
+        if all(token in haystack for token in tokens):
+            filtered.append(record)
+    return filtered
+
+
+def _wiki_markdown_picker(records: list[dict], *, max_cards: int = 220) -> dict | None:
+    return _source_index_picker(
+        records,
+        group_token="wiki_markdown",
+        selected_key="wiki_markdown_file_browser",
+        loading_key="wiki_loading_markdown_file",
+        item_id_func=lambda row, idx: str(row.get("path") or idx),
+        title_func=lambda row: str(row.get("title") or row.get("path") or "Untitled"),
+        category_func=lambda row: str(row.get("category") or "Overview"),
+        max_items=max_cards,
+        default_id="index.md",
+        overflow_hint="Refine by section or search.",
+    )
+
+
+def _read_wiki_markdown(layout, rel_path: str, *, max_chars: int = 60000) -> tuple[str, str]:
+    if not rel_path:
+        return "", "No wiki Markdown file selected."
+    candidate = layout.wiki_dir / rel_path
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(layout.wiki_dir.resolve())
+    except ValueError:
+        return "", "Wiki Markdown path is outside this workspace."
+    if not resolved.exists() or not resolved.is_file():
+        return "", "Wiki Markdown file was not found."
+    return resolved.read_text(encoding="utf-8", errors="replace")[:max_chars], ""
+
+
+def _parse_markdown_frontmatter(text: str) -> dict:
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---", 4)
+    if end < 0:
+        return {}
+    metadata: dict = {}
+    current_key = ""
+    for line in text[4:end].splitlines():
+        if line.startswith("  - ") and current_key:
+            metadata.setdefault(current_key, []).append(line[4:].strip())
+        elif ":" in line:
+            key, value = line.split(":", 1)
+            current_key = key.strip()
+            metadata[current_key] = value.strip() if value.strip() else []
+    return metadata
+
+
+def _strip_markdown_frontmatter(text: str) -> str:
+    if not text.startswith("---\n"):
+        return text
+    end = text.find("\n---", 4)
+    return text[end + 4 :].lstrip() if end >= 0 else text
+
+
 def _load_run_analytics_inputs(site_id: str, run_id: str, run_root: Path) -> tuple[list[dict], list[dict], dict, list[dict]]:
     pages: list[dict] = []
     seen_urls: set[str] = set()
@@ -743,10 +1751,10 @@ def _load_run_analytics_inputs(site_id: str, run_id: str, run_root: Path) -> tup
                 seen_urls.add(url)
 
     _merge_rows(read_json(run_root / "scrape_manifest.json", []))
-    _merge_rows(read_json(run_root / "pages.jsonl", []))
+    _merge_rows(read_page_states(run_root))
     failures = read_json(run_root / "failures.json", [])
-    run_status = read_json(run_root / "run_status.json", {})
-    scrape_events = read_json(run_root / "events.jsonl", [])
+    run_status = read_run_status(run_root)
+    scrape_events = read_run_events(run_root)
 
     store = _get_store()
     live_pages = store.get_pages(site_id, run_id)
@@ -762,70 +1770,921 @@ def _load_run_analytics_inputs(site_id: str, run_id: str, run_root: Path) -> tup
     return pages, failures if isinstance(failures, list) else [], run_status if isinstance(run_status, dict) else {}, scrape_events if isinstance(scrape_events, list) else []
 
 
+def _fmt_compact_number(value: float) -> str:
+    val = float(value or 0.0)
+    abs_val = abs(val)
+    if abs_val >= 1_000_000_000:
+        return f"{val/1_000_000_000:.1f}B"
+    if abs_val >= 1_000_000:
+        return f"{val/1_000_000:.1f}M"
+    if abs_val >= 1_000:
+        return f"{val/1_000:.1f}K"
+    return f"{int(val)}" if val.is_integer() else f"{val:.1f}"
+
+
+def _fmt_usd(value: float) -> str:
+    val = float(value or 0.0)
+    if abs(val) < 0.01:
+        return f"${val:.4f}"
+    if abs(val) < 1000:
+        return f"${val:.2f}"
+    return f"${val/1000:.1f}K"
+
+
+def _parse_metrics_ts(value: object):
+    try:
+        return pd.to_datetime(value, utc=True, errors="coerce")
+    except Exception:
+        return pd.NaT
+
+
+def _run_id_timestamp(run_id: str):
+    value = str(run_id or "").strip()
+    if not value:
+        return pd.NaT
+    try:
+        return pd.Timestamp(datetime.strptime(value.split("-", 1)[0], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc))
+    except ValueError:
+        pass
+    manual_match = re.match(r"^manual-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})(?:-(\d{1,6}))?", value)
+    if manual_match:
+        year, month, day, hour, minute, second, micros = manual_match.groups()
+        return pd.Timestamp(
+            datetime(
+                int(year),
+                int(month),
+                int(day),
+                int(hour),
+                int(minute),
+                int(second),
+                int((micros or "0").ljust(6, "0")[:6]),
+                tzinfo=timezone.utc,
+            )
+        )
+    return pd.NaT
+
+
+def _run_metrics_timestamp(run_id: str, run_status: dict, pages: list[dict], events: list[dict]):
+    candidates = [
+        _parse_metrics_ts(run_status.get("started_at")),
+        _parse_metrics_ts(run_status.get("finished_at")),
+        _parse_metrics_ts(run_status.get("created_at")),
+        _run_id_timestamp(run_id),
+    ]
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        candidates.append(_parse_metrics_ts(page.get("started_at")))
+        candidates.append(_parse_metrics_ts(page.get("finished_at")))
+    for event in events:
+        if isinstance(event, dict):
+            candidates.append(_parse_metrics_ts(event.get("ts")))
+    valid = [item for item in candidates if pd.notna(item)]
+    return min(valid) if valid else pd.NaT
+
+
+def _metrics_window_start(window_label: str):
+    now = pd.Timestamp.now(tz="UTC")
+    days_by_label = {
+        "Last 7 days": 7,
+        "Last 30 days": 30,
+        "Last 3 months": 90,
+        "Last 6 months": 180,
+        "Last year": 365,
+    }
+    days = days_by_label.get(window_label)
+    return None if days is None else now - pd.Timedelta(days=days)
+
+
+def _normalize_trace_metrics(trace_df: pd.DataFrame) -> pd.DataFrame:
+    if trace_df.empty:
+        return pd.DataFrame()
+    df = trace_df.copy()
+    df["provider"] = (df["provider"] if "provider" in df.columns else pd.Series("unknown", index=df.index)).fillna("unknown").astype(str)
+    df["operation"] = (df["operation"] if "operation" in df.columns else pd.Series("unknown", index=df.index)).fillna("unknown").astype(str)
+    df["model"] = (df["model"] if "model" in df.columns else pd.Series("unknown", index=df.index)).fillna("unknown").astype(str)
+    for col in ("prompt_tokens", "completion_tokens", "total_tokens", "cost_usd"):
+        values = df[col] if col in df.columns else pd.Series(0.0, index=df.index)
+        df[col] = pd.to_numeric(values, errors="coerce").fillna(0.0)
+    return df[~df.get("is_summary", pd.Series(False, index=df.index)).fillna(False).astype(bool)].copy()
+
+
+def _build_run_metrics_row(
+    *,
+    site_id: str,
+    run_id: str,
+    site_root: Path,
+    model_map: dict,
+    tavily_per_call: float,
+    ollama_in_per_m: float,
+    ollama_out_per_m: float,
+) -> dict:
+    run_root = site_root / run_id
+    run_events = load_events(run_root)
+    pages, failures, run_status, scrape_events = _load_run_analytics_inputs(site_id, run_id, run_root)
+    selected_urls = read_json(run_root / "selected_urls.json", [])
+    cleanup_manifest = read_json(run_root / "cleanup_manifest.json", [])
+    selected_count = len(selected_urls) if isinstance(selected_urls, list) else 0
+    cleaned_count = len([row for row in cleanup_manifest if isinstance(row, dict) and row.get("status") == "cleaned"])
+    skipped_count = len([row for row in cleanup_manifest if isinstance(row, dict) and row.get("status") == "skipped"])
+    page_summary = summarize_pages(pages, run_status=run_status, total_hint=selected_count)
+    duration_summary = summarize_durations(pages)
+    output_summary = summarize_output_volume(pages)
+    trace_df = _build_trace_df(
+        run_events=run_events,
+        site_events=[],
+        model_map=model_map,
+        tavily_per_call=tavily_per_call,
+        ollama_in_per_m=ollama_in_per_m,
+        ollama_out_per_m=ollama_out_per_m,
+    )
+    billable_trace = _normalize_trace_metrics(trace_df)
+    run_ts = _run_metrics_timestamp(run_id, run_status, pages, scrape_events + run_events)
+    return {
+        "run_id": run_id,
+        "run_label": _run_human_timestamp(run_id),
+        "run_ts": run_ts,
+        "state": str(run_status.get("state") or page_summary.get("state") or "unknown"),
+        "selected_urls": selected_count,
+        "total_pages": int(page_summary.get("total") or 0),
+        "done_pages": int(page_summary.get("done") or 0),
+        "scraped_pages": int(page_summary.get("success") or 0),
+        "cleaned_pages": cleaned_count,
+        "skipped_pages": skipped_count,
+        "failed_pages": int(page_summary.get("failed") or 0),
+        "cancelled_pages": int(page_summary.get("cancelled") or 0),
+        "success_rate": float(page_summary.get("success_rate") or 0.0),
+        "elapsed_min": float(page_summary.get("elapsed_sec") or 0.0) / 60.0,
+        "pages_per_min": float(page_summary.get("pages_per_min") or 0.0),
+        "p50_sec": float(duration_summary.get("p50_sec") or 0.0),
+        "p95_sec": float(duration_summary.get("p95_sec") or 0.0),
+        "markdown_bytes": int(output_summary.get("markdown_total_bytes") or 0),
+        "raw_html_bytes": int(output_summary.get("raw_html_total_bytes") or 0),
+        "provider_requests": int(len(billable_trace)),
+        "total_tokens": float(billable_trace["total_tokens"].sum()) if not billable_trace.empty else 0.0,
+        "cost_usd": float(billable_trace["cost_usd"].sum()) if not billable_trace.empty else 0.0,
+        "failure_records": len(failures),
+    }
+
+
 def _apply_compact_ui_styles() -> None:
     st.markdown(
         """
         <style>
-        html, body, [class*="st-"], [data-testid="stAppViewContainer"] {
+        :root {
+            --canvas: #faf9f5;
+            --ink: #141413;
+            --body: #3d3d3a;
+            --muted: #6c6a64;
+            --hairline: #e6dfd8;
+            --primary: #cc785c;
+            --primary-rgb: 204, 120, 92;
+            --primary-active: #a9583e;
+            --electric: #66f2d5;
+            --sunburst: #ffd166;
+            --plum: #8f6cff;
+            --on-primary: #ffffff;
+            --on-dark: #faf9f5;
+            --on-dark-rgb: 250, 249, 245;
+            --shadow-soft: 0 18px 42px rgba(24, 23, 21, 0.08);
+            --shadow-card: 0 12px 28px rgba(24, 23, 21, 0.05);
+            --radius-md: 12px;
+            --radius-lg: 18px;
+            --radius-xl: 24px;
+            --display-font: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+            --body-font: "Avenir Next", "Segoe UI", Inter, sans-serif;
+            --code-font: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace;
+        }
+        html, body, .stApp, [data-testid="stApp"], [data-testid="stAppViewContainer"] {
             font-size: 14px;
-            color: #0f172a;
+            color: var(--body);
+            font-family: var(--body-font);
+        }
+        [data-testid="stAppViewContainer"] {
+            background:
+                radial-gradient(circle at top left, rgba(204, 120, 92, 0.10), transparent 28%),
+                radial-gradient(circle at 88% 8%, rgba(93, 184, 166, 0.08), transparent 24%),
+                linear-gradient(180deg, #f8f5ee 0%, var(--canvas) 14%, var(--canvas) 100%);
         }
         .main .block-container {
-            padding-top: 2.2rem;
-            padding-bottom: 1.8rem;
-            max-width: 1180px;
+            padding-top: 2.4rem;
+            padding-bottom: 2.5rem;
+            max-width: 1240px;
         }
         h1 {
-            font-size: 1.7rem !important;
-            line-height: 1.2 !important;
-            margin-bottom: 0.45rem !important;
-            color: #0f172a !important;
-            font-weight: 750 !important;
+            font-family: var(--display-font) !important;
+            font-size: 3.6rem !important;
+            line-height: 1.03 !important;
+            letter-spacing: -0.04em !important;
+            margin-bottom: 0.55rem !important;
+            color: var(--ink) !important;
+            font-weight: 500 !important;
         }
         h2, h3 {
-            font-size: 1.08rem !important;
-            line-height: 1.25 !important;
-            margin-top: 0.95rem !important;
-            margin-bottom: 0.45rem !important;
-            color: #0f172a !important;
-            font-weight: 750 !important;
+            font-family: var(--display-font) !important;
+            line-height: 1.15 !important;
+            margin-top: 1.1rem !important;
+            margin-bottom: 0.55rem !important;
+            color: var(--ink) !important;
+            font-weight: 500 !important;
+            letter-spacing: -0.02em !important;
+        }
+        h2 {
+            font-size: 2rem !important;
+        }
+        h3 {
+            font-size: 1.35rem !important;
         }
         p, label, .stMarkdown, .stCaption, [data-testid="stMarkdownContainer"] {
-            font-size: 0.88rem !important;
-            line-height: 1.42 !important;
+            font-size: 0.95rem !important;
+            line-height: 1.55 !important;
+            color: var(--body);
+        }
+        [data-testid="stCaptionContainer"] p, .stCaption {
+            color: var(--muted) !important;
         }
         [data-testid="stMetric"] {
-            border: 1px solid #e2e8f0;
-            border-radius: 8px;
-            padding: 12px 14px;
-            background: #ffffff;
+            position: relative;
+            overflow: hidden;
+            border: 1px solid rgba(var(--on-dark-rgb), 0.18);
+            border-radius: var(--radius-md);
+            padding: 16px 18px;
+            background:
+                radial-gradient(circle at top right, rgba(102, 242, 213, 0.16), transparent 34%),
+                radial-gradient(circle at bottom left, rgba(255, 209, 102, 0.13), transparent 30%),
+                linear-gradient(145deg, rgba(18, 17, 16, 0.98), rgba(44, 34, 31, 0.96));
+            box-shadow: 0 16px 34px rgba(24, 23, 21, 0.18), inset 0 1px 0 rgba(255,255,255,0.08);
         }
+        [data-testid="stMetric"]::before {
+            content: none;
+            display: none;
+        }
+        [data-testid="stMetricLabel"],
+        [data-testid="stMetricLabel"] *,
         [data-testid="stMetricLabel"] p {
-            font-size: 0.76rem !important;
+            font-size: 0.74rem !important;
+            text-transform: uppercase;
+            letter-spacing: 0.13em;
+            color: rgba(var(--on-dark-rgb), 0.82) !important;
+            -webkit-text-fill-color: rgba(var(--on-dark-rgb), 0.82) !important;
         }
-        [data-testid="stMetricValue"] {
-            font-size: 1.18rem !important;
-            line-height: 1.15 !important;
-            color: #0f172a !important;
-            font-weight: 750 !important;
+        [data-testid="stMetricValue"],
+        [data-testid="stMetricValue"] *,
+        [data-testid="stMetricValue"] div {
+            font-family: var(--display-font) !important;
+            font-size: 1.55rem !important;
+            line-height: 1.05 !important;
+            letter-spacing: -0.03em !important;
+            color: #fffaf0 !important;
+            -webkit-text-fill-color: #fffaf0 !important;
+            opacity: 1 !important;
+            font-weight: 650 !important;
+            text-shadow: 0 1px 0 rgba(0,0,0,0.45), 0 0 18px rgba(255, 209, 102, 0.12);
+        }
+        [data-testid="stMetricDelta"] svg {
+            fill: rgba(102, 242, 213, 0.78) !important;
+        }
+        [data-testid="stMetricDelta"],
+        [data-testid="stMetricDelta"] *,
+        [data-testid="stMetricDelta"] > div {
+            color: rgba(var(--on-dark-rgb), 0.82) !important;
+            -webkit-text-fill-color: rgba(var(--on-dark-rgb), 0.82) !important;
+        }
+        .operator-metric-strip {
+            display: grid;
+            grid-template-columns: repeat(var(--metric-columns, 4), minmax(0, 1fr));
+            gap: 1rem;
+            margin: 0 0 1.1rem 0;
+        }
+        .operator-metric-card {
+            position: relative;
+            overflow: hidden;
+            min-height: 82px;
+            border: 1px solid rgba(var(--on-dark-rgb), 0.18);
+            border-radius: var(--radius-md);
+            padding: 14px 16px 13px;
+            background:
+                radial-gradient(circle at 92% 12%, rgba(102, 242, 213, 0.18), transparent 32%),
+                radial-gradient(circle at 8% 98%, rgba(255, 209, 102, 0.12), transparent 28%),
+                linear-gradient(145deg, rgba(18, 17, 16, 0.985), rgba(45, 35, 31, 0.96));
+            box-shadow: 0 16px 34px rgba(24, 23, 21, 0.18), inset 0 1px 0 rgba(255,255,255,0.08);
+        }
+        .operator-metric-card::after {
+            content: none;
+            display: none;
+        }
+        .operator-metric-label {
+            display: flex;
+            align-items: center;
+            gap: 0.42rem;
+            color: rgba(var(--on-dark-rgb), 0.84);
+            font-family: var(--code-font);
+            font-size: 0.66rem;
+            font-weight: 760;
+            letter-spacing: 0.13em;
+            text-transform: uppercase;
+        }
+        .operator-metric-sigil {
+            color: var(--electric);
+            text-shadow: 0 0 14px rgba(102, 242, 213, 0.34);
+        }
+        .operator-metric-value {
+            margin-top: 0.48rem;
+            color: #fffaf0;
+            font-family: var(--display-font);
+            font-size: clamp(1.12rem, 1.55vw, 1.52rem);
+            font-weight: 720;
+            line-height: 1.08;
+            letter-spacing: -0.035em;
+            text-shadow: 0 1px 0 rgba(0,0,0,0.48), 0 0 22px rgba(255, 209, 102, 0.12);
+        }
+        .operator-metric-foot {
+            margin-top: 0.4rem;
+            color: rgba(var(--on-dark-rgb), 0.78);
+            font-size: 0.72rem;
+            font-weight: 650;
         }
         button, input, textarea, select, [role="tab"] {
-            font-size: 0.86rem !important;
+            font-size: 0.9rem !important;
+            font-family: var(--body-font) !important;
+        }
+        .stButton > button, [data-testid="stFormSubmitButton"] button {
+            border-radius: 999px !important;
+            border: 1px solid var(--primary) !important;
+            background: var(--primary) !important;
+            color: var(--on-primary) !important;
+            min-height: 2.85rem !important;
+            padding: 0.7rem 1.15rem !important;
+            box-shadow: none !important;
+            transition: all 120ms ease !important;
+            font-weight: 600 !important;
+        }
+        .stButton > button *, [data-testid="stFormSubmitButton"] button * {
+            color: var(--on-primary) !important;
+        }
+        .stButton > button[kind="primary"],
+        .stButton > button[data-kind="primary"],
+        [data-testid="stBaseButton-primary"],
+        [data-testid="stBaseButton-primary"] > button,
+        [data-testid="stFormSubmitButton"] button[kind="primary"] {
+            background: var(--primary) !important;
+            color: var(--on-primary) !important;
+            border-color: var(--primary) !important;
+        }
+        .stButton > button[kind="primary"]:hover,
+        .stButton > button[data-kind="primary"]:hover,
+        [data-testid="stBaseButton-primary"]:hover,
+        [data-testid="stBaseButton-primary"] > button:hover,
+        [data-testid="stFormSubmitButton"] button[kind="primary"]:hover {
+            background: var(--primary-active) !important;
+            border-color: var(--primary-active) !important;
+            color: var(--on-primary) !important;
+        }
+        .stButton > button[kind="secondary"] {
+            background: var(--primary) !important;
+            color: var(--on-primary) !important;
+            border-color: var(--primary) !important;
+        }
+        .stButton > button:hover {
+            transform: translateY(-1px);
+            background: var(--primary-active) !important;
+            border-color: var(--primary-active) !important;
+            color: var(--on-primary) !important;
+        }
+        .stButton > button:hover *, [data-testid="stFormSubmitButton"] button:hover * {
+            color: var(--on-primary) !important;
+        }
+        [data-testid="stTextInputRootElement"] > div,
+        [data-testid="stTextAreaRootElement"] textarea,
+        [data-testid="stNumberInput"] input,
+        [data-baseweb="select"] > div,
+        [data-testid="stDateInputField"] {
+            border-radius: var(--radius-md) !important;
+            border-color: var(--hairline) !important;
+            background: rgba(255, 255, 255, 0.70) !important;
+        }
+        [data-testid="stTextInputRootElement"] > div:focus-within,
+        [data-testid="stTextAreaRootElement"] textarea:focus,
+        [data-testid="stNumberInput"] input:focus,
+        [data-baseweb="select"] > div:focus-within,
+        [data-testid="stDateInputField"]:focus-within {
+            border-color: rgba(204, 120, 92, 0.48) !important;
+            box-shadow: 0 0 0 1px rgba(204, 120, 92, 0.32), 0 8px 18px rgba(204, 120, 92, 0.10) !important;
+        }
+        [data-testid="stForm"] {
+            background: linear-gradient(180deg, rgba(255,255,255,0.62), rgba(255,255,255,0.38));
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius-lg);
+            padding: 1rem 1rem 0.6rem;
+            box-shadow: var(--shadow-card);
+        }
+        [data-testid="stTabs"] [data-baseweb="tab-list"],
+        [data-testid="stRadio"] [role="radiogroup"] {
+            gap: 0.45rem;
+            background: rgba(239, 233, 222, 0.80);
+            border: 1px solid var(--hairline);
+            border-radius: 999px;
+            padding: 0.35rem;
+            width: 100%;
+            overflow-x: auto;
+            scrollbar-width: none;
+            margin-bottom: 1.25rem;
+        }
+        [data-testid="stTabs"] [data-baseweb="tab-list"]::-webkit-scrollbar,
+        [data-testid="stRadio"] [role="radiogroup"]::-webkit-scrollbar {
+            display: none;
+        }
+        [data-testid="stTabs"] [data-baseweb="tab"],
+        [data-testid="stRadio"] [role="radiogroup"] label {
+            border-radius: 999px !important;
+            color: var(--muted) !important;
+            padding: 0.55rem 0.95rem !important;
+            height: auto !important;
+            font-weight: 600 !important;
+            letter-spacing: 0.01em;
+        }
+        [data-testid="stTabs"] [aria-selected="true"],
+        [data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) {
+            background: rgba(255, 255, 255, 0.9) !important;
+            color: var(--ink) !important;
+            box-shadow: 0 2px 10px rgba(24, 23, 21, 0.08);
         }
         [data-testid="stAlert"] {
-            border-radius: 8px;
+            border-radius: var(--radius-md);
+            border: 1px solid var(--hairline);
+            background: rgba(255, 255, 255, 0.72);
         }
         [data-testid="stDataFrame"] {
             font-size: 0.82rem !important;
+            border-radius: var(--radius-md) !important;
+            overflow: hidden !important;
+            border: 1px solid var(--hairline) !important;
+        }
+        [data-testid="stCodeBlock"] pre {
+            font-family: var(--code-font) !important;
+            border-radius: var(--radius-md) !important;
         }
         div[data-testid="stExpander"] {
-            border-radius: 8px;
+            border-radius: var(--radius-md);
+            border: 1px solid var(--hairline);
+            background: rgba(255, 255, 255, 0.62);
         }
         div[data-testid="stExpander"] details summary p {
-            font-size: 0.86rem !important;
+            font-size: 0.88rem !important;
+            color: var(--ink) !important;
+            font-weight: 600 !important;
+        }
+        [data-testid="stFileUploaderDropzone"] {
+            border-radius: var(--radius-lg) !important;
+            border: 1.5px dashed rgba(204, 120, 92, 0.35) !important;
+            background: rgba(255, 255, 255, 0.60) !important;
+        }
+        .design-shell {
+            position: relative;
+            overflow: hidden;
+            border-radius: var(--radius-xl);
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            background:
+                linear-gradient(180deg, rgba(204, 120, 92, 0.10), rgba(204, 120, 92, 0.00) 38%),
+                radial-gradient(circle at top right, rgba(93, 184, 166, 0.12), transparent 28%),
+                linear-gradient(135deg, rgba(24, 23, 21, 0.98), rgba(37, 35, 32, 0.96));
+            padding: 2rem 2rem 1.85rem;
+            color: var(--on-dark);
+            box-shadow: var(--shadow-soft);
+            margin-bottom: 1.4rem;
+        }
+        .design-shell::before {
+            content: "";
+            position: absolute;
+            inset: 0 auto auto 0;
+            width: 34%;
+            height: 1px;
+            background: rgba(250, 249, 245, 0.22);
+        }
+        .design-shell::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(120deg, transparent 0%, rgba(255,255,255,0.04) 52%, transparent 100%);
+            pointer-events: none;
+        }
+        .design-kicker {
+            font-size: 0.74rem;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            color: rgba(250, 249, 245, 0.78);
+            margin-bottom: 0.85rem;
+            font-weight: 600;
+        }
+        .design-shell h1,
+        .design-shell h2,
+        .design-shell p {
+            color: var(--on-dark) !important;
+            margin: 0;
+        }
+        .design-shell h1 {
+            font-size: 3.2rem !important;
+            max-width: 13ch;
+        }
+        .design-shell p {
+            max-width: 64ch;
+            margin-top: 0.9rem;
+            color: rgba(250, 249, 245, 0.78) !important;
+        }
+        .design-shell-copy {
+            display: grid;
+            grid-template-columns: minmax(0, 1.3fr) minmax(260px, 0.8fr);
+            gap: 1.25rem;
+            align-items: end;
+        }
+        .design-stat-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            margin-top: 1.35rem;
+            justify-content: flex-end;
+        }
+        .design-stat {
+            min-width: 144px;
+            border-radius: 14px;
+            padding: 0.8rem 0.95rem;
+            background: rgba(250, 249, 245, 0.07);
+            border: 1px solid rgba(250, 249, 245, 0.10);
+            backdrop-filter: blur(4px);
+        }
+        .design-stat-label {
+            font-size: 0.72rem;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: rgba(250, 249, 245, 0.65);
+            margin-bottom: 0.4rem;
+        }
+        .design-stat-value {
+            font-size: 1.2rem;
+            font-weight: 650;
+            color: var(--on-dark);
+        }
+        [class*="st-key-workspace_card_"] {
+            border-radius: var(--radius-lg);
+            padding: 1.15rem;
+            background:
+                radial-gradient(circle at top right, rgba(var(--primary-rgb), 0.10), transparent 26%),
+                linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,255,255,0.56));
+            border: 1px solid var(--hairline);
+            box-shadow: var(--shadow-card);
+            margin-bottom: 1rem;
+        }
+        .catalog-card-title {
+            font-family: var(--display-font);
+            color: var(--ink);
+            font-size: 1.35rem;
+            line-height: 1.15;
+            margin-bottom: 0.35rem;
+        }
+        .catalog-card-meta {
+            color: var(--muted);
+            font-size: 0.9rem;
+        }
+        .workspace-card-divider {
+            height: 1px;
+            margin: 1rem 0 0.9rem;
+            background: rgba(var(--primary-rgb), 0.16);
+        }
+        .workspace-toolbar {
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius-lg);
+            background: linear-gradient(180deg, rgba(255,255,255,0.68), rgba(255,255,255,0.48));
+            padding: 1rem 1.1rem;
+            margin-bottom: 1rem;
+            box-shadow: var(--shadow-card);
+        }
+        .workspace-toolbar-title {
+            font-family: var(--display-font);
+            color: var(--ink);
+            font-size: 1.6rem;
+            margin-bottom: 0.15rem;
+        }
+        .workspace-toolbar-copy {
+            color: var(--muted);
+            font-size: 0.92rem;
+        }
+        .workspace-toolbar-meta {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.55rem;
+            margin-top: 0.65rem;
+            padding: 0.35rem 0.7rem;
+            border-radius: 999px;
+            background: rgba(24, 23, 21, 0.06);
+            color: var(--body);
+            font-size: 0.8rem;
+            letter-spacing: 0.04em;
+        }
+        .workspace-toolbar-meta strong {
+            color: var(--ink);
+            font-weight: 650;
+        }
+        [class*="st-key-documents_review_shell"] {
+            border-color: rgba(var(--primary-rgb), 0.14) !important;
+            background: linear-gradient(180deg, rgba(255,255,255,0.70), rgba(255,255,255,0.48)) !important;
+            box-shadow: var(--shadow-card);
+        }
+        .document-preview-countline {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            border-radius: 999px;
+            padding: 0.28rem 0.62rem;
+            margin: 0.05rem 0 0.65rem;
+            background: rgba(24,23,21,0.055);
+            color: var(--muted);
+            font-size: 0.78rem;
+            font-weight: 650;
+        }
+        [class*="st-key-source_index_list_"] {
+            border: 1px solid rgba(24,23,21,0.08);
+            border-radius: 16px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.42), rgba(255,255,255,0.22));
+            padding: 0.28rem 0.26rem;
+        }
+        .document-index-section {
+            margin: 0.42rem 0 0.18rem;
+            padding: 0.18rem 0.55rem;
+            color: var(--muted);
+            font-family: var(--code-font);
+            font-size: 0.66rem;
+            font-weight: 750;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+        }
+        [class*="st-key-source_index_card_"] {
+            position: relative;
+            border-bottom: 0;
+            margin: 0.02rem 0;
+            padding: 0;
+        }
+        [class*="st-key-source_index_card_"] .stButton {
+            margin: 0 !important;
+        }
+        [class*="st-key-source_index_card_"] .stButton > button {
+            position: relative;
+            width: 100%;
+            min-height: 2.05rem !important;
+            border-radius: 10px !important;
+            justify-content: flex-start !important;
+            text-align: left !important;
+            padding: 0.38rem 0.62rem 0.38rem 1rem !important;
+            box-shadow: none !important;
+            font-size: 0.84rem !important;
+            font-weight: 620 !important;
+            letter-spacing: -0.005em;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            transform: none !important;
+            transition: none !important;
+        }
+        [class*="st-key-source_index_card_"] .stButton > button p,
+        [class*="st-key-source_index_card_"] .stButton > button span {
+            display: block;
+            width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            text-align: left;
+            margin: 0 !important;
+        }
+        [class*="st-key-source_index_card_"] [data-testid="stBaseButton-secondary"],
+        [class*="st-key-source_index_card_"] .stButton > button[kind="secondary"] {
+            background: transparent !important;
+            border-color: transparent !important;
+            color: var(--body) !important;
+        }
+        [class*="st-key-source_index_card_"] [data-testid="stBaseButton-secondary"] *,
+        [class*="st-key-source_index_card_"] .stButton > button[kind="secondary"] * {
+            color: var(--body) !important;
+            -webkit-text-fill-color: var(--body) !important;
+        }
+        [class*="st-key-source_index_card_"] .stButton > button:hover {
+            background: transparent !important;
+            border-color: transparent !important;
+            color: var(--body) !important;
+            box-shadow: none !important;
+            transform: none !important;
+        }
+        [class*="st-key-source_index_card_"] .stButton > button:hover * {
+            color: var(--body) !important;
+            -webkit-text-fill-color: var(--body) !important;
+        }
+        [class*="st-key-source_index_card_"] [data-testid="stBaseButton-primary"],
+        [class*="st-key-source_index_card_"] .stButton > button[kind="primary"],
+        [class*="st-key-source_index_card_selected_"] .stButton > button {
+            background: linear-gradient(90deg, rgba(var(--primary-rgb), 0.12), rgba(255,209,102,0.07) 72%, rgba(255,255,255,0.16)) !important;
+            border-color: rgba(var(--primary-rgb), 0.32) !important;
+            color: var(--ink) !important;
+            box-shadow: none !important;
+        }
+        [class*="st-key-source_index_card_"] [data-testid="stBaseButton-primary"] *,
+        [class*="st-key-source_index_card_"] .stButton > button[kind="primary"] *,
+        [class*="st-key-source_index_card_selected_"] .stButton > button * {
+            color: var(--ink) !important;
+            -webkit-text-fill-color: var(--ink) !important;
+        }
+        [class*="st-key-source_index_card_"] [data-testid="stBaseButton-primary"]:hover,
+        [class*="st-key-source_index_card_"] .stButton > button[kind="primary"]:hover,
+        [class*="st-key-source_index_card_selected_"] .stButton > button:hover {
+            background: linear-gradient(90deg, rgba(var(--primary-rgb), 0.12), rgba(255,209,102,0.07) 72%, rgba(255,255,255,0.16)) !important;
+            border-color: rgba(var(--primary-rgb), 0.32) !important;
+            color: var(--ink) !important;
+            box-shadow: none !important;
+            transform: none !important;
+        }
+        .document-index-note {
+            margin: -0.05rem 0 0.24rem 1rem;
+            color: var(--muted);
+            font-size: 0.72rem;
+            line-height: 1.25;
+        }
+        [class*="st-key-documents_markdown_preview"],
+        [class*="st-key-wiki_markdown_preview"] {
+            border-color: rgba(var(--primary-rgb), 0.12) !important;
+            background: rgba(255,255,255,0.56) !important;
+        }
+        [class*="st-key-runs_control_panel"] {
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius-lg);
+            background: rgba(255, 255, 255, 0.62);
+            padding: 0.85rem 0.95rem 0.75rem;
+            margin: 0.35rem 0 1rem;
+            box-shadow: var(--shadow-card);
+        }
+        [class*="st-key-runs_control_panel"] .stButton > button {
+            min-height: 2.35rem !important;
+            padding: 0.46rem 0.72rem !important;
+            border-radius: 12px !important;
+            background: rgba(255,255,255,0.78) !important;
+            border: 1px solid rgba(24,23,21,0.14) !important;
+            color: var(--ink) !important;
+            box-shadow: none !important;
+            font-size: 0.82rem !important;
+            font-weight: 700 !important;
+        }
+        [class*="st-key-runs_control_panel"] .stButton > button * {
+            color: var(--ink) !important;
+        }
+        [class*="st-key-runs_control_panel"] .stButton > button[kind="primary"],
+        [class*="st-key-runs_control_panel"] [data-testid="stBaseButton-primary"] {
+            background: var(--primary) !important;
+            border-color: var(--primary) !important;
+            color: var(--on-primary) !important;
+        }
+        [class*="st-key-runs_control_panel"] .stButton > button[kind="primary"] *,
+        [class*="st-key-runs_control_panel"] [data-testid="stBaseButton-primary"] * {
+            color: var(--on-primary) !important;
+        }
+        [class*="st-key-runs_control_panel"] [data-testid="stNumberInput"] input {
+            min-height: 2.35rem !important;
+            border-radius: 12px !important;
+            background: rgba(255,255,255,0.82) !important;
+        }
+        [class*="st-key-runs_control_panel"] label,
+        [class*="st-key-runs_control_panel"] label p {
+            font-size: 0.78rem !important;
+            color: var(--muted) !important;
+            font-weight: 650 !important;
+        }
+        .run-meta-line {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.45rem;
+            align-items: center;
+            margin-top: 0.5rem;
+        }
+        .run-meta-pill {
+            display: inline-flex;
+            gap: 0.35rem;
+            align-items: center;
+            border-radius: 999px;
+            background: rgba(24,23,21,0.055);
+            color: var(--muted);
+            padding: 0.3rem 0.62rem;
+            font-size: 0.76rem;
+            font-weight: 650;
+        }
+        .run-meta-pill strong,
+        .run-meta-pill code {
+            color: var(--ink);
+            font-weight: 750;
+            font-family: var(--code-font);
+            font-size: 0.74rem;
+        }
+        @media (max-width: 980px) {
+            .main .block-container {
+                padding-top: 1.3rem;
+                padding-bottom: 1.5rem;
+            }
+            h1 {
+                font-size: 2.8rem !important;
+            }
+            .design-shell {
+                padding: 1.45rem 1.2rem 1.35rem;
+            }
+            .design-shell h1 {
+                font-size: 2.55rem !important;
+                max-width: none;
+            }
+            .design-shell-copy {
+                grid-template-columns: 1fr;
+            }
+            .design-stat-row {
+                justify-content: flex-start;
+            }
+            .operator-metric-strip {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            [data-testid="stTabs"] [data-baseweb="tab-list"],
+            [data-testid="stRadio"] [role="radiogroup"] {
+                width: calc(100vw - 2.2rem);
+            }
+        }
+        @media (max-width: 640px) {
+            .operator-metric-strip {
+                grid-template-columns: 1fr;
+            }
         }
         </style>
         """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_workflow_navigation(options: list[str]) -> str:
+    """Render a lazy top-level section selector.
+
+    Streamlit tabs eagerly execute every tab body on each interaction, which made
+    this app feel slow once source tables, wiki reports, and metrics grew large.
+    A keyed radio keeps the same workflow affordance while only rendering the
+    selected section below.
+    """
+    if not options:
+        return ""
+    if st.session_state.get("workflow_active_tab") not in options:
+        st.session_state["workflow_active_tab"] = options[0]
+    return str(
+        st.radio(
+            "Workflow section",
+            options=options,
+            key="workflow_active_tab",
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+    )
+
+
+def _render_shell_banner(*, kicker: str, title: str, subtitle: str, stats: list[tuple[str, str]] | None = None) -> None:
+    stats = stats or []
+    stats_html = "".join(
+        (
+            '<div class="design-stat">'
+            f'<div class="design-stat-label">{escape(_safe_text(label), quote=True)}</div>'
+            f'<div class="design-stat-value">{escape(_safe_text(value), quote=True)}</div>'
+            "</div>"
+        )
+        for label, value in stats
+    )
+    st.markdown(
+        (
+            '<section class="design-shell">'
+            f'<div class="design-kicker">{escape(_safe_text(kicker), quote=True)}</div>'
+            '<div class="design-shell-copy">'
+            '<div>'
+            f"<h1>{escape(_safe_text(title), quote=True)}</h1>"
+            f"<p>{escape(_safe_text(subtitle), quote=True)}</p>"
+            "</div>"
+            f'<div class="design-stat-row">{stats_html}</div>'
+            "</div>"
+            "</section>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_toolbar_card(*, title: str, copy: str, meta_label: str | None = None, meta_value: str | None = None) -> None:
+    meta_html = ""
+    if meta_label and meta_value:
+        meta_html = (
+            '<div class="workspace-toolbar-meta">'
+            f"<span>{escape(_safe_text(meta_label), quote=True)}</span>"
+            f"<strong>{escape(_safe_text(meta_value), quote=True)}</strong>"
+            "</div>"
+        )
+    st.markdown(
+        (
+            '<section class="workspace-toolbar">'
+            f'<div class="workspace-toolbar-title">{escape(_safe_text(title), quote=True)}</div>'
+            f'<div class="workspace-toolbar-copy">{escape(_safe_text(copy), quote=True)}</div>'
+            f"{meta_html}"
+            "</section>"
+        ),
         unsafe_allow_html=True,
     )
 
@@ -877,10 +2736,11 @@ def _render_scraped_page_preview() -> None:
         if stripped.startswith("#"):
             first_heading = stripped.lstrip("#").strip()
             break
-    preview_title = first_heading or Path(preview.url or slug).name or "Untitled scraped page"
+    preview_source_path = _url_path_label(preview.url, max_chars=140) if preview.url else "Not recorded"
+    preview_title = first_heading or (preview_source_path if preview_source_path not in {"/", "Not recorded"} else Path(slug).name) or "Untitled scraped page"
 
     st.markdown(f"### {preview_title}")
-    st.caption(f"Source URL: `{preview.url or 'Not recorded'}`")
+    st.caption(f"Source path: `{preview_source_path}`")
     st.caption(f"Run id: `{run_id}`")
     st.caption(f"Page slug: `{slug}`")
 
@@ -892,6 +2752,7 @@ def _render_scraped_page_preview() -> None:
 
     expected_markdown_path = preview.path or (run_root / "markdown" / f"{slug}.md")
     metadata_summary_rows = [
+        {"Metric": "Source path", "Value": preview_source_path},
         {"Metric": "HTTP status", "Value": preview.http_status if preview.http_status is not None else "n/a"},
         {"Metric": "Fetch mode", "Value": preview.fetch_mode or "n/a"},
         {"Metric": "Text length", "Value": preview.text_length if preview.text_length is not None else "n/a"},
@@ -1005,12 +2866,25 @@ store = _get_store()
 runner = _get_runner()
 tmux_runner = _get_tmux_runner()
 
-st.title("University Knowledge Ops")
-st.caption("Overview -> Sources -> Runs -> Corpus -> Wiki -> Retrieval -> Settings.")
+workspace_count = len(st.session_state.get("workspaces", []))
+active_run_label = _run_human_timestamp(st.session_state.get("run_id", "")) if st.session_state.get("run_id") else "No run yet"
+
+_render_shell_banner(
+    kicker="Knowledge Operations Platform",
+    title="University Knowledge Ops",
+    subtitle="Coordinate source intake, scrape operations, document review, wiki production, embeddings, and metrics from one operator workspace.",
+    stats=[
+        ("Workflow", f"{len(WORKFLOW_TABS)} stages"),
+        ("Workspaces", f"{workspace_count:,}"),
+        ("Active run", active_run_label),
+    ],
+)
 
 if not st.session_state.get("active_workspace_id"):
-    st.subheader("Workspaces")
-    st.caption("Create a workspace for each university, then open it to use the full pipeline UI.")
+    _render_toolbar_card(
+        title="Workspace catalog",
+        copy="Create one workspace per university and reopen the full pipeline with its sources, runs, wiki, and embeddings state intact.",
+    )
 
     with st.form("new_workspace_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
@@ -1029,9 +2903,12 @@ if not st.session_state.get("active_workspace_id"):
 
     if st.session_state["workspaces"]:
         for ws in st.session_state["workspaces"]:
-            with st.container(border=True):
-                st.markdown(f"**{ws.get('name','Unnamed University')}**")
-                st.caption(f"{ws.get('url','')}")
+            with st.container(key=f"workspace_card_{ws.get('id', 'unknown')}"):
+                ws_name = _safe_text(ws.get("name"), "Unnamed University")
+                ws_url = _safe_text(ws.get("url"))
+                st.markdown(f'<div class="catalog-card-title">{escape(ws_name, quote=True)}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="catalog-card-meta">{escape(ws_url, quote=True)}</div>', unsafe_allow_html=True)
+                st.markdown('<div class="workspace-card-divider"></div>', unsafe_allow_html=True)
                 b1, b2 = st.columns([1, 1])
                 if b1.button("Open Workspace", key=f"open_ws_{ws.get('id')}"):
                     st.session_state["active_workspace_id"] = ws.get("id", "")
@@ -1048,21 +2925,28 @@ if not st.session_state.get("active_workspace_id"):
                     _save_app_state()
                     st.rerun()
     else:
-        st.info("No workspaces yet. Add one above.")
+        st.info("No workspaces yet. Create the first one above and this catalog will fill in.")
     st.stop()
 
 active_ws = next((w for w in st.session_state.get("workspaces", []) if w.get("id") == st.session_state.get("active_workspace_id")), None)
 if active_ws:
     top1, top2 = st.columns([3, 1])
-    top1.caption(f"Workspace: {active_ws.get('name')} ({active_ws.get('url')})")
+    with top1:
+        _render_toolbar_card(
+            title=_safe_text(active_ws.get("name"), "Unnamed workspace"),
+            copy=_safe_text(active_ws.get("url")),
+            meta_label="Active run",
+            meta_value=_run_human_timestamp(st.session_state.get("run_id", "")) if st.session_state.get("run_id") else "No run yet",
+        )
     if top2.button("Back to Workspaces"):
         st.session_state["active_workspace_id"] = ""
         _save_app_state()
         st.rerun()
 
-tabs = st.tabs(WORKFLOW_TABS)
+active_tab = _render_workflow_navigation(WORKFLOW_TABS)
 
-with tabs[0]:
+# with tabs[0]:
+if active_tab == WORKFLOW_TABS[0]:
     st.subheader("Overview")
     if active_ws:
         discovered_count = len(st.session_state.get("discovered") or read_json(_discovered_json_path(st.session_state["site_id"]), []))
@@ -1186,7 +3070,8 @@ with tabs[0]:
     else:
         st.warning("No active workspace selected. Go back to the workspace list and open one.")
 
-with tabs[1]:
+# with tabs[1]:
+if active_tab == WORKFLOW_TABS[1]:
     st.subheader("Sources")
     discovered_path = _discovered_json_path(st.session_state["site_id"])
     discovered_rows_for_summary = st.session_state.get("discovered") or read_json(discovered_path, [])
@@ -1249,11 +3134,21 @@ with tabs[1]:
     url_panel, doc_panel = st.columns(2)
     with url_panel:
         st.markdown("Website URLs")
+        st.caption("Refreshing discovery is additive: newly found sitemap URLs are merged with existing/manual URLs.")
         if st.button("Refresh Sitemap URLs", disabled=not st.session_state["site_url"], type="primary"):
             result = discover_site_urls(st.session_state["site_url"])
-            st.session_state["discovered"] = _to_discovered_rows(result.urls)
+            refreshed_rows = _to_discovered_rows(result.urls)
+            merged = {
+                row.get("url"): row
+                for row in st.session_state.get("discovered", [])
+                if isinstance(row, dict) and row.get("url")
+            }
+            for row in refreshed_rows:
+                if isinstance(row, dict) and row.get("url"):
+                    merged[row["url"]] = row
+            st.session_state["discovered"] = list(merged.values())
             st.session_state["selected_df"] = pd.DataFrame(st.session_state["discovered"])
-            persist_discovered(_discovered_json_path(st.session_state["site_id"]), result.urls)
+            write_json(_discovered_json_path(st.session_state["site_id"]), st.session_state["discovered"])
             _save_app_state()
             discovered_rows_for_summary = st.session_state["discovered"]
             source_count = len(
@@ -1291,6 +3186,45 @@ with tabs[1]:
             _save_app_state()
             st.success(f"Accepted {accepted:,} URL(s). Excluded {excluded:,} off-domain URL(s).")
 
+        st.markdown("Add One URL To Knowledge Base")
+        one_url = st.text_input(
+            "URL to scrape, compile, and index",
+            value="",
+            placeholder="https://example.edu/admissions/deadlines",
+            key="manual_one_url_pipeline_input",
+        )
+        if st.button(
+            "Scrape + Inject",
+            type="primary",
+            disabled=not site_id or not one_url.strip(),
+            key="manual_one_url_pipeline_run",
+        ):
+            with st.spinner("Scraping one URL and injecting it into the knowledge base..."):
+                try:
+                    pipeline_result = run_manual_url_pipeline(
+                        site_root=site_root,
+                        site_url=st.session_state.get("site_url", ""),
+                        url=one_url.strip(),
+                    )
+                except Exception as exc:
+                    st.error(f"One URL pipeline failed: {exc}")
+                else:
+                    if pipeline_result.get("status") == "rejected":
+                        st.warning(f"URL rejected: {pipeline_result.get('reason')}")
+                    else:
+                        st.session_state["run_id"] = str(pipeline_result.get("run_id") or "")
+                        st.session_state["last_run_by_site"][site_id] = st.session_state["run_id"]
+                        _save_app_state()
+                        st.success("URL scraped, compiled into the wiki, and indexed for query.")
+                        render_metric_strip(
+                            [
+                                {"label": "Raw Ready", "value": f"{int((pipeline_result.get('raw_report') or {}).get('counts', {}).get('ready', 0)):,}"},
+                                {"label": "Wiki Pages", "value": f"{int((pipeline_result.get('wiki_report') or {}).get('pages_created', 0)) + int((pipeline_result.get('wiki_report') or {}).get('pages_updated', 0)):,}"},
+                                {"label": "Raw Docs", "value": f"{int((pipeline_result.get('index_report') or {}).get('raw_index_count', 0)):,}"},
+                                {"label": "Wiki Docs", "value": f"{int((pipeline_result.get('index_report') or {}).get('wiki_index_count', 0)):,}"},
+                            ]
+                        )
+
     if not site_id:
         st.info("Create or open a workspace first.")
     else:
@@ -1307,6 +3241,7 @@ with tabs[1]:
             if isinstance(payload, list):
                 page_rows.extend([row for row in payload if isinstance(row, dict)])
         sources_by_path = {str(row.get("path") or ""): row for row in source_rows}
+        pdf_metrics = _summarize_pdf_rows(source_rows, page_rows, chunk_rows, quarantine_rows)
         if pdf_manifest and source_rows:
             changed = False
             for row in pdf_manifest:
@@ -1327,43 +3262,63 @@ with tabs[1]:
                 key="choose_pdf_uploads",
             )
             if uploaded_pdfs:
-                pdf_dir.mkdir(parents=True, exist_ok=True)
-                existing = {row.get("path"): row for row in pdf_manifest if isinstance(row, dict)}
-                for uploaded in uploaded_pdfs:
-                    target = pdf_dir / _safe_uploaded_filename(uploaded.name)
-                    target.write_bytes(uploaded.getbuffer())
-                    existing[str(target)] = {
-                        "name": uploaded.name,
-                        "path": str(target),
-                        "size_bytes": int(target.stat().st_size),
-                        "added_at": datetime.now(timezone.utc).isoformat(),
-                        "status": "ready_for_docling_zvec",
-                    }
-                pdf_manifest = sorted(existing.values(), key=lambda row: row.get("name", ""))
-                write_json(pdf_manifest_path, pdf_manifest)
-                with st.spinner("Extracting uploaded PDFs..."):
-                    try:
-                        pdf_summary = _extract_uploaded_pdfs_to_site_sources(site_root, pdf_manifest)
-                    except PdfParserUnavailableError as exc:
-                        _render_pdf_parser_unavailable_error(exc)
-                    else:
-                        st.success(
-                            f"Saved and extracted {len(uploaded_pdfs):,} PDF(s): "
-                            f"{pdf_summary['chunks']:,} search chunk(s), {pdf_summary['quarantine']:,} needing review."
-                        )
+                upload_signature = _pdf_upload_signature(uploaded_pdfs)
+                if upload_signature and st.session_state.get("last_pdf_upload_signature") != upload_signature:
+                    st.session_state["last_pdf_upload_signature"] = upload_signature
+                    pdf_dir.mkdir(parents=True, exist_ok=True)
+                    existing = {row.get("path"): row for row in pdf_manifest if isinstance(row, dict)}
+                    for uploaded in uploaded_pdfs:
+                        target = pdf_dir / _safe_uploaded_filename(uploaded.name)
+                        target.write_bytes(uploaded.getbuffer())
+                        existing[str(target)] = {
+                            "name": uploaded.name,
+                            "path": str(target),
+                            "size_bytes": int(target.stat().st_size),
+                            "added_at": datetime.now(timezone.utc).isoformat(),
+                            "status": "extracting",
+                        }
+                    pdf_manifest = sorted(existing.values(), key=lambda row: row.get("name", ""))
+                    write_json(pdf_manifest_path, pdf_manifest)
+                    _start_pdf_extraction_job(site_root, pdf_manifest)
+                    _render_pdf_live_status_loop(site_root)
+
+            pdf_status = _read_pdf_extraction_status(site_root)
             if pdf_manifest:
                 st.caption(f"{len(pdf_manifest):,} PDF document(s) uploaded.")
-                if st.button("Extract / Re-extract PDFs", type="secondary", key="extract_uploaded_pdfs_now"):
-                    with st.spinner("Extracting PDFs with PyPDF/Docling..."):
-                        try:
-                            pdf_summary = _extract_uploaded_pdfs_to_site_sources(site_root, pdf_manifest)
-                        except PdfParserUnavailableError as exc:
-                            _render_pdf_parser_unavailable_error(exc)
-                        else:
-                            st.success(
-                                f"Extraction complete: {pdf_summary['chunks']:,} search chunks, {pdf_summary['quarantine']:,} needing review."
-                            )
-                            st.rerun()
+                queue_summary = _summarize_pdf_manifest_queue(pdf_manifest)
+                if pdf_status.get("state") == "running":
+                    _render_pdf_live_status_loop(site_root)
+                else:
+                    if pdf_status.get("state") == "complete":
+                        st.success(
+                            f"PDF extraction complete: {int(pdf_status.get('pages_done') or 0):,} page(s), "
+                            f"{int(pdf_status.get('chunks') or 0):,} search chunks, "
+                            f"{int(pdf_status.get('review') or 0):,} needing review."
+                        )
+                    elif pdf_status.get("state") == "interrupted":
+                        st.warning("Previous PDF extraction was interrupted. Click Extract / Re-extract PDFs to restart with page-by-page progress.")
+                    elif pdf_status.get("state") in {"failed", "parser_unavailable"}:
+                        st.error(f"PDF extraction failed: {pdf_status.get('error') or 'unknown error'}")
+                    if source_rows or chunk_rows or quarantine_rows:
+                        _render_pdf_extraction_metrics(
+                            pdfs_done=pdf_metrics["accepted"],
+                            pdfs_total=len(pdf_manifest),
+                            pages_done=pdf_metrics["pages_done"],
+                            pages_total=queue_summary["pages"] if not queue_summary["unknown_pages"] else None,
+                            chunks=pdf_metrics["chunks"],
+                            review=pdf_metrics["quarantine"],
+                        )
+                        st.caption(f"{pdf_metrics['page_artifacts']:,} page artifact(s) prepared for the knowledge base.")
+                        if pdf_metrics["unknown_page_sources"]:
+                            st.caption(f"{pdf_metrics['unknown_page_sources']:,} extracted PDF(s) did not report a page count.")
+                if st.button(
+                    "Extract / Re-extract PDFs",
+                    type="secondary",
+                    key="extract_uploaded_pdfs_now",
+                    disabled=pdf_status.get("state") == "running",
+                ):
+                    _start_pdf_extraction_job(site_root, pdf_manifest)
+                    _render_pdf_live_status_loop(site_root)
             else:
                 st.info("Upload PDFs to include documents in the source set.")
 
@@ -1375,27 +3330,12 @@ with tabs[1]:
             prepared_cols[1].metric("Search chunks", f"{len(chunk_rows):,}")
             prepared_cols[2].metric("Needs review", f"{len(quarantine_rows):,}")
 
-with tabs[2]:
+# with tabs[2]:
+if active_tab == WORKFLOW_TABS[2]:
     st.subheader("Runs")
     runs_site_id = st.session_state.get("site_id", "")
     runs_selected_url_strings = _selected_url_strings_from_state()
     runs_run_id = st.session_state.get("run_id", "")
-    runs_discovered_path = _discovered_json_path(runs_site_id)
-    runs_discovered_rows = st.session_state.get("discovered") or (read_json(runs_discovered_path, []) if runs_site_id else [])
-    runs_source_count = len(
-        {
-            row.get("source_sitemap")
-            for row in runs_discovered_rows
-            if isinstance(row, dict) and row.get("source_sitemap")
-        }
-    )
-    runs_last_refreshed = "never"
-    if runs_discovered_path.exists():
-        runs_last_refreshed = datetime.fromtimestamp(
-            runs_discovered_path.stat().st_mtime,
-            tz=timezone.utc,
-        ).strftime("%Y-%m-%d %H:%M UTC")
-
     runs_status = {}
     runs_pages = []
     runs_summary = None
@@ -1436,78 +3376,84 @@ with tabs[2]:
     if not runs_site_id:
         st.info("Create or open a workspace first.")
     else:
-        runs_cols = st.columns([1, 1, 1, 1])
-        runs_settings = st.columns([1, 1, 2])
-        runs_concurrency = runs_settings[0].number_input(
-            "Concurrency",
-            min_value=1,
-            max_value=16,
-            value=int(st.session_state.get("scrape_concurrency", 10)),
-            step=1,
-            key="runs_scrape_concurrency",
-        )
-        st.session_state["scrape_concurrency"] = int(runs_concurrency)
-        if runs_cols[0].button("Start New Scrape", type="primary", key="runs_start_new_scrape"):
-            selected_urls = _rows_to_discovered_urls(st.session_state["selected_df"].to_dict("records"))
-            selected_urls = [
-                item
-                for item in selected_urls
-                if (urlparse(item.url.strip()).scheme in {"http", "https"} and urlparse(item.url.strip()).netloc)
-            ]
-            if not selected_urls:
-                st.session_state["scrape_status_message"] = "No URLs selected. Add selected URLs before starting a scrape."
-                st.error("No URLs selected. Add selected URLs before starting a scrape.")
-            else:
-                run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
-                st.session_state["run_id"] = run_id
-                st.session_state["last_run_by_site"][runs_site_id] = run_id
-                _save_app_state()
-                st.session_state["scrape_status_message"] = "Starting new scrape run..."
-                with st.spinner("Starting new scrape run..."):
-                    runner.start(
-                        runs_site_id,
-                        run_id,
-                        selected_urls,
-                        concurrency=int(runs_concurrency),
-                        browser_mode=st.session_state.get("scrape_browser_mode", "none"),
-                        lightpanda_cdp_url=st.session_state.get("lightpanda_cdp_url", ""),
-                    )
-                st.session_state["scrape_status_message"] = f"Started scrape for {len(selected_urls):,} selected URLs."
-                st.success(f"Started scrape for {len(selected_urls):,} selected URLs.")
-                st.rerun()
-        if runs_cols[1].button("Resume", disabled=not st.session_state["run_id"], key="runs_resume_scrape"):
-            live_run = runner.has_live_run(runs_site_id, st.session_state["run_id"])
-            resumed = runner.resume(
-                runs_site_id,
-                st.session_state["run_id"],
-                concurrency=int(runs_concurrency),
-                browser_mode=st.session_state.get("scrape_browser_mode", "none"),
-                lightpanda_cdp_url=st.session_state.get("lightpanda_cdp_url", ""),
+        with st.container(key="runs_control_panel"):
+            runs_controls = st.columns([1.05, 1.35, 0.9, 0.85, 0.85, 0.9, 1.55], gap="small", vertical_alignment="bottom")
+            runs_concurrency = runs_controls[0].number_input(
+                "Concurrency",
+                min_value=1,
+                max_value=16,
+                value=int(st.session_state.get("scrape_concurrency", 10)),
+                step=1,
+                key="runs_scrape_concurrency",
             )
-            if not resumed and live_run:
-                runner.unpause(runs_site_id, st.session_state["run_id"])
-                st.session_state["scrape_status_message"] = "Continuing paused in-memory run..."
-            elif resumed:
-                st.session_state["scrape_status_message"] = "Resuming saved run from disk state..."
-            else:
-                st.session_state["scrape_status_message"] = "No resumable pages were found for this run."
-            st.rerun()
-        if runs_cols[2].button("Pause", disabled=not st.session_state["run_id"], key="runs_pause_scrape"):
-            runner.pause(runs_site_id, st.session_state["run_id"])
-            st.session_state["scrape_status_message"] = "Pausing after in-flight pages finish..."
-            st.rerun()
-        if runs_cols[3].button("Cancel", disabled=not st.session_state["run_id"], key="runs_cancel_scrape"):
-            runner.cancel(runs_site_id, st.session_state["run_id"])
-            st.session_state["scrape_status_message"] = "Cancel requested. Stopping after in-flight pages finish..."
-            st.rerun()
-        if runs_settings[1].button("Refresh", use_container_width=True, key="runs_refresh"):
-            st.rerun()
-        runs_autorefresh = runs_settings[2].checkbox("Auto-refresh every 1s", value=False, key="runs_autorefresh")
-        if runs_autorefresh and st_autorefresh is None:
-            runs_settings[2].caption("Install `streamlit-autorefresh` to enable this without blocking. Use Refresh for now.")
-        st.caption(
-            f"Selected URLs: `{len(runs_selected_url_strings):,}`   |   Active run: `{st.session_state.get('run_id') or 'none'}`"
-        )
+            st.session_state["scrape_concurrency"] = int(runs_concurrency)
+            if runs_controls[1].button("Start New Scrape", type="primary", use_container_width=True, key="runs_start_new_scrape"):
+                selected_urls = _rows_to_discovered_urls(st.session_state["selected_df"].to_dict("records"))
+                selected_urls = [
+                    item
+                    for item in selected_urls
+                    if (urlparse(item.url.strip()).scheme in {"http", "https"} and urlparse(item.url.strip()).netloc)
+                ]
+                if not selected_urls:
+                    st.session_state["scrape_status_message"] = "No URLs selected. Add selected URLs before starting a scrape."
+                    st.error("No URLs selected. Add selected URLs before starting a scrape.")
+                else:
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
+                    st.session_state["run_id"] = run_id
+                    st.session_state["last_run_by_site"][runs_site_id] = run_id
+                    _save_app_state()
+                    st.session_state["scrape_status_message"] = "Starting new scrape run..."
+                    with st.spinner("Starting new scrape run..."):
+                        runner.start(
+                            runs_site_id,
+                            run_id,
+                            selected_urls,
+                            concurrency=int(runs_concurrency),
+                            browser_mode=st.session_state.get("scrape_browser_mode", "none"),
+                            lightpanda_cdp_url=st.session_state.get("lightpanda_cdp_url", ""),
+                        )
+                    st.session_state["scrape_status_message"] = f"Started scrape for {len(selected_urls):,} selected URLs."
+                    st.success(f"Started scrape for {len(selected_urls):,} selected URLs.")
+                    st.rerun()
+            if runs_controls[2].button("Resume", disabled=not st.session_state["run_id"], use_container_width=True, key="runs_resume_scrape"):
+                live_run = runner.has_live_run(runs_site_id, st.session_state["run_id"])
+                resumed = runner.resume(
+                    runs_site_id,
+                    st.session_state["run_id"],
+                    concurrency=int(runs_concurrency),
+                    browser_mode=st.session_state.get("scrape_browser_mode", "none"),
+                    lightpanda_cdp_url=st.session_state.get("lightpanda_cdp_url", ""),
+                )
+                if not resumed and live_run:
+                    runner.unpause(runs_site_id, st.session_state["run_id"])
+                    st.session_state["scrape_status_message"] = "Continuing paused in-memory run..."
+                elif resumed:
+                    st.session_state["scrape_status_message"] = "Resuming saved run from disk state..."
+                else:
+                    st.session_state["scrape_status_message"] = "No resumable pages were found for this run."
+                st.rerun()
+            if runs_controls[3].button("Pause", disabled=not st.session_state["run_id"], use_container_width=True, key="runs_pause_scrape"):
+                runner.pause(runs_site_id, st.session_state["run_id"])
+                st.session_state["scrape_status_message"] = "Pausing after in-flight pages finish..."
+                st.rerun()
+            if runs_controls[4].button("Cancel", disabled=not st.session_state["run_id"], use_container_width=True, key="runs_cancel_scrape"):
+                runner.cancel(runs_site_id, st.session_state["run_id"])
+                st.session_state["scrape_status_message"] = "Cancel requested. Stopping after in-flight pages finish..."
+                st.rerun()
+            if runs_controls[5].button("Refresh", use_container_width=True, key="runs_refresh"):
+                st.rerun()
+            runs_autorefresh = runs_controls[6].checkbox("Auto-refresh", value=False, key="runs_autorefresh")
+            if runs_autorefresh and st_autorefresh is None:
+                runs_controls[6].caption("Install `streamlit-autorefresh` for live auto-refresh. Use Refresh for now.")
+            active_run_id = str(st.session_state.get("run_id") or "none")
+            active_run_label_short = active_run_id if len(active_run_id) <= 46 else f"{active_run_id[:24]}…{active_run_id[-12:]}"
+            st.markdown(
+                "<div class=\"run-meta-line\">"
+                f"<span class=\"run-meta-pill\">Selected URLs <strong>{len(runs_selected_url_strings):,}</strong></span>"
+                f"<span class=\"run-meta-pill\">Active run <code title=\"{escape(active_run_id, quote=True)}\">{escape(active_run_label_short, quote=True)}</code></span>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
         if st.session_state["run_id"] and runs_summary:
             if runs_status_stale:
@@ -1577,50 +3523,34 @@ with tabs[2]:
             st.progress(progress_done / progress_total, text=runs_summary.progress_label)
             r1, r2, r3, r4, r5 = st.columns(5)
             r1.metric("State", runs_summary.state)
-            r2.metric("Success", f"{runs_summary.success:,}")
+            r2.metric("Markdown saved", f"{runs_summary.success:,}")
             r3.metric("Failed", f"{runs_summary.failed:,}")
             r4.metric("Remaining", f"{runs_summary.remaining:,}")
             r5.metric("ETA", runs_eta_label)
+            impact_cols = st.columns(4)
+            pages_per_min = (runs_summary.done / (runs_elapsed_seconds / 60.0)) if runs_elapsed_seconds > 0 else 0.0
+            impact_cols[0].metric("Queued", f"{runs_summary.queued:,}")
+            impact_cols[1].metric("Running", f"{runs_summary.running:,}")
+            impact_cols[2].metric("Elapsed", runs_elapsed_label)
+            impact_cols[3].metric("Pages / min", f"{pages_per_min:.1f}")
             if runs_status_stale:
                 st.warning("This run is paused in the UI. Resume it to continue from saved progress.")
 
-            with st.expander("Website discovery details", expanded=False):
-                d1, d2, d3 = st.columns(3)
-                d1.metric("Discovered URLs", f"{len(runs_discovered_rows):,}")
-                d2.metric("Sitemap sources", f"{runs_source_count:,}")
-                d3.metric("Last refreshed", runs_last_refreshed)
-                if runs_discovered_rows:
-                    host_counts = pd.Series(
-                        [
-                            urlparse(str(row.get("url") or "")).netloc.lower()
-                            for row in runs_discovered_rows
-                            if isinstance(row, dict)
-                        ]
-                    ).value_counts().head(12)
-                    if not host_counts.empty:
-                        st.dataframe(host_counts.rename_axis("host").reset_index(name="urls"), use_container_width=True, hide_index=True)
-
-            with st.expander("Scrape activity details", expanded=True):
-                st.caption(f"Current URL: `{runs_status.get('current_url') or 'pending initialization'}`")
-                st.caption(f"Elapsed: `{runs_elapsed_label}`")
-                st.caption(f"ETA: `{runs_eta_label}`")
-                st.caption("Current activity")
+            with st.expander("Page outcomes", expanded=False):
+                st.caption("Content Inspector")
                 running_pages = latest_pages_by_status(runs_all_page_rows, "running", limit=8)
                 if running_pages:
+                    st.caption("Running")
                     running_df = pd.DataFrame(running_pages)
                     st.dataframe(
                         running_df[[c for c in ["url", "worker_id", "fetch_mode", "attempt", "started_at"] if c in running_df.columns]],
                         use_container_width=True,
                         hide_index=True,
                     )
-                else:
-                    st.info("No pages are running right now. The queue may be waiting, paused, or already complete.")
 
-                st.caption("Recently scraped")
                 successful_pages = latest_pages_by_status(runs_all_page_rows, "success", limit=10)
                 if successful_pages:
-                    st.markdown("#### Content Inspector")
-                    st.caption("Compact preview actions for recently scraped pages.")
+                    st.caption("Recently scraped")
                     recent_preview_rows = []
                     for row in successful_pages:
                         url = str(row.get("url") or "")
@@ -1629,102 +3559,103 @@ with tabs[2]:
                             run_id=st.session_state["run_id"],
                             url=url,
                         )
-                        parsed_url = urlparse(url)
-                        title = str(row.get("title") or parsed_url.path.strip("/") or parsed_url.netloc or "Untitled page")
+                        source_path = _url_path_label(url, max_chars=110)
+                        path_title = source_path.strip("/") or "Home"
+                        title = str(row.get("title") or path_title or "Untitled page")
                         recent_preview_rows.append(
                             {
                                 "Title": title[:120],
                                 "Status": str(row.get("status") or "success"),
+                                "Source path": source_path,
                                 "Source URL": url,
                                 "Scraped timestamp": str(row.get("finished_at") or row.get("started_at") or "unknown"),
                                 "Preview URL": href,
                             }
                         )
+                    recent_preview_df = pd.DataFrame(recent_preview_rows)
                     st.dataframe(
-                        pd.DataFrame(recent_preview_rows),
+                        recent_preview_df[["Title", "Status", "Source path", "Scraped timestamp", "Preview URL"]],
                         use_container_width=True,
                         hide_index=True,
                         column_config={
                             "Preview URL": st.column_config.LinkColumn("Preview", display_text="Preview"),
                         },
                     )
-                else:
-                    st.info("Successful pages will appear here as soon as markdown is saved.")
 
-                st.caption("Current failures")
                 failed_pages = latest_pages_by_status(runs_all_page_rows, "failed", limit=10)
                 if failed_pages:
+                    st.caption("Failures")
                     failed_df = pd.DataFrame(failed_pages)
                     st.dataframe(
                         failed_df[[c for c in ["url", "failure_reason", "http_status", "attempt", "finished_at"] if c in failed_df.columns]],
                         use_container_width=True,
                         hide_index=True,
                     )
+
+                st.markdown("#### All Pages")
+                if runs_pages_df.empty:
+                    st.info("Run initializing. Waiting for queue state to be published.")
                 else:
-                    st.info("No failed pages in this run yet.")
+                    f1, f2, f3, f4, f5 = st.columns([1.5, 1.4, 2.4, 1.4, 1.2])
+                    status_options = sorted(runs_pages_df["status"].dropna().astype(str).unique().tolist())
+                    default_statuses = ["running"] if "running" in status_options else []
+                    selected_statuses = f1.multiselect(
+                        "Status filter",
+                        options=status_options,
+                        default=default_statuses,
+                        key="runs_live_status_filter",
+                    )
+                    slow_threshold = f2.number_input("Slow threshold (sec)", min_value=0, max_value=600, value=10, step=1)
+                    url_query = f3.text_input("URL contains", value="", key="runs_live_url_query")
+                    latest_only = f4.checkbox("Latest only", value=False, key="runs_live_latest_only")
+                    wide_table = f5.checkbox("Wide table", value=True, key="runs_live_wide_table")
 
-                with st.expander("All pages and filters", expanded=False):
-                    if runs_pages_df.empty:
-                        st.info("Run initializing. Waiting for queue state to be published.")
+                    visible_df = runs_pages_df.copy()
+                    if selected_statuses:
+                        visible_df = visible_df[visible_df["status"].isin(selected_statuses)]
+                    if url_query.strip():
+                        visible_df = visible_df[
+                            visible_df["url"].astype(str).str.contains(url_query.strip(), case=False, na=False, regex=False)
+                        ]
+                    visible_df["is_slow"] = visible_df["duration_sec"] >= float(slow_threshold)
+                    if latest_only:
+                        visible_df = visible_df.sort_values(
+                            ["status_rank", "updated_at"], ascending=[True, False], na_position="last"
+                        ).head(250)
                     else:
-                        f1, f2, f3, f4 = st.columns([2, 2, 3, 2])
-                        status_options = sorted(runs_pages_df["status"].dropna().astype(str).unique().tolist())
-                        default_statuses = ["running"] if "running" in status_options else []
-                        selected_statuses = f1.multiselect(
-                            "Status filter",
-                            options=status_options,
-                            default=default_statuses,
-                            key="runs_live_status_filter",
+                        visible_df = visible_df.sort_values(
+                            ["status_rank", "updated_at", "url"], ascending=[True, False, True], na_position="last"
                         )
-                        slow_threshold = f2.number_input("Slow threshold (sec)", min_value=0, max_value=600, value=10, step=1)
-                        url_query = f3.text_input("URL contains", value="", key="runs_live_url_query")
-                        latest_only = f4.checkbox("Show latest activity only", value=False, key="runs_live_latest_only")
 
-                        visible_df = runs_pages_df.copy()
-                        if selected_statuses:
-                            visible_df = visible_df[visible_df["status"].isin(selected_statuses)]
-                        if url_query.strip():
-                            visible_df = visible_df[
-                                visible_df["url"].astype(str).str.contains(url_query.strip(), case=False, na=False)
+                    if visible_df.empty:
+                        st.info("No pages match the current filters.")
+                    else:
+                        table_df = visible_df[
+                            [
+                                c
+                                for c in [
+                                    "status",
+                                    "url",
+                                    "worker_id",
+                                    "fetch_mode",
+                                    "http_status",
+                                    "failure_reason",
+                                    "attempt",
+                                    "duration_sec",
+                                    "is_slow",
+                                    "updated_at_str",
+                                ]
+                                if c in visible_df.columns
                             ]
-                        visible_df["is_slow"] = visible_df["duration_sec"] >= float(slow_threshold)
-                        if latest_only:
-                            visible_df = visible_df.sort_values(
-                                ["status_rank", "updated_at"], ascending=[True, False], na_position="last"
-                            ).head(250)
+                        ]
+                        if wide_table:
+                            page_size = int(st.selectbox("Rows per page", options=[100, 250, 500, 1000], index=1, key="runs_live_page_size"))
+                            _render_paginated_df(table_df, key_prefix="runs_live_pages", default_page_size=page_size)
                         else:
-                            visible_df = visible_df.sort_values(
-                                ["status_rank", "updated_at", "url"], ascending=[True, False, True], na_position="last"
-                            )
-
-                        if visible_df.empty:
-                            st.info("No pages match the current filters.")
-                        else:
-                            _render_paginated_df(
-                                visible_df[
-                                    [
-                                        c
-                                        for c in [
-                                            "status",
-                                            "url",
-                                            "worker_id",
-                                            "fetch_mode",
-                                            "http_status",
-                                            "failure_reason",
-                                            "attempt",
-                                            "duration_sec",
-                                            "is_slow",
-                                            "updated_at_str",
-                                        ]
-                                        if c in visible_df.columns
-                                    ]
-                                ],
-                                key_prefix="runs_live_pages",
-                                default_page_size=100,
-                            )
-                            waiting_for_first = bool(runs_summary.total > 0 and runs_summary.done == 0)
-                            if waiting_for_first:
-                                st.caption("Waiting for first page completion. Queue and worker activity are live.")
+                            _render_paginated_df(table_df, key_prefix="runs_live_pages", default_page_size=100)
+                        waiting_for_first = bool(runs_summary.total > 0 and runs_summary.done == 0)
+                        if waiting_for_first:
+                            st.caption("Waiting for first page completion. Queue and worker activity are live.")
 
             _schedule_live_refresh(
                 key="runs_live_autorefresh_tick",
@@ -1743,320 +3674,123 @@ with tabs[2]:
                 st.info(f"Ready to scrape {len(runs_selected_url_strings):,} selected URL(s).")
             else:
                 st.info("No selected URLs yet.")
-            with st.expander("Website discovery details", expanded=False):
-                d1, d2, d3 = st.columns(3)
-                d1.metric("Discovered URLs", f"{len(runs_discovered_rows):,}")
-                d2.metric("Sitemap sources", f"{runs_source_count:,}")
-                d3.metric("Last refreshed", runs_last_refreshed)
-
-with tabs[3]:
-    st.subheader("Corpus")
+# with tabs[3]:
+if active_tab == WORKFLOW_TABS[3]:
+    st.subheader("Documents")
     site_id = st.session_state.get("site_id", "")
     if not site_id:
         st.info("Create or open a workspace first.")
     else:
         layout = site_layout(DATA_ROOT / "sites" / site_id)
-        corpus_ingest_dir = layout.site_root / "sources" / "pdf_ingest"
-        corpus_pages_dir = layout.site_root / "sources" / "pdf_pages"
-        chunk_rows = _read_jsonl_rows(corpus_ingest_dir / "pdf_chunks.jsonl")
-        quarantine_rows = _read_jsonl_rows(corpus_ingest_dir / "pdf_quarantine.jsonl")
-        page_rows = []
-        for pages_index in sorted(corpus_pages_dir.glob("*/pages.json")) if corpus_pages_dir.exists() else []:
-            payload = read_json(pages_index, [])
-            if isinstance(payload, list):
-                page_rows.extend([row for row in payload if isinstance(row, dict)])
-
         raw_status = _raw_source_status(layout)
-        counts_by_status = raw_status["by_status"]
+        source_rows = _compact_source_rows(raw_status["rows"], layout)
+        if source_rows:
+            docs_df = pd.DataFrame(source_rows)
+            available_groups = []
+            if (docs_df["kind"] == "web").any():
+                available_groups.append("Scraped URLs")
+            if (docs_df["kind"] == "pdf").any():
+                available_groups.append("PDF pages")
+            if (~docs_df["kind"].isin(["web", "pdf"])).any():
+                available_groups.append("Other documents")
+            if not available_groups:
+                available_groups = ["Other documents"]
 
-        latest_report_path = raw_status.get("latest_report_path")
-        render_metric_strip(
-            [
-                {"label": "PDF Pages", "value": f"{len(page_rows):,}"},
-                {"label": "Search Chunks", "value": f"{len(chunk_rows):,}"},
-                {"label": "PDF Review", "value": f"{len(quarantine_rows):,}"},
-                {"label": "Raw Sources", "value": f"{len(raw_status['rows']):,}"},
-                {"label": "Raw Ready", "value": f"{int(counts_by_status.get('ready', 0)):,}"},
-            ]
-        )
+            group_counts = {
+                "Scraped URLs": int((docs_df["kind"] == "web").sum()),
+                "PDF pages": int((docs_df["kind"] == "pdf").sum()),
+                "Other documents": int((~docs_df["kind"].isin(["web", "pdf"])).sum()),
+            }
+            documents_group_key = "documents_source_group"
+            documents_previous_group_key = "documents_previous_source_group"
+            if st.session_state.get(documents_group_key) not in available_groups:
+                st.session_state[documents_group_key] = available_groups[0]
+            previous_group = st.session_state.get(documents_previous_group_key, st.session_state[documents_group_key])
 
-        quality_sample_rows = [row for row in chunk_rows[:50] if isinstance(row, dict)]
-        quality_summary = build_chunk_quality_summary(quality_sample_rows)
-        st.markdown("### Chunk quality")
-        render_metric_strip(
-            [
-                {"label": "Sampled chunks", "value": f"{quality_summary.total:,}"},
-                {"label": "Good", "value": f"{quality_summary.good_count:,}"},
-                {"label": "Needs review", "value": f"{quality_summary.needs_review_count:,}"},
-                {"label": "Poor", "value": f"{quality_summary.poor_count:,}"},
-                {
-                    "label": "Ready state",
-                    "value": "Ready for retrieval" if quality_summary.ready_for_retrieval else "Needs review",
-                },
-            ]
-        )
-        if quality_summary.total:
-            st.caption(
-                "Top flags: "
-                + (", ".join(quality_summary.top_flags) if quality_summary.top_flags else "none")
+            with st.container(border=True, key="documents_review_shell"):
+                toolbar_left, toolbar_middle, toolbar_right = st.columns([1.0, 1.05, 1.35])
+                source_group = toolbar_left.segmented_control(
+                    "Choose source type",
+                    options=available_groups,
+                    format_func=lambda group: f"{group} ({group_counts.get(str(group), 0):,})",
+                    key=documents_group_key,
+                ) or available_groups[0]
+                if source_group != previous_group:
+                    st.session_state[documents_previous_group_key] = source_group
+                    st.session_state["documents_filter"] = ""
+                else:
+                    st.session_state[documents_previous_group_key] = source_group
+
+                group_docs = _documents_for_group(docs_df, str(source_group))
+                with toolbar_middle:
+                    selected_category = _document_category_selector(group_docs, source_group=str(source_group))
+                doc_query = toolbar_right.text_input(
+                    _document_search_label(str(source_group)),
+                    value="",
+                    placeholder=_document_search_placeholder(str(source_group)),
+                    key="documents_filter",
+                )
+
+                visible_docs = group_docs.copy()
+                if selected_category != "__all__" and "category_key" in visible_docs.columns:
+                    visible_docs = visible_docs[visible_docs["category_key"] == selected_category]
+                if doc_query.strip():
+                    visible_docs = _filter_document_rows_by_search(visible_docs, doc_query, str(source_group))
+                visible_docs = _sort_document_rows(visible_docs)
+
+                source_col, preview_col = st.columns([0.95, 1.45], gap="large")
+                with source_col:
+                    st.subheader("Sources")
+                    entry_label = "pages" if str(source_group) == "PDF pages" else "sources"
+                    st.markdown(
+                        f'<div class="document-preview-countline">{len(visible_docs):,} {entry_label} · index view</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if visible_docs.empty:
+                        st.info("No sources match the current filter.")
+                        selected_row = None
+                    else:
+                        selected_row = _document_source_picker(visible_docs, source_group=str(source_group))
+                with preview_col:
+                    st.subheader("Preview")
+                    st.caption("Markdown preview")
+                    if selected_row:
+                        selected_source_id = str(selected_row.get("source_id") or "")
+                        preview_loading_key = f"documents_loading_source_{_widget_key_token(str(source_group))}"
+                        is_loading_preview = bool(
+                            selected_source_id and st.session_state.get(preview_loading_key) == selected_source_id
+                        )
+
+                        def render_selected_preview() -> None:
+                            preview_text, preview_error = _read_source_markdown(layout, str(selected_row["markdown"] or ""))
+                            if preview_error:
+                                st.warning(preview_error)
+                            else:
+                                _render_markdown_preview(
+                                    preview_text,
+                                    selected_row.get("title"),
+                                    source_label=selected_row.get("display_path") or _document_source_subtitle(selected_row, str(source_group)),
+                                )
+
+                        if is_loading_preview:
+                            with st.spinner("Loading selected source…"):
+                                render_selected_preview()
+                            st.session_state.pop(preview_loading_key, None)
+                        else:
+                            render_selected_preview()
+                    else:
+                        st.info("Choose a source to preview rendered Markdown.")
+            render_operator_details(
+                "Operator Details",
+                {"Registry path:": str(layout.registry_path)},
+                expanded=False,
             )
         else:
-            st.caption("Unknown chunk quality. Next action: inspect sample chunks after PDF extraction.")
+            st.info("Normalize scraped pages, PDFs, or tabular files to populate document rows.")
 
-        render_operator_details(
-            "Operator Details",
-            {
-                "Registry path:": str(layout.registry_path),
-                "Latest report path:": str(latest_report_path or ""),
-            },
-        )
-        if latest_report_path:
-            with st.expander("Latest normalization report", expanded=False):
-                st.json(raw_status.get("latest_report") or {})
-        else:
-            st.warning("Blocked: normalize Corpus sources before reviewing the latest report.")
 
-        with st.expander("PDF extraction", expanded=bool(page_rows)):
-            p1, p2, p3 = st.columns(3)
-            p1.metric("Pages extracted", f"{len(page_rows):,}")
-            p2.metric("Search chunks", f"{len(chunk_rows):,}")
-            p3.metric("Needs review", f"{len(quarantine_rows):,}")
-            if pdf_manifest:
-                display_rows = [
-                    {
-                        "name": row.get("name", ""),
-                        "size_bytes": row.get("size_bytes", 0),
-                        "status": row.get("status", ""),
-                        "page_count": row.get("page_count", ""),
-                        "path": row.get("path", ""),
-                        "added_at": row.get("added_at", ""),
-                    }
-                    for row in pdf_manifest
-                    if isinstance(row, dict)
-                ]
-                st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
-                with st.expander("Page-by-page markdown", expanded=bool(page_rows)):
-                    if page_rows:
-                        page_preview_options = [
-                            row for row in page_rows
-                            if isinstance(row, dict)
-                            and str(row.get("markdown_path") or "").strip()
-                            and row.get("page_number") is not None
-                        ]
-                        preview_cols = st.columns(3)
-                        preview_cols[0].metric("Previewable pages", f"{len(page_preview_options):,}")
-                        preview_cols[1].metric(
-                            "Parsers",
-                            ", ".join(sorted({str(row.get("parser") or "") for row in page_preview_options if row.get("parser")})) or "n/a",
-                        )
-                        preview_cols[2].metric(
-                            "Largest page",
-                            f"{max((int(row.get('char_count') or 0) for row in page_preview_options), default=0):,} chars",
-                        )
-                        if page_preview_options:
-                            preview_by_page_number = {
-                                int(row.get("page_number")): row
-                                for row in page_preview_options
-                                if str(row.get("page_number") or "").isdigit()
-                            }
-                            preview_page_numbers = sorted(preview_by_page_number)
-                            current_preview_page = int(
-                                st.session_state.get("pdf_page_preview_number")
-                                or preview_page_numbers[0]
-                            )
-                            if current_preview_page not in preview_by_page_number:
-                                current_preview_page = preview_page_numbers[0]
-                            selected_page_number = int(
-                                st.number_input(
-                                    "Page number",
-                                    min_value=preview_page_numbers[0],
-                                    max_value=preview_page_numbers[-1],
-                                    value=current_preview_page,
-                                    step=1,
-                                    key="pdf_page_preview_number",
-                                )
-                            )
-                            selected_page = preview_by_page_number.get(selected_page_number, preview_by_page_number[preview_page_numbers[0]])
-                            markdown_path = str(selected_page.get("markdown_path") or "").strip()
-                            detail_cols = st.columns(3)
-                            detail_cols[0].caption(f"Parser: `{str(selected_page.get('parser') or 'n/a')}`")
-                            detail_cols[1].caption(f"Chars: `{int(selected_page.get('char_count') or 0):,}`")
-                            detail_cols[2].caption(f"File: `{Path(markdown_path).name}`")
-
-                            action_cols = st.columns([1, 1, 4])
-                            if action_cols[0].button("Load preview", key="load_pdf_preview", type="secondary"):
-                                st.session_state["pdf_page_markdown_preview_path"] = markdown_path
-                                st.session_state["pdf_page_markdown_preview_text"] = _load_markdown_preview(markdown_path, max_chars=12000)
-                            if hasattr(st, "dialog") and action_cols[1].button(
-                                "Open dialog",
-                                key="open_pdf_preview_dialog",
-                                type="secondary",
-                            ):
-                                _open_page_markdown_dialog(markdown_path)
-
-                            preview_target_path = str(st.session_state.get("pdf_page_markdown_preview_path") or "").strip()
-                            preview_text = str(st.session_state.get("pdf_page_markdown_preview_text") or "")
-                            if preview_target_path == markdown_path and preview_text:
-                                st.markdown("---")
-                                st.markdown(preview_text)
-                            elif preview_target_path == markdown_path:
-                                st.warning("Could not load markdown preview from this path.")
-                            else:
-                                st.caption("Preview is loaded on demand to keep this screen responsive during large runs.")
-                        else:
-                            st.warning("No previewable page markdown files were found yet.")
-                    else:
-                        st.warning("No page markdown files yet. Click Extract / Re-extract PDFs.")
-                with st.expander("PDF review queue", expanded=bool(quarantine_rows)):
-                    if quarantine_rows:
-                        st.dataframe(pd.DataFrame(quarantine_rows), use_container_width=True, hide_index=True)
-                    else:
-                        st.success("No PDFs need review.")
-            else:
-                st.info("Upload one or more PDFs to extract them for embedding.")
-
-        st.markdown("### Content Inspector")
-        st.caption("Preview extracted pages and chunks before trusting them for wiki or retrieval.")
-        with st.expander("Embedding chunks", expanded=False):
-            if chunk_rows:
-                for idx, row in enumerate([item for item in chunk_rows[:20] if isinstance(item, dict)]):
-                    source_title = _chunk_source_title(row)
-                    quality = classify_chunk_row(row)
-                    with st.container(border=True):
-                        c1, c2, c3 = st.columns([2.5, 1.2, 1.3])
-                        c1.markdown(f"**{source_title}**")
-                        c2.caption(f"Quality: `{quality.quality}`")
-                        c3.caption(f"Chars: `{quality.char_count:,}`")
-                        st.caption(f"Source: `{_chunk_source_location(row)}`")
-                        st.caption(f"Section path/context: `{quality.context_label}`")
-                        st.caption(
-                            "Flags: `"
-                            + (", ".join(quality.flags) if quality.flags else "none")
-                            + "`"
-                        )
-                        st.caption(f"Reason: {quality.reason}")
-                        text_sample = str(row.get("text") or "").strip()
-                        if text_sample:
-                            st.text_area(
-                                "Chunk text",
-                                value=text_sample[:1200],
-                                height=140,
-                                disabled=True,
-                                key=f"corpus_chunk_text_{idx}",
-                            )
-                        else:
-                            st.warning("This chunk has no text.")
-            else:
-                st.warning("No chunks extracted yet. Click Extract / Re-extract PDFs.")
-
-        if raw_status["rows"]:
-            rows = raw_status["rows"][:1000]
-            rows_by_kind: dict[str, list[dict]] = {}
-            for row in rows:
-                kind = str(row.get("source_kind") or "unknown").strip().lower()
-                rows_by_kind.setdefault(kind, []).append(row)
-
-            pdf_rows = rows_by_kind.get("pdf", [])
-            web_rows = rows_by_kind.get("web", [])
-            other_rows = [row for kind, kind_rows in rows_by_kind.items() if kind not in {"pdf", "web"} for row in kind_rows]
-
-            pdf_page_count = 0
-            pdf_pages_dir = layout.site_root / "sources" / "pdf_pages"
-            if pdf_pages_dir.exists():
-                pdf_page_count = len([path for path in pdf_pages_dir.rglob("*.md") if path.is_file()])
-            raw_markdown_count = 0
-            if layout.raw_sources_dir.exists():
-                raw_markdown_count = len([path for path in layout.raw_sources_dir.rglob("*.md") if path.is_file()])
-
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Total Sources", f"{len(rows):,}")
-            m2.metric("Web Sources", f"{len(web_rows):,}")
-            m3.metric("PDF Sources", f"{len(pdf_rows):,}")
-            m4.metric("PDF Pages Extracted", f"{pdf_page_count:,}")
-            m5.metric("Raw Markdown Files", f"{raw_markdown_count:,}")
-
-            c_web, c_pdf, c_other = st.columns(3)
-            c_web.metric("Web Ready/Failed", f"{sum(1 for r in web_rows if str(r.get('status') or '') == 'ready')}/{sum(1 for r in web_rows if str(r.get('status') or '') == 'failed')}")
-            c_pdf.metric("PDF Ready/Failed", f"{sum(1 for r in pdf_rows if str(r.get('status') or '') == 'ready')}/{sum(1 for r in pdf_rows if str(r.get('status') or '') == 'failed')}")
-            c_other.metric("Other Sources", f"{len(other_rows):,}")
-
-            st.markdown("### PDF Sources")
-            if pdf_rows:
-                for row in pdf_rows[:80]:
-                    source_id = str(row.get("source_id") or "")
-                    title = str(row.get("title") or source_id or "Untitled PDF")
-                    status = str(row.get("status") or "unknown")
-                    parser = str(row.get("parser") or "")
-                    markdown_path = str(row.get("markdown_path") or "")
-                    metadata_path = str(row.get("metadata_path") or "")
-                    error_reason = str(row.get("error_reason") or "")
-                    page_count = ""
-                    if metadata_path:
-                        metadata_abs = layout.site_root / metadata_path
-                        if metadata_abs.exists():
-                            metadata = read_json(metadata_abs, {})
-                            page_count = str(metadata.get("page_count") or "")
-                    with st.container(border=True):
-                        p1, p2, p3, p4 = st.columns([2.6, 1.1, 1.0, 1.3])
-                        p1.markdown(f"**{title}**")
-                        p2.caption(f"Status: `{status}`")
-                        p3.caption(f"Parser: `{parser or 'n/a'}`")
-                        p4.caption(f"Pages: `{page_count or 'n/a'}`")
-                        st.caption(f"Source ID: `{source_id}`")
-                        if error_reason:
-                            st.warning(error_reason)
-                        a1, a2, a3 = st.columns([1, 1, 2.5])
-                        if a1.button("Preview", key=f"pdf_card_preview_{source_id}"):
-                            preview_path = str((layout.site_root / markdown_path) if markdown_path else "")
-                            if preview_path and hasattr(st, "dialog"):
-                                _open_page_markdown_dialog(preview_path)
-                        if a2.button("Metadata", key=f"pdf_card_metadata_{source_id}"):
-                            st.session_state["raw_source_metadata_id"] = source_id
-                        a3.caption(f"Markdown: `{markdown_path or 'n/a'}`")
-            else:
-                st.info("No PDF sources found yet.")
-
-            st.markdown("### Web Sources")
-            if web_rows:
-                for row in web_rows[:120]:
-                    source_id = str(row.get("source_id") or "")
-                    title = str(row.get("title") or source_id or "Untitled web source")
-                    status = str(row.get("status") or "unknown")
-                    original_url = str(row.get("original_url") or "")
-                    markdown_path = str(row.get("markdown_path") or "")
-                    change_state = str(row.get("change_state") or "")
-                    error_reason = str(row.get("error_reason") or "")
-                    with st.container(border=True):
-                        w1, w2, w3 = st.columns([2.8, 1.2, 1.3])
-                        w1.markdown(f"**{title}**")
-                        w2.caption(f"Status: `{status}`")
-                        w3.caption(f"Change: `{change_state or 'n/a'}`")
-                        if original_url:
-                            st.caption(f"URL: `{original_url}`")
-                        st.caption(f"Source ID: `{source_id}`")
-                        if error_reason:
-                            st.warning(error_reason)
-                        a1, a2, a3 = st.columns([1, 1, 2.5])
-                        if a1.button("Preview", key=f"web_card_preview_{source_id}"):
-                            preview_path = str((layout.site_root / markdown_path) if markdown_path else "")
-                            if preview_path and hasattr(st, "dialog"):
-                                _open_page_markdown_dialog(preview_path)
-                        if a2.button("Metadata", key=f"web_card_metadata_{source_id}"):
-                            st.session_state["raw_source_metadata_id"] = source_id
-                        a3.caption(f"Markdown: `{markdown_path or 'n/a'}`")
-            else:
-                st.info("No web sources found yet.")
-
-            selected_meta_id = str(st.session_state.get("raw_source_metadata_id") or "")
-            if selected_meta_id:
-                selected_row = next((row for row in rows if str(row.get("source_id") or "") == selected_meta_id), None)
-                if selected_row:
-                    with st.expander(f"Metadata: {selected_meta_id}", expanded=True):
-                        st.json(selected_row)
-        else:
-            st.info("Normalize scraped pages, PDFs, or tabular files to populate `raw_sources/registry.jsonl`.")
-
-with tabs[4]:
+# with tabs[4]:
+if active_tab == WORKFLOW_TABS[4]:
     st.subheader("Wiki")
     site_id = st.session_state.get("site_id", "")
     if not site_id:
@@ -2066,22 +3800,45 @@ with tabs[4]:
         raw_status = _raw_source_status(layout)
         raw_sources_ready = _raw_sources_ready(raw_status)
         wiki_status = _load_wiki_status(layout, raw_status)
+        pending_by_kind = wiki_status.get("pending_source_count_by_kind") or {}
+        pending_pdf_sources = int(pending_by_kind.get("pdf") or 0)
+        pending_web_sources = int(pending_by_kind.get("web") or 0)
+        pending_other_sources = max(int(wiki_status.get("pending_source_count") or 0) - pending_pdf_sources - pending_web_sources, 0)
+        wiki_primary_action = _wiki_primary_action_label(wiki_status)
         wiki_tone = "ready" if _wiki_ready(wiki_status) else "warning"
         render_status_band(
             title="Wiki build",
-            subtitle="Build grounded pages from prepared corpus sources.",
+            subtitle="Keep generated wiki pages synchronized with prepared web, PDF, and document sources.",
             status_label=str(wiki_status["job_status"]).replace("-", " ").title(),
             tone=wiki_tone,
-            action_label="Build wiki" if raw_sources_ready else "Prepare corpus",
+            action_label=wiki_primary_action if raw_sources_ready else "Prepare documents",
         )
 
         if not raw_sources_ready:
-            st.warning("Blocked: normalize Corpus sources before building the LLM Wiki.")
+            st.warning("Blocked: prepare source documents before building the LLM Wiki.")
 
-        build_col, refresh_col = st.columns([1, 1])
-        if build_col.button("Build LLM Wiki", type="primary", disabled=not raw_sources_ready, key="build_llm_wiki"):
-            launch_result = launch_wiki_builder(layout.site_root, runner=tmux_runner, resume=True, runtime="pi")
+        st.caption("Wiki builder runs locally in Python. Pi extensions can be added later.")
+        source_cols = st.columns(5)
+        source_cols[0].metric("Sources Ready", f"{int(wiki_status.get('source_count') or 0):,}")
+        source_cols[1].metric("Sources Waiting", f"{int(wiki_status.get('pending_source_count') or 0):,}")
+        source_cols[2].metric("PDF Waiting", f"{pending_pdf_sources:,}")
+        source_cols[3].metric("Web Waiting", f"{pending_web_sources:,}")
+        source_cols[4].metric("Changed", f"{int(wiki_status.get('changed_source_count') or 0):,}")
+        if pending_other_sources:
+            st.caption(f"Other source types waiting: `{pending_other_sources:,}`")
+
+        build_col, update_col, rebuild_col, refresh_col = st.columns([1, 1, 1, 1])
+        build_disabled = not raw_sources_ready or int(wiki_status.get("integrated_sources") or 0) > 0
+        update_disabled = not raw_sources_ready or int(wiki_status.get("pending_source_count") or 0) <= 0
+        rebuild_disabled = not raw_sources_ready
+        if build_col.button("Build Wiki", type="primary", disabled=build_disabled, key="build_llm_wiki"):
+            launch_result = launch_wiki_builder(layout.site_root, runner=tmux_runner, resume=True)
             if launch_result.get("ok"):
+                st.session_state["wiki_build_launch_notice"] = {
+                    "tmux_session": launch_result["session_name"],
+                    "report_path": launch_result["report_path"],
+                    "runtime": launch_result.get("runtime", "python"),
+                }
                 st.success("Started wiki build.")
                 st.caption(f"Runtime: `{launch_result.get('runtime', 'python')}`")
                 render_operator_details(
@@ -2092,8 +3849,51 @@ with tabs[4]:
                         "runtime": launch_result.get("runtime", "python"),
                     },
                 )
+                st.rerun()
             else:
                 st.error(launch_result.get("error") or "Failed to start LLM Wiki builder.")
+        if update_col.button("Update Wiki", type="primary", disabled=update_disabled, key="update_llm_wiki"):
+            launch_result = launch_wiki_builder(layout.site_root, runner=tmux_runner, resume=True)
+            if launch_result.get("ok"):
+                st.session_state["wiki_build_launch_notice"] = {
+                    "tmux_session": launch_result["session_name"],
+                    "report_path": launch_result["report_path"],
+                    "runtime": launch_result.get("runtime", "python"),
+                }
+                st.success("Started wiki update.")
+                st.caption(f"Runtime: `{launch_result.get('runtime', 'python')}`")
+                render_operator_details(
+                    "Operator Details",
+                    {
+                        "tmux_session": launch_result["session_name"],
+                        "report_path": launch_result["report_path"],
+                        "runtime": launch_result.get("runtime", "python"),
+                    },
+                )
+                st.rerun()
+            else:
+                st.error(launch_result.get("error") or "Failed to start LLM Wiki update.")
+        if rebuild_col.button("Rebuild Wiki", disabled=rebuild_disabled, key="rebuild_llm_wiki"):
+            launch_result = launch_wiki_builder(layout.site_root, runner=tmux_runner, resume=False, rebuild=True)
+            if launch_result.get("ok"):
+                st.session_state["wiki_build_launch_notice"] = {
+                    "tmux_session": launch_result["session_name"],
+                    "report_path": launch_result["report_path"],
+                    "runtime": launch_result.get("runtime", "python"),
+                }
+                st.success("Started full wiki rebuild.")
+                st.caption(f"Runtime: `{launch_result.get('runtime', 'python')}`")
+                render_operator_details(
+                    "Operator Details",
+                    {
+                        "tmux_session": launch_result["session_name"],
+                        "report_path": launch_result["report_path"],
+                        "runtime": launch_result.get("runtime", "python"),
+                    },
+                )
+                st.rerun()
+            else:
+                st.error(launch_result.get("error") or "Failed to start full LLM Wiki rebuild.")
         if refresh_col.button("Refresh Wiki Status", key="refresh_llm_wiki_status"):
             st.rerun()
 
@@ -2115,304 +3915,136 @@ with tabs[4]:
             },
         )
 
-        live_col1, live_col2 = st.columns([1, 1.2])
-        live_logs = live_col1.checkbox("Auto-refresh live logs (1s)", value=False, key="wiki_live_logs_autorefresh")
-        show_tmux = live_col2.checkbox("Include tmux pane output", value=True, key="wiki_live_tmux_output")
-        _schedule_live_refresh(
-            key="wiki_live_logs_tick",
-            enabled=live_logs,
-            active=bool(wiki_status.get("job_status", "").lower() in {"running", "started", "pending"}),
-            interval_seconds=1.0,
-        )
+        st.markdown("### Generated Markdown")
+        wiki_markdown_files = _list_wiki_markdown_files(layout.wiki_dir)
+        if wiki_markdown_files:
+            wiki_records = _wiki_markdown_records(wiki_markdown_files)
+            wiki_list_col, wiki_preview_col = st.columns([0.95, 1.45], gap="large")
+            with wiki_list_col:
+                st.subheader("Wiki pages")
+                wiki_query = st.text_input(
+                    "Search wiki pages",
+                    value="",
+                    placeholder="Title, section, or path",
+                    key="wiki_markdown_filter",
+                )
+                visible_wiki_records = _filter_wiki_markdown_records(wiki_records, wiki_query)
+                st.markdown(
+                    f'<div class="document-preview-countline">{len(visible_wiki_records):,} pages · index view</div>',
+                    unsafe_allow_html=True,
+                )
+                if visible_wiki_records:
+                    selected_wiki_record = _wiki_markdown_picker(visible_wiki_records)
+                else:
+                    st.info("No wiki pages match the current search.")
+                    selected_wiki_record = None
 
-        wiki_log_text = _tail_text(Path(wiki_status["log_path"]), max_lines=120)
-        tmux_text = tmux_runner.capture(str(wiki_status["tmux_session"]), lines=120) if show_tmux else ""
-        with st.expander("Live wiki build logs", expanded=False):
-            st.caption("Streaming latest wiki log and tmux pane output.")
-            st.markdown("**wiki/log.md (tail)**")
-            st.code(wiki_log_text or "(no wiki log yet)", language="text")
-            if show_tmux:
-                st.markdown("**tmux pane (tail)**")
-                st.code(tmux_text or "(no tmux output yet)", language="text")
+            with wiki_preview_col:
+                st.subheader("Preview")
+                if selected_wiki_record:
+                    selected_wiki_file = str(selected_wiki_record.get("path") or "")
+                    wiki_loading_key = "wiki_loading_markdown_file"
+                    is_loading_wiki_preview = bool(
+                        selected_wiki_file and st.session_state.get(wiki_loading_key) == selected_wiki_file
+                    )
 
-        latest_report_path = wiki_status.get("latest_report_path")
-        if latest_report_path:
-            with st.expander("Latest wiki report", expanded=False):
-                st.json(wiki_status.get("latest_report") or {})
+                    def render_wiki_markdown_preview() -> None:
+                        selected_markdown, selected_markdown_error = _read_wiki_markdown(layout, selected_wiki_file)
+                        if selected_markdown_error:
+                            st.warning(selected_markdown_error)
+                            return
+                        page_metadata = _parse_markdown_frontmatter(selected_markdown)
+                        if page_metadata:
+                            meta_cols = st.columns(4)
+                            meta_cols[0].metric("Sources", f"{len(page_metadata.get('source_ids') or []):,}")
+                            meta_cols[1].metric("Audience", ", ".join(page_metadata.get("audiences") or ["general"])[:80])
+                            meta_cols[2].metric("Intent", ", ".join(page_metadata.get("intents") or ["explore"])[:80])
+                            meta_cols[3].metric("Owner", str(page_metadata.get("canonical_owner") or selected_wiki_file)[:80])
+                            citations = page_metadata.get("source_paths") or []
+                            if citations:
+                                st.caption("Citations: " + ", ".join(f"`{item}`" for item in citations[:8]))
+                        with st.container(border=True, key="wiki_markdown_preview"):
+                            st.markdown(_strip_markdown_frontmatter(selected_markdown))
+
+                    if is_loading_wiki_preview:
+                        with st.spinner("Loading selected wiki page…"):
+                            render_wiki_markdown_preview()
+                        st.session_state.pop(wiki_loading_key, None)
+                    else:
+                        render_wiki_markdown_preview()
+                else:
+                    st.info("Choose a wiki page to preview generated Markdown.")
         else:
-            st.info("Wiki build reports will appear under `wiki/reports/` after the builder runs.")
+            st.info("Generated Markdown files will appear after the wiki build creates `wiki/*.md` artifacts.")
 
-with tabs[5]:
-    st.subheader("Retrieval")
-    retrieval_quality_summary = None
+
+# with tabs[5]:
+if active_tab == WORKFLOW_TABS[5]:
+    st.subheader("Embeddings")
     site_id = st.session_state.get("site_id", "")
-    if site_id:
+    if not site_id:
+        st.info("Create or open a workspace first.")
+    else:
         layout = site_layout(DATA_ROOT / "sites" / site_id)
         raw_status = _raw_source_status(layout)
         wiki_status = _load_wiki_status(layout, raw_status)
         embedding_status = _load_embedding_status(layout)
-        chunk_rows = _read_jsonl_rows(layout.site_root / "sources" / "pdf_ingest" / "pdf_chunks.jsonl")
-        retrieval_quality_summary = build_chunk_quality_summary(row for row in chunk_rows if isinstance(row, dict))
-        vectors_exist = bool(embedding_status["raw_index_count"] or embedding_status["wiki_index_count"])
+        raw_ready = _raw_sources_ready(raw_status)
         wiki_ready = _wiki_ready(wiki_status)
-        if not _raw_sources_ready(raw_status):
-            st.warning("Blocked: normalize Corpus sources before retrieval indexing.")
-        elif not wiki_ready:
-            st.warning("Blocked: build the LLM Wiki before retrieval indexing.")
+        can_build_index = raw_ready and wiki_ready
 
-        st.markdown("### Chunk quality")
-        quality_state_label = (
-            "Blocked"
-            if retrieval_quality_summary.total == 0
-            else ("Ready" if retrieval_quality_summary.ready_for_retrieval else "Needs review")
-        )
         render_status_band(
-            title="Retrieval readiness",
-            subtitle=(
-                "Chunk quality is unknown. Next action: open Corpus Content Inspector."
-                if retrieval_quality_summary.total == 0
-                else (
-                    "Chunk samples support retrieval."
-                    if retrieval_quality_summary.ready_for_retrieval
-                    else "Source chunks need review before retrieval answers can be trusted."
-                )
-            ),
-            status_label=quality_state_label,
-            tone="ready" if retrieval_quality_summary.ready_for_retrieval else "warning",
-            action_label=(
-                "Corpus Content Inspector" if not retrieval_quality_summary.ready_for_retrieval else "Query retrieval"
-            ),
+            title="Wiki and source index",
+            subtitle="Embeds generated wiki pages plus the underlying source documents into the local LLM Wiki index.",
+            status_label=str(embedding_status["index_health"]).replace("_", " ").title(),
+            tone="ready" if embedding_status["index_health"] == "ready" else "warning",
+            action_label="Build embeddings" if can_build_index else "Build wiki first",
         )
-        render_metric_strip(
-            [
-                {"label": "Sampled chunks", "value": f"{retrieval_quality_summary.total:,}"},
-                {"label": "Good", "value": f"{retrieval_quality_summary.good_count:,}"},
-                {"label": "Needs review", "value": f"{retrieval_quality_summary.needs_review_count:,}"},
-                {"label": "Poor", "value": f"{retrieval_quality_summary.poor_count:,}"},
-                {
-                    "label": "ready_for_retrieval",
-                    "value": "true" if retrieval_quality_summary.ready_for_retrieval else "false",
-                },
-            ]
-        )
-        if retrieval_quality_summary.total == 0:
-            st.info("Unknown chunk quality. Next action: review Corpus Content Inspector before trusting retrieval.")
-        elif not retrieval_quality_summary.ready_for_retrieval:
-            if vectors_exist:
-                st.warning("Vectors exist, but source chunks need review before retrieval can be trusted.")
-            st.caption(
-                "Top chunk quality flags: "
-                + (", ".join(retrieval_quality_summary.top_flags) if retrieval_quality_summary.top_flags else "none")
-            )
+        if not raw_ready:
+            st.warning("Blocked: prepare source documents before building embeddings.")
+        elif not wiki_ready:
+            st.warning("Blocked: build the LLM Wiki before embedding/indexing.")
 
-        st.markdown("### Index Health")
+        build_index_col, refresh_index_col = st.columns([1, 1])
+        if build_index_col.button("Build / Rebuild Embeddings", type="primary", disabled=not can_build_index, key="build_llm_wiki_index"):
+            with st.spinner("Building LLM Wiki index..."):
+                try:
+                    index_report = build_llm_wiki_index(layout.site_root)
+                except Exception as exc:
+                    st.error(f"Embedding build failed: {exc}")
+                else:
+                    st.success(
+                        f"Indexed {int(index_report.get('raw_index_count') or 0):,} raw document chunk(s) and "
+                        f"{int(index_report.get('wiki_index_count') or 0):,} wiki chunk(s)."
+                    )
+                    st.rerun()
+        if refresh_index_col.button("Refresh Embedding Status", key="refresh_embedding_status"):
+            st.rerun()
+
         e1, e2, e3, e4, e5 = st.columns(5)
-        e1.metric("Raw Index", f"{embedding_status['raw_index_count']:,}")
-        e2.metric("Wiki Index", f"{embedding_status['wiki_index_count']:,}")
+        e1.metric("Raw Docs", f"{embedding_status['raw_index_count']:,}")
+        e2.metric("Wiki Docs", f"{embedding_status['wiki_index_count']:,}")
         e3.metric("Changed Docs", f"{embedding_status['changed_document_count']:,}")
         e4.metric("Reranker", "ready" if embedding_status["reranker_ready"] else "not ready")
         e5.metric("Index Health", embedding_status["index_health"])
-        if embedding_status["last_build_time"]:
-            st.caption(f"Last build time: `{embedding_status['last_build_time']}`")
-        if embedding_status.get("latest_report_path"):
-            st.caption(f"Latest embedding report: `{embedding_status['latest_report_path']}`")
-            with st.expander("Latest embedding/rerank status", expanded=False):
-                st.json(embedding_status.get("latest_report") or {})
-        else:
-            st.info("Embedding and reranker reports will appear under `indexes/` after the index build runs.")
-    st.divider()
-    st.markdown("### Knowledge Graph")
-    site_id = st.session_state.get("site_id", "")
-    if not site_id:
-        st.info("Select or create a site first.")
-    else:
-        site_root = DATA_ROOT / "sites" / site_id
-        graph_run_choices = sorted([d.name for d in site_root.iterdir() if d.is_dir() and d.name != "meta"]) if site_root.exists() else []
-        graph_real_runs = [name for name in graph_run_choices if _is_real_scrape_run(site_id, name)]
-        if not graph_real_runs:
-            st.info("No raw markdown run is available yet. Scrape pages first, then build the graph.")
-        else:
-            latest_graph_run = graph_real_runs[-1]
-            current_graph_run = st.session_state.get("graph_run", "")
-            selected_graph_run = current_graph_run if current_graph_run in graph_real_runs else latest_graph_run
-            selected_graph_index = graph_real_runs.index(selected_graph_run)
-            graph_run = st.selectbox(
-                "Graph run",
-                options=graph_real_runs,
-                index=selected_graph_index,
-                key="graph_run",
-                format_func=lambda run_name: f"Run {_run_human_timestamp(run_name)}",
-            )
-            graph_run_root = site_root / graph_run
-            graph_dir = knowledge_graph_dir(graph_run_root)
-            stats = load_graph_stats(graph_run_root)
-            raw_files = discover_raw_markdown_files(graph_run_root)
-            raw_count = len(raw_files)
-            page_count = int(stats.get("page_nodes") or 0)
-            unit_count = int(stats.get("unit_nodes") or 0)
-            edge_count = int(stats.get("edges") or 0)
-            status_label = "ready" if stats.get("status") == "ready" else "missing"
-            if stats.get("counts_match") is False:
-                status_label = "count mismatch"
-
-            g1, g2, g3, g4, g5 = st.columns([1, 1, 1, 1, 1.4])
-            g1.metric("Raw Files", f"{raw_count:,}")
-            g2.metric("Page Nodes", f"{page_count:,}")
-            g3.metric("Units", f"{unit_count:,}")
-            g4.metric("Edges", f"{edge_count:,}")
-            g5.metric("Graph Status", status_label)
-            st.caption(f"Primary retrieval graph: `{graph_dir / 'graph.json'}`")
-
-            b1, b2, b3, b4 = st.columns([1.4, 1.6, 1.2, 2.8])
-            if b1.button("Build Deterministic Graph", type="primary", key="build_deterministic_kg"):
-                try:
-                    graph = build_markdown_graph(graph_run_root, site_id, graph_run)
-                    st.success(
-                        f"Built graph with {graph['counts']['page_nodes']:,} page nodes and {graph['counts']['edges']:,} edges."
-                    )
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Graph build failed: {exc}")
-
-            selected_unit_for_enrich = b2.selectbox(
-                "Semantic enrichment unit",
-                options=[row.get("unit_key") for row in graph_list_units(graph_run_root) if row.get("page_count", 0) > 0] or [""],
-                help="Optional bounded enrichment merged into knowledge_graph/graph.json. Deterministic graph does not require it.",
-                key="semantic_enrichment_unit",
-            )
-            if b3.button("Rebuild Query Index", disabled=stats.get("status") != "ready", key="rebuild_kg_query_index"):
-                try:
-                    st.json(rebuild_graph_query_index(graph_run_root))
-                except Exception as exc:
-                    st.error(f"Query index rebuild failed: {exc}")
-            b4.caption(
-                "Use Build Deterministic Graph for the real retrieval graph. Optional semantic enrichment can add concept edges after the deterministic build."
-            )
-            if st.button(
-                "Run Semantic Enrichment for Selected Unit",
-                disabled=stats.get("status") != "ready" or not selected_unit_for_enrich,
-                key="run_semantic_enrichment_unit",
-            ):
-                try:
-                    st.json(run_graphify_enrichment_for_unit(graph_run_root, str(selected_unit_for_enrich)))
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Semantic enrichment failed: {exc}")
-
-            if stats.get("status") != "ready":
-                st.info("Build the deterministic graph to enable inspection and retrieval controls.")
-            else:
-                dist = load_unit_distribution(graph_run_root)
-                no_unit = load_pages_without_unit_tags(graph_run_root)
-                orphaned = load_graph_orphan_pages(graph_run_root)
-                tags = load_graph_tags(graph_run_root)
-                edges = load_graph_edges(graph_run_root)
-                pages = load_graph_page_nodes(graph_run_root)
-
-                st.caption("Coverage")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Tagged Pages", f"{len({t.get('page_id') for t in tags}):,}")
-                c2.metric("Pages Without Unit", f"{len(no_unit):,}")
-                c3.metric("Orphan Pages", f"{len(orphaned):,}")
-                c4.metric("Graph Count Match", "yes" if stats.get("counts_match") else "no")
-
-                left, right = st.columns([1.2, 1])
-                with left:
-                    st.caption("Unit Distribution")
-                    if dist:
-                        st.dataframe(pd.DataFrame(dist), use_container_width=True, hide_index=True)
-                    else:
-                        st.info("No unit tags found.")
-                with right:
-                    st.caption("Edge Types")
-                    edge_counts = pd.DataFrame(
-                        [{"type": key, "count": val} for key, val in Counter([edge.get("type") for edge in edges]).items()]
-                    ).sort_values("count", ascending=False)
-                    st.dataframe(edge_counts, use_container_width=True, hide_index=True)
-
-                with st.expander("Pages without unit tags", expanded=False):
-                    if no_unit:
-                        st.dataframe(
-                            pd.DataFrame(no_unit)[[c for c in ["id", "title", "source_url", "path"] if c in no_unit[0]]],
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                    else:
-                        st.success("Every page has at least one unit tag.")
-                with st.expander("Orphan pages and isolated nodes", expanded=False):
-                    if orphaned:
-                        st.dataframe(
-                            pd.DataFrame(orphaned)[[c for c in ["id", "title", "source_url", "path"] if c in orphaned[0]]],
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                    else:
-                        st.success("No orphan pages.")
-
-                inspect_tabs = st.tabs(["Query", "Path", "Explain", "Knowledge Graph HTML"])
-                with inspect_tabs[0]:
-                    st.markdown("#### Ask the markdown graph")
-                    unit_options = [""] + [str(row.get("unit_key")) for row in graph_list_units(graph_run_root) if row.get("page_count", 0) > 0]
-                    graph_query = st.text_area(
-                        "Ask a question",
-                        value="I-20 international students",
-                        height=90,
-                        key="kg_query",
-                        help="This queries the deterministic raw-markdown graph and returns source markdown evidence for the LLM.",
-                    )
-                    q1, q2, q3 = st.columns([1.6, 1, 1])
-                    graph_unit = q1.selectbox("Unit filter", options=unit_options, index=0, key="kg_query_unit")
-                    graph_limit = int(q2.number_input("Page result limit", min_value=1, max_value=50, value=10, key="kg_query_limit"))
-                    context_budget = int(q3.number_input("Evidence budget", min_value=1000, max_value=50000, value=12000, step=1000, key="kg_context_budget"))
-                    ask_col, search_col = st.columns([1, 1])
-                    ask_clicked = ask_col.button("Ask Graph / Get Evidence", type="primary", key="kg_build_context")
-                    search_clicked = search_col.button("Search Matching Pages", key="kg_search_pages")
-                    if ask_clicked:
-                        context = graph_answer_context(graph_run_root, graph_query, unit=graph_unit or None, budget_chars=context_budget)
-                        st.success(f"Found {len(context.get('evidence', []))} evidence item(s), {context.get('used_chars', 0)} chars.")
-                        for item in context.get("evidence", []):
-                            with st.container(border=True):
-                                st.markdown(f"**{item.get('title') or item.get('page_id')}**")
-                                st.caption(f"{item.get('source_url')} | `{item.get('path')}`")
-                                st.code(item.get("markdown_excerpt", ""), language="markdown")
-                        with st.expander("Raw MCP-style answer_context payload", expanded=False):
-                            st.json({k: v for k, v in context.items() if k != "evidence"})
-                    if search_clicked:
-                        results = graph_search_pages(graph_run_root, graph_query, unit=graph_unit or None, limit=graph_limit)
-                        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
-                with inspect_tabs[1]:
-                    page_options = [page.get("id") for page in pages if page.get("id")]
-                    safe_page_options = page_options or [""]
-                    p1, p2, p3 = st.columns([1.5, 1.5, 1])
-                    from_page = p1.selectbox("From page", options=safe_page_options, index=0, key="kg_path_from")
-                    to_page = p2.selectbox("To page", options=safe_page_options, index=min(1, len(safe_page_options) - 1), key="kg_path_to")
-                    depth = int(p3.number_input("Depth", min_value=1, max_value=4, value=1, key="kg_traverse_depth"))
-                    if st.button("Traverse From Page", disabled=not from_page, key="kg_traverse"):
-                        st.json(graph_traverse_from_page(graph_run_root, str(from_page), depth=depth))
-                    if st.button("Shortest Path", disabled=not from_page or not to_page, key="kg_shortest_path"):
-                        st.json(graph_shortest_path(graph_run_root, str(from_page), str(to_page)))
-                with inspect_tabs[2]:
-                    selected_unit = st.selectbox("Unit pages", options=unit_options, key="kg_explain_unit")
-                    if selected_unit:
-                        rows = graph_get_unit_pages(graph_run_root, selected_unit, limit=200)
-                        st.dataframe(
-                            pd.DataFrame(rows)[[c for c in ["id", "title", "source_url", "path"] if rows and c in rows[0]]],
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                    with st.expander("Build status JSON", expanded=False):
-                        st.json(read_json(graph_dir / "build_status.json", {}))
-                with inspect_tabs[3]:
-                    graph_html = graph_dir / "graph.html"
-                    if graph_html.exists():
-                        st.caption(f"Rendered from `{graph_html}`. This is the deterministic knowledge graph summary.")
-                        components.html(graph_html.read_text(encoding="utf-8", errors="replace"), height=650, scrolling=True)
-                    else:
-                        st.info("HTML graph view will appear after build.")
-    st.divider()
-    st.markdown("### Run Metrics")
-    if not st.toggle("Load detailed run metrics", value=False, key="retrieval_load_run_metrics"):
-        st.info("Detailed run analytics are available on demand so retrieval readiness and Settings stay responsive.")
+        latest_embedding_report = embedding_status.get("latest_report") or {}
+        embedding_meta = latest_embedding_report.get("embedding") if isinstance(latest_embedding_report, dict) else {}
+        reranker_meta = latest_embedding_report.get("reranker") if isinstance(latest_embedding_report, dict) else {}
+        detail_rows = [
+            {"Metric": "Embedding provider", "Value": str((embedding_meta or {}).get("provider") or "n/a")},
+            {"Metric": "Embedding model", "Value": str((embedding_meta or {}).get("model") or "n/a")},
+            {"Metric": "Vector dimensions", "Value": str((embedding_meta or {}).get("vector_dimensions") or "n/a")},
+            {"Metric": "Reranker provider", "Value": str((reranker_meta or {}).get("provider") or "n/a")},
+            {"Metric": "Reranker model", "Value": str((reranker_meta or {}).get("model") or "n/a")},
+            {"Metric": "Last build time", "Value": embedding_status.get("last_build_time") or "n/a"},
+        ]
+        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+# with tabs[6]:
+if active_tab == WORKFLOW_TABS[6]:
+    st.subheader("Metrics")
+    st.caption("Request and cost metrics are estimated from recorded run/site events plus configured provider pricing.")
+    if not st.toggle("Load detailed run metrics", value=False, key="metrics_load_run_metrics"):
+        st.info("Detailed metrics are loaded on demand so the operator UI stays responsive.")
     elif not st.session_state.get("site_id"):
         st.info("Select or create a site first.")
     else:
@@ -2425,21 +4057,132 @@ with tabs[5]:
             latest_run = real_run_choices[-1]
             current_selected = st.session_state.get("metrics_run", "")
             selected_run = current_selected if current_selected in real_run_choices else latest_run
-            selected_index = real_run_choices.index(selected_run)
             metrics_run = st.selectbox(
                 "Run",
                 options=real_run_choices,
-                index=selected_index,
+                index=real_run_choices.index(selected_run),
                 key="metrics_run",
                 format_func=lambda run_name: f"Run {_run_human_timestamp(run_name)}",
             )
             run_root = site_root / metrics_run
-            run_events = load_events(run_root)
-            site_events = load_events(site_root / "meta")
             model_map = {m.get("id"): m for m in st.session_state.get("openrouter_models", [])}
             tavily_per_call = float(st.session_state.get("tavily_cost_per_call_usd", 0.0))
             ollama_in_per_m = float(st.session_state.get("ollama_input_per_m_usd", 0.0))
             ollama_out_per_m = float(st.session_state.get("ollama_output_per_m_usd", 0.0))
+
+            st.markdown("### Metrics To Date")
+            window_label = st.selectbox(
+                "Date range",
+                options=["Last 7 days", "Last 30 days", "Last 3 months", "Last 6 months", "Last year", "All time"],
+                index=1,
+                key="metrics_to_date_window",
+                help="Filters run-level rollups by run start time.",
+            )
+            run_metric_rows = [
+                _build_run_metrics_row(
+                    site_id=st.session_state["site_id"],
+                    run_id=run_name,
+                    site_root=site_root,
+                    model_map=model_map,
+                    tavily_per_call=tavily_per_call,
+                    ollama_in_per_m=ollama_in_per_m,
+                    ollama_out_per_m=ollama_out_per_m,
+                )
+                for run_name in real_run_choices
+            ]
+            metrics_df = pd.DataFrame(run_metric_rows)
+            if metrics_df.empty:
+                st.info("No run metrics are available for this site yet.")
+            else:
+                metrics_df["run_ts"] = pd.to_datetime(metrics_df["run_ts"], errors="coerce", utc=True)
+                window_start = _metrics_window_start(window_label)
+                filtered_metrics_df = metrics_df if window_start is None else metrics_df[metrics_df["run_ts"].isna() | (metrics_df["run_ts"] >= window_start)]
+                filtered_metrics_df = filtered_metrics_df.copy()
+                if filtered_metrics_df.empty:
+                    st.info(f"No runs match {window_label.lower()}.")
+                else:
+                    total_done = int(filtered_metrics_df["done_pages"].sum())
+                    total_scraped = int(filtered_metrics_df["scraped_pages"].sum())
+                    total_failed = int(filtered_metrics_df["failed_pages"].sum())
+                    total_elapsed_min = float(filtered_metrics_df["elapsed_min"].sum())
+                    success_rate = (total_scraped / total_done * 100.0) if total_done > 0 else 0.0
+                    aggregate_ppm = (total_done / total_elapsed_min) if total_elapsed_min > 0 else 0.0
+                    render_metric_strip(
+                        [
+                            {"label": "Runs", "value": _fmt_compact_number(float(len(filtered_metrics_df)))},
+                            {"label": "Selected URLs", "value": _fmt_compact_number(float(filtered_metrics_df["selected_urls"].sum()))},
+                            {"label": "Scraped Pages", "value": _fmt_compact_number(float(total_scraped))},
+                            {"label": "Failed Pages", "value": _fmt_compact_number(float(total_failed))},
+                        ]
+                    )
+                    render_metric_strip(
+                        [
+                            {"label": "Success Rate", "value": f"{success_rate:.1f}%"},
+                            {"label": "Pages / Min", "value": f"{aggregate_ppm:.2f}"},
+                            {"label": "Provider Requests", "value": _fmt_compact_number(float(filtered_metrics_df["provider_requests"].sum()))},
+                            {"label": "Est. Cost", "value": _fmt_usd(float(filtered_metrics_df["cost_usd"].sum()))},
+                        ]
+                    )
+
+                    chart_metrics_df = filtered_metrics_df.dropna(subset=["run_ts"]).sort_values("run_ts")
+                    if not chart_metrics_df.empty:
+                        daily_metrics = chart_metrics_df.copy()
+                        daily_metrics["run_date"] = daily_metrics["run_ts"].dt.floor("D")
+                        daily_metrics = (
+                            daily_metrics.groupby("run_date", as_index=False)
+                            .agg(
+                                runs=("run_id", "count"),
+                                scraped_pages=("scraped_pages", "sum"),
+                                failed_pages=("failed_pages", "sum"),
+                                cost_usd=("cost_usd", "sum"),
+                                provider_requests=("provider_requests", "sum"),
+                            )
+                            .sort_values("run_date")
+                        )
+                        td1, td2 = st.columns(2)
+                        td1.altair_chart(
+                            alt.Chart(daily_metrics)
+                            .mark_bar(cornerRadiusTopRight=4, cornerRadiusTopLeft=4)
+                            .encode(
+                                x=alt.X("run_date:T", title="Date"),
+                                y=alt.Y("scraped_pages:Q", title="Scraped Pages"),
+                                tooltip=["run_date:T", "runs:Q", "scraped_pages:Q", "failed_pages:Q"],
+                            )
+                            .properties(height=260),
+                            use_container_width=True,
+                        )
+                        td2.altair_chart(
+                            alt.Chart(daily_metrics)
+                            .mark_line(point=alt.OverlayMarkDef(size=24, filled=True))
+                            .encode(
+                                x=alt.X("run_date:T", title="Date"),
+                                y=alt.Y("cost_usd:Q", title="Estimated Cost (USD)"),
+                                tooltip=["run_date:T", "cost_usd:Q", "provider_requests:Q"],
+                            )
+                            .properties(height=260),
+                            use_container_width=True,
+                        )
+
+                    per_run_display = filtered_metrics_df.sort_values("run_ts", ascending=False, na_position="last").copy()
+                    per_run_display["Run"] = per_run_display["run_label"]
+                    per_run_display["Selected"] = per_run_display["selected_urls"].map(lambda value: _fmt_compact_number(float(value)))
+                    per_run_display["Scraped"] = per_run_display["scraped_pages"].map(lambda value: _fmt_compact_number(float(value)))
+                    per_run_display["Failed"] = per_run_display["failed_pages"].map(lambda value: _fmt_compact_number(float(value)))
+                    per_run_display["Cleaned"] = per_run_display["cleaned_pages"].map(lambda value: _fmt_compact_number(float(value)))
+                    per_run_display["Success %"] = per_run_display["success_rate"].map(lambda value: f"{float(value):.1f}%")
+                    per_run_display["Pages/min"] = per_run_display["pages_per_min"].map(lambda value: f"{float(value):.2f}")
+                    per_run_display["Requests"] = per_run_display["provider_requests"].map(lambda value: _fmt_compact_number(float(value)))
+                    per_run_display["Cost"] = per_run_display["cost_usd"].map(lambda value: _fmt_usd(float(value)))
+                    st.caption("Per-run metrics in the selected date range")
+                    st.dataframe(
+                        per_run_display[["Run", "state", "Selected", "Scraped", "Failed", "Cleaned", "Success %", "Pages/min", "Requests", "Cost", "run_id"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            st.markdown("### Selected Run Detail")
+            run_events = load_events(run_root)
+            site_events = load_events(site_root / "meta")
             trace_df = _build_trace_df(
                 run_events=run_events,
                 site_events=site_events,
@@ -2461,340 +4204,150 @@ with tabs[5]:
             failure_summary = summarize_failures(pages, failures)
             output_summary = summarize_output_volume(pages)
 
-            def _fmt_compact_number(value: float) -> str:
-                val = float(value)
-                abs_val = abs(val)
-                if abs_val >= 1_000_000_000:
-                    return f"{val/1_000_000_000:.1f}B"
-                if abs_val >= 1_000_000:
-                    return f"{val/1_000_000:.1f}M"
-                if abs_val >= 1_000:
-                    return f"{val/1_000:.1f}K"
-                return f"{int(val)}" if val.is_integer() else f"{val:.1f}"
-
-            st.caption("Run Summary")
             with st.container(border=True):
+                st.caption("Run Summary")
                 ra1, ra2, ra3, ra4, ra5 = st.columns(5)
                 ra1.metric("Selected URLs", _fmt_compact_number(len(selected_urls) if isinstance(selected_urls, list) else 0))
                 ra2.metric("Scraped Pages", _fmt_compact_number(int(page_summary.get("success", 0))))
                 ra3.metric("Cleaned Pages", _fmt_compact_number(len(cleaned_pages)))
                 ra4.metric("Skipped Pages", _fmt_compact_number(len(skipped_pages)))
                 ra5.metric("Failed Pages", _fmt_compact_number(int(page_summary.get("failed", 0))))
-
-                st.write("")
-                st.caption("Performance")
                 rb1, rb2, rb3, rb4, rb5 = st.columns(5)
                 rb1.metric("Elapsed", f"{float(page_summary.get('elapsed_sec', 0.0)) / 60.0:.1f} min")
                 rb2.metric("Pages / min", f"{float(page_summary.get('pages_per_min', 0.0)):.2f}")
                 eta_value = page_summary.get("eta_min")
-                rb3.metric("ETA", "—" if eta_value is None else f"{float(eta_value):.1f} min")
+                rb3.metric("ETA", "n/a" if eta_value is None else f"{float(eta_value):.1f} min")
                 rb4.metric("P50 Duration", f"{float(duration_summary.get('p50_sec', 0.0)):.2f} s")
                 rb5.metric("P95 Duration", f"{float(duration_summary.get('p95_sec', 0.0)):.2f} s")
-
-                st.write("")
-                st.caption("Content Volume")
                 rc1, rc2, rc3 = st.columns(3)
                 rc1.metric("Markdown Bytes", _fmt_compact_number(int(output_summary.get("markdown_total_bytes", 0))))
                 rc2.metric("Raw HTML Bytes", _fmt_compact_number(int(output_summary.get("raw_html_total_bytes", 0))))
                 rc3.metric("Avg Text Length", _fmt_compact_number(float(output_summary.get("text_avg", 0.0))))
 
-            with st.container(border=True):
-                st.caption("Scrape Analytics Charts")
-                if completion_df.empty:
-                    st.info("No completed pages yet for run-level scrape analytics.")
+            if completion_df.empty:
+                st.info("No completed pages yet for scrape charts.")
+            else:
+                cts1, cts2 = st.columns(2)
+                cts1.altair_chart(
+                    alt.Chart(completion_df)
+                    .mark_line(point=alt.OverlayMarkDef(size=22, filled=True))
+                    .encode(x=alt.X("bucket:T", title="Time"), y=alt.Y("completed:Q", title="Pages Completed"), tooltip=["bucket:T", "completed:Q", "success:Q", "failed:Q", "cancelled:Q"])
+                    .properties(height=300),
+                    use_container_width=True,
+                )
+                cts2.altair_chart(
+                    alt.Chart(completion_df)
+                    .mark_line(point=alt.OverlayMarkDef(size=22, filled=True))
+                    .encode(x=alt.X("bucket:T", title="Time"), y=alt.Y("ppm:Q", title="Pages / Minute"), tooltip=["bucket:T", "ppm:Q"])
+                    .properties(height=300),
+                    use_container_width=True,
+                )
+
+            fr1, fr2, fr3 = st.columns(3)
+            for target, df, title in [
+                (fr1, failure_summary["by_reason"], "Reason"),
+                (fr2, failure_summary["by_fetch_mode"], "Fetch Mode"),
+                (fr3, failure_summary["by_http_status"], "HTTP Status"),
+            ]:
+                if df.empty:
+                    target.info(f"No failures by {title.lower()} yet.")
                 else:
-                    cts1, cts2 = st.columns(2)
-                    cts1.altair_chart(
-                        alt.Chart(completion_df)
-                        .mark_line(point=alt.OverlayMarkDef(size=22, filled=True))
-                        .encode(
-                            x=alt.X("bucket:T", title="Time"),
-                            y=alt.Y("completed:Q", title="Pages Completed"),
-                            tooltip=["bucket:T", "completed:Q", "success:Q", "failed:Q", "cancelled:Q"],
-                        )
+                    target.altair_chart(
+                        alt.Chart(df.sort_values("count", ascending=False))
+                        .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+                        .encode(x=alt.X("count:Q", title="Count"), y=alt.Y("label:N", title=title, sort="-x"), tooltip=["label", "count"])
+                        .properties(height=240),
+                        use_container_width=True,
+                    )
+            if not slow_pages_df.empty:
+                st.caption("Slowest Pages")
+                st.dataframe(slow_pages_df, use_container_width=True, hide_index=True)
+
+            st.markdown("### Provider Requests And Cost")
+            if trace_df.empty:
+                st.info("No OpenRouter, Tavily, or Ollama events are recorded for this run yet.")
+            else:
+                trace_df["ts"] = pd.to_datetime(trace_df.get("ts"), errors="coerce", utc=True)
+                trace_df["provider"] = trace_df.get("provider", "unknown").fillna("unknown").astype(str)
+                trace_df["operation"] = trace_df.get("operation", "unknown").fillna("unknown").astype(str)
+                trace_df["model"] = trace_df.get("model", "unknown").fillna("unknown").astype(str)
+                trace_df["prompt_tokens"] = pd.to_numeric(trace_df.get("prompt_tokens"), errors="coerce").fillna(0.0)
+                trace_df["completion_tokens"] = pd.to_numeric(trace_df.get("completion_tokens"), errors="coerce").fillna(0.0)
+                trace_df["total_tokens"] = pd.to_numeric(trace_df.get("total_tokens"), errors="coerce").fillna(trace_df["prompt_tokens"] + trace_df["completion_tokens"])
+                trace_df["cost_usd"] = pd.to_numeric(trace_df.get("cost_usd"), errors="coerce").fillna(0.0)
+                billable_trace = trace_df[~trace_df.get("is_summary", pd.Series(False, index=trace_df.index)).fillna(False).astype(bool)].copy()
+                provider_counts = billable_trace.groupby("provider", as_index=False).size().rename(columns={"size": "requests"}).sort_values("requests", ascending=False)
+                model_counts = billable_trace.groupby(["provider", "model"], as_index=False).size().rename(columns={"size": "requests"}).sort_values("requests", ascending=False)
+                operation_counts = billable_trace.groupby(["provider", "operation"], as_index=False).size().rename(columns={"size": "requests"}).sort_values("requests", ascending=False)
+                cost_by_provider = billable_trace.groupby("provider", as_index=False)["cost_usd"].sum().sort_values("cost_usd", ascending=False)
+                token_ts = billable_trace.dropna(subset=["ts"]).copy()
+                if not token_ts.empty:
+                    token_ts["bucket"] = token_ts["ts"].dt.floor("min")
+                    token_ts = token_ts.groupby(["bucket", "provider"], as_index=False)[["prompt_tokens", "completion_tokens", "total_tokens", "cost_usd"]].sum()
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Provider Requests", _fmt_compact_number(float(len(billable_trace))))
+                m2.metric("OpenRouter", _fmt_compact_number(float((billable_trace["provider"] == "openrouter").sum())))
+                m3.metric("Tavily", _fmt_compact_number(float((billable_trace["provider"] == "tavily").sum())))
+                m4.metric("Ollama", _fmt_compact_number(float((billable_trace["provider"] == "ollama").sum())))
+
+                p1, p2 = st.columns(2)
+                p1.altair_chart(
+                    alt.Chart(provider_counts)
+                    .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+                    .encode(x=alt.X("requests:Q", title="Requests"), y=alt.Y("provider:N", title="Provider", sort="-x"), tooltip=["provider", "requests"])
+                    .properties(height=260),
+                    use_container_width=True,
+                )
+                p2.altair_chart(
+                    alt.Chart(cost_by_provider)
+                    .mark_arc(innerRadius=45)
+                    .encode(theta=alt.Theta("cost_usd:Q", title="Estimated Cost"), color=alt.Color("provider:N", title="Provider"), tooltip=["provider", "cost_usd"])
+                    .properties(height=260),
+                    use_container_width=True,
+                )
+                p3, p4 = st.columns(2)
+                p3.altair_chart(
+                    alt.Chart(model_counts.head(30))
+                    .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+                    .encode(x=alt.X("requests:Q", title="Requests"), y=alt.Y("model:N", title="Model", sort="-x"), color=alt.Color("provider:N", title="Provider"), tooltip=["provider", "model", "requests"])
+                    .properties(height=360),
+                    use_container_width=True,
+                )
+                p4.altair_chart(
+                    alt.Chart(operation_counts.head(30))
+                    .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+                    .encode(x=alt.X("requests:Q", title="Requests"), y=alt.Y("operation:N", title="Operation", sort="-x"), color=alt.Color("provider:N", title="Provider"), tooltip=["provider", "operation", "requests"])
+                    .properties(height=360),
+                    use_container_width=True,
+                )
+                if token_ts.empty:
+                    st.info("No token or cost time series data yet.")
+                else:
+                    t1, t2 = st.columns(2)
+                    t1.altair_chart(
+                        alt.Chart(token_ts)
+                        .mark_area(opacity=0.7)
+                        .encode(x=alt.X("bucket:T", title="Time"), y=alt.Y("total_tokens:Q", title="Tokens"), color=alt.Color("provider:N", title="Provider"), tooltip=["bucket:T", "provider", "total_tokens"])
                         .properties(height=300),
                         use_container_width=True,
                     )
-                    cts2.altair_chart(
-                        alt.Chart(completion_df)
-                        .mark_line(point=alt.OverlayMarkDef(size=22, filled=True))
-                        .encode(
-                            x=alt.X("bucket:T", title="Time"),
-                            y=alt.Y("ppm:Q", title="Pages / Minute"),
-                            tooltip=["bucket:T", "ppm:Q"],
-                        )
+                    t2.altair_chart(
+                        alt.Chart(token_ts)
+                        .mark_line(point=alt.OverlayMarkDef(size=18, filled=True))
+                        .encode(x=alt.X("bucket:T", title="Time"), y=alt.Y("cost_usd:Q", title="Estimated Cost (USD)"), color=alt.Color("provider:N", title="Provider"), tooltip=["bucket:T", "provider", "cost_usd"])
                         .properties(height=300),
                         use_container_width=True,
                     )
-
-                st.write("")
-                fr1, fr2, fr3 = st.columns(3)
-                by_reason_df = failure_summary["by_reason"]
-                by_fetch_mode_df = failure_summary["by_fetch_mode"]
-                by_http_status_df = failure_summary["by_http_status"]
-                if by_reason_df.empty:
-                    fr1.info("No failures by reason yet.")
-                else:
-                    fr1.altair_chart(
-                        alt.Chart(by_reason_df.sort_values("count", ascending=False))
-                        .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
-                        .encode(
-                            x=alt.X("count:Q", title="Count"),
-                            y=alt.Y("label:N", title="Reason", sort="-x"),
-                            tooltip=["label", "count"],
-                        )
-                        .properties(height=240),
+                with st.expander("Provider event table", expanded=False):
+                    st.dataframe(
+                        billable_trace[[c for c in ["ts", "provider", "operation", "model", "status", "prompt_tokens", "completion_tokens", "total_tokens", "latency_ms", "cost_usd"] if c in billable_trace.columns]],
                         use_container_width=True,
-                    )
-                if by_fetch_mode_df.empty:
-                    fr2.info("No failures by fetch mode yet.")
-                else:
-                    fr2.altair_chart(
-                        alt.Chart(by_fetch_mode_df.sort_values("count", ascending=False))
-                        .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
-                        .encode(
-                            x=alt.X("count:Q", title="Count"),
-                            y=alt.Y("label:N", title="Fetch Mode", sort="-x"),
-                            tooltip=["label", "count"],
-                        )
-                        .properties(height=240),
-                        use_container_width=True,
-                    )
-                if by_http_status_df.empty:
-                    fr3.info("No failures by HTTP status yet.")
-                else:
-                    fr3.altair_chart(
-                        alt.Chart(by_http_status_df.sort_values("count", ascending=False))
-                        .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
-                        .encode(
-                            x=alt.X("count:Q", title="Count"),
-                            y=alt.Y("label:N", title="HTTP Status", sort="-x"),
-                            tooltip=["label", "count"],
-                        )
-                        .properties(height=240),
-                        use_container_width=True,
+                        hide_index=True,
                     )
 
-                if not slow_pages_df.empty:
-                    st.caption("Slowest Pages")
-                    st.dataframe(slow_pages_df, use_container_width=True, hide_index=True)
-
-            with st.container(border=True):
-                st.caption("OpenRouter LLM Metrics")
-                openrouter_trace = trace_df[
-                    (trace_df["provider"].fillna("").astype(str) == "openrouter")
-                    & (~trace_df.get("is_summary", pd.Series(False, index=trace_df.index)).fillna(False).astype(bool))
-                ].copy() if not trace_df.empty else pd.DataFrame()
-                if openrouter_trace.empty:
-                    st.info("No non-summary OpenRouter calls recorded for this run yet.")
-                else:
-                    openrouter_trace["ts"] = pd.to_datetime(openrouter_trace.get("ts"), errors="coerce", utc=True)
-                    openrouter_trace = openrouter_trace.dropna(subset=["ts"]).copy()
-                    openrouter_trace["operation"] = openrouter_trace.get("operation", "unknown").fillna("unknown").astype(str)
-                    openrouter_trace["model"] = openrouter_trace.get("model", "unknown").fillna("unknown").astype(str)
-                    openrouter_trace["prompt_tokens"] = pd.to_numeric(openrouter_trace.get("prompt_tokens"), errors="coerce").fillna(0.0)
-                    openrouter_trace["completion_tokens"] = pd.to_numeric(openrouter_trace.get("completion_tokens"), errors="coerce").fillna(0.0)
-                    openrouter_trace["total_tokens"] = pd.to_numeric(openrouter_trace.get("total_tokens"), errors="coerce").fillna(
-                        openrouter_trace["prompt_tokens"] + openrouter_trace["completion_tokens"]
-                    )
-                    openrouter_trace["latency_ms"] = pd.to_numeric(openrouter_trace.get("latency_ms"), errors="coerce")
-                    openrouter_trace["cost_usd"] = pd.to_numeric(openrouter_trace.get("cost_usd"), errors="coerce").fillna(0.0)
-
-                    llm_calls_ts = build_llm_calls_timeseries(trace_df)
-                    llm_tokens_ts = build_llm_token_timeseries(trace_df)
-                    llm_model_counts = build_llm_model_counts(trace_df)
-                    llm_latency = build_llm_latency_table(trace_df)
-                    llm_cost_by_operation = build_llm_cost_breakdown(trace_df, group_by="operation")
-                    llm_cost_by_model = build_llm_cost_breakdown(trace_df, group_by="model")
-                    llm_operation_counts = (
-                        llm_calls_ts.groupby("operation", as_index=False)["calls"].sum().sort_values("calls", ascending=False)
-                        if not llm_calls_ts.empty
-                        else pd.DataFrame(columns=["operation", "calls"])
-                    )
-                    llm_p95_latency = float(llm_latency["latency_ms"].quantile(0.95)) if not llm_latency.empty else 0.0
-
-                    l1, l2, l3, l4 = st.columns(4)
-                    l1.metric("OpenRouter Calls", _fmt_compact_number(len(openrouter_trace)))
-                    l2.metric("Prompt Tokens", _fmt_compact_number(float(openrouter_trace["prompt_tokens"].sum())))
-                    l3.metric("Completion Tokens", _fmt_compact_number(float(openrouter_trace["completion_tokens"].sum())))
-                    l4.metric("P95 Latency", f"{llm_p95_latency:.1f} ms")
-
-                    gt1, gt2 = st.columns(2)
-                    if llm_calls_ts.empty:
-                        gt1.info("No call timeline data yet.")
-                    else:
-                        gt1.altair_chart(
-                            alt.Chart(llm_calls_ts)
-                            .mark_line(point=alt.OverlayMarkDef(size=18, filled=True))
-                            .encode(
-                                x=alt.X("bucket:T", title="Time"),
-                                y=alt.Y("calls:Q", title="Calls"),
-                                color=alt.Color("operation:N", title="Operation"),
-                                tooltip=["bucket:T", "operation", "calls"],
-                            )
-                            .properties(height=280),
-                            use_container_width=True,
-                        )
-                    if llm_operation_counts.empty:
-                        gt2.info("No operation breakdown yet.")
-                    else:
-                        gt2.altair_chart(
-                            alt.Chart(llm_operation_counts)
-                            .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
-                            .encode(
-                                x=alt.X("calls:Q", title="Calls"),
-                                y=alt.Y("operation:N", title="Operation", sort="-x"),
-                                tooltip=["operation", "calls"],
-                            )
-                            .properties(height=280),
-                            use_container_width=True,
-                        )
-
-                    gt3, gt4 = st.columns(2)
-                    if llm_model_counts.empty:
-                        gt3.info("No model mix data yet.")
-                    else:
-                        gt3.altair_chart(
-                            alt.Chart(llm_model_counts)
-                            .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
-                            .encode(
-                                x=alt.X("calls:Q", title="Calls"),
-                                y=alt.Y("model:N", title="Model", sort="-x"),
-                                tooltip=["model", "calls"],
-                            )
-                            .properties(height=300),
-                            use_container_width=True,
-                        )
-                    if llm_tokens_ts.empty:
-                        gt4.info("No token timeline data yet.")
-                    else:
-                        token_long = llm_tokens_ts.melt(
-                            id_vars=["bucket"],
-                            value_vars=["prompt_tokens", "completion_tokens"],
-                            var_name="token_type",
-                            value_name="tokens",
-                        )
-                        gt4.altair_chart(
-                            alt.Chart(token_long)
-                            .mark_area(opacity=0.7)
-                            .encode(
-                                x=alt.X("bucket:T", title="Time"),
-                                y=alt.Y("tokens:Q", title="Tokens"),
-                                color=alt.Color("token_type:N", title="Token Type"),
-                                tooltip=["bucket:T", "token_type", "tokens"],
-                            )
-                            .properties(height=300),
-                            use_container_width=True,
-                        )
-
-                    gt5, gt6 = st.columns(2)
-                    gt5.altair_chart(
-                        alt.Chart(openrouter_trace)
-                        .mark_bar()
-                        .encode(
-                            x=alt.X("total_tokens:Q", bin=alt.Bin(maxbins=20), title="Total Tokens / Call"),
-                            y=alt.Y("count():Q", title="Calls"),
-                            tooltip=[alt.Tooltip("count():Q", title="Calls")],
-                        )
-                        .properties(height=280),
-                        use_container_width=True,
-                    )
-                    latency_ts = openrouter_trace.dropna(subset=["latency_ms"]).sort_values("ts")
-                    if latency_ts.empty:
-                        gt6.info("No latency timeline yet.")
-                    else:
-                        gt6.altair_chart(
-                            alt.Chart(latency_ts)
-                            .mark_line(point=alt.OverlayMarkDef(size=18, filled=True, opacity=0.6))
-                            .encode(
-                                x=alt.X("ts:T", title="Time"),
-                                y=alt.Y("latency_ms:Q", title="Latency (ms)"),
-                                color=alt.Color("operation:N", title="Operation"),
-                                tooltip=["ts:T", "operation", "model", "latency_ms", "status"],
-                            )
-                            .properties(height=280),
-                            use_container_width=True,
-                        )
-
-                    gt7, gt8 = st.columns(2)
-                    if llm_latency.empty:
-                        gt7.info("No latency distribution yet.")
-                    else:
-                        gt7.altair_chart(
-                            alt.Chart(llm_latency)
-                            .mark_boxplot(extent="min-max")
-                            .encode(
-                                x=alt.X("operation:N", title="Operation"),
-                                y=alt.Y("latency_ms:Q", title="Latency (ms)"),
-                                color=alt.Color("operation:N", legend=None),
-                                tooltip=["operation", "model", "latency_ms"],
-                            )
-                            .properties(height=300),
-                            use_container_width=True,
-                        )
-                    cost_long = pd.concat(
-                        [
-                            llm_cost_by_operation.rename(columns={"operation": "label"}).assign(dimension="operation"),
-                            llm_cost_by_model.rename(columns={"model": "label"}).assign(dimension="model"),
-                        ],
-                        ignore_index=True,
-                    )
-                    if cost_long.empty:
-                        gt8.info("No non-zero OpenRouter cost data yet.")
-                    else:
-                        gt8.altair_chart(
-                            alt.Chart(cost_long)
-                            .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
-                            .encode(
-                                x=alt.X("cost_usd:Q", title="Estimated Cost (USD)"),
-                                y=alt.Y("label:N", title="Operation / Model", sort="-x"),
-                                color=alt.Color("dimension:N", title="Breakdown"),
-                                tooltip=["dimension", "label", "cost_usd"],
-                            )
-                            .properties(height=300),
-                            use_container_width=True,
-                        )
-    st.divider()
-    st.markdown("### MCP readiness")
-    site_id = st.session_state.get("site_id", "")
-    if not site_id:
-        st.info("Create or open a workspace first.")
-    else:
-        layout = site_layout(DATA_ROOT / "sites" / site_id)
-        raw_status = _raw_source_status(layout)
-        wiki_status = _load_wiki_status(layout, raw_status)
-        embedding_status = _load_embedding_status(layout)
-        if retrieval_quality_summary is None:
-            chunk_rows = _read_jsonl_rows(layout.site_root / "sources" / "pdf_ingest" / "pdf_chunks.jsonl")
-            retrieval_quality_summary = build_chunk_quality_summary(row for row in chunk_rows if isinstance(row, dict))
-        mcp_status = _load_mcp_status(layout)
-        if not _raw_sources_ready(raw_status):
-            st.warning("Blocked: normalize Corpus sources before MCP readiness checks.")
-        elif not _wiki_ready(wiki_status):
-            st.warning("Blocked: build the LLM Wiki before MCP readiness checks.")
-        elif not retrieval_quality_summary.ready_for_retrieval:
-            st.warning("Retrieval is blocked until Corpus Content Inspector chunk quality is ready.")
-        elif embedding_status["index_health"] != "ready":
-            st.warning("Blocked: build healthy corpus/wiki indexes before MCP readiness checks.")
-        elif not mcp_status["server_available"]:
-            st.warning("MCP server implementation is pending. Query setup stays unavailable until a real server module is present.")
-        else:
-            st.success("MCP query prerequisites are ready.")
-
-        m1, m2 = st.columns(2)
-        m1.metric("Index Health", mcp_status["index_health"])
-        m2.metric("Server", "configured" if mcp_status["server_available"] else "pending")
-        render_operator_details(
-            "Operator Details",
-            {
-                "Server command": mcp_status.get("server_command") or "",
-                "Expected server command": mcp_status.get("expected_server_command") or "",
-                "Config snippet": mcp_status.get("config_snippet") or {},
-                "Latest MCP report path": str(mcp_status.get("latest_report_path") or ""),
-            },
-        )
-
-with tabs[6]:
+# with tabs[7]:
+if active_tab == WORKFLOW_TABS[7]:
     st.subheader("Settings")
     st.caption("Configure local providers, models, scraping, retrieval, and research.")
 
@@ -2804,7 +4357,7 @@ with tabs[6]:
     status_cols[2].metric("Concurrency", int(st.session_state.get("scrape_concurrency", 10)))
     status_cols[3].metric("Vector", "on" if st.session_state.get("zvec_enabled", True) else "off")
 
-    settings_tabs = st.tabs(["Keys", "LLM", "Scraping", "Retrieval", "Research"])
+    settings_tabs = st.tabs(["Keys", "LLM", "Scraping", "Indexing", "Research"])
 
     with settings_tabs[0]:
         st.caption("API keys are stored locally in `.env`.")
@@ -2873,16 +4426,14 @@ with tabs[6]:
                 key="settings_url_reasoning_ollama_model",
             )
 
-        with st.expander("Graph enrichment", expanded=False):
+        with st.expander("Wiki enrichment", expanded=False):
             tg1, tg2, tg3 = st.columns([1, 1.5, 1.5])
             current_graph_provider = st.session_state.get("graph_enrichment_provider", "openrouter")
             st.session_state["graph_enrichment_provider"] = tg1.selectbox(
                 "Provider",
-                options=["deterministic", "openrouter", "ollama"],
-                index=["deterministic", "openrouter", "ollama"].index(current_graph_provider)
-                if current_graph_provider in {"deterministic", "openrouter", "ollama"}
-                else 1,
-                help="URL graph artifacts are secondary support. Provider applies only to optional semantic enrichment.",
+                options=["openrouter", "ollama"],
+                index=["openrouter", "ollama"].index(current_graph_provider) if current_graph_provider in {"openrouter", "ollama"} else 0,
+                help="Provider for optional wiki maintenance/enrichment jobs.",
                 key="graph_enrichment_provider_select",
             )
             st.session_state["graph_enrichment_openrouter_model"] = tg2.text_input(
@@ -2896,7 +4447,7 @@ with tabs[6]:
                 key="settings_graph_enrichment_ollama_model",
             )
 
-        with st.expander("Graph Q&A", expanded=False):
+        with st.expander("Wiki Q&A", expanded=False):
             ta1, ta2, ta3 = st.columns([1, 1.5, 1.5])
             current_answer_provider = st.session_state.get("graph_answer_provider", "openrouter")
             st.session_state["graph_answer_provider"] = ta1.selectbox(

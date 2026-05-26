@@ -4,32 +4,27 @@ from pathlib import Path
 APP_SOURCE = Path(__file__).resolve().parents[1] / "app.py"
 
 
-def test_retrieval_tab_combines_metrics_and_mcp_readiness() -> None:
+def test_embeddings_metrics_and_query_have_separate_top_level_tabs() -> None:
     app = APP_SOURCE.read_text(encoding="utf-8")
-    start = app.index("with tabs[5]:")
-    end = app.index("with tabs[6]:", start)
-    retrieval = app[start:end]
+    embeddings = app[app.index("with tabs[5]:"):app.index("with tabs[6]:")]
+    metrics = app[app.index("with tabs[6]:"):app.index("with tabs[7]:")]
+    settings = app[app.index("with tabs[7]:"):]
 
-    assert 'st.subheader("Retrieval")' in retrieval
-    assert "Scrape Analytics Charts" in retrieval
-    assert 'key="retrieval_load_run_metrics"' in retrieval
-    assert retrieval.index('key="retrieval_load_run_metrics"') < retrieval.index("Scrape Analytics Charts")
-    assert retrieval.index('key="retrieval_load_run_metrics"') < retrieval.index("_load_run_analytics_inputs")
-    assert "Index Health" in retrieval
-    assert "Chunk quality" in retrieval
-    assert "ready_for_retrieval" in retrieval
-    assert "from src.scrape_planner.ui_preview_quality import" in app
-    assert "build_chunk_quality_summary" in app
-    assert (
-        'chunk_rows = _read_jsonl_rows(layout.site_root / "sources" / "pdf_ingest" / "pdf_chunks.jsonl")'
-        in retrieval
-    )
-    assert "build_chunk_quality_summary(row for row in chunk_rows if isinstance(row, dict))" in retrieval
-    assert '"Blocked"' in retrieval
-    assert "Chunk quality is unknown" in retrieval
-    assert "Corpus Content Inspector" in retrieval
-    assert '"Unknown"' not in retrieval
-    assert "MCP readiness" in retrieval
-    assert "Server command" in retrieval
-    assert "Operator Details" in retrieval
-    assert 'st.subheader("Settings")' not in retrieval
+    assert 'st.subheader("Embeddings")' in embeddings
+    assert "Build / Rebuild Embeddings" in embeddings
+    assert "build_llm_wiki_index(layout.site_root)" in embeddings
+    assert "Raw Docs" in embeddings
+    assert "Wiki Docs" in embeddings
+    assert "Chunk quality" not in embeddings
+
+    assert 'st.subheader("Metrics")' in metrics
+    assert 'key="metrics_load_run_metrics"' in metrics
+    assert "_load_run_analytics_inputs" in metrics
+    assert "Provider Requests" in metrics
+    assert "OpenRouter" in metrics
+    assert "Tavily" in metrics
+    assert "Ollama" in metrics
+
+    assert 'st.subheader("Settings")' in settings
+    assert "Query Wiki Index" not in settings
+    assert "MCP connection" not in settings

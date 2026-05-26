@@ -33,6 +33,8 @@ def test_sources_tab_keeps_pdf_sources_not_url_selection() -> None:
     assert '"Documents"' in source
     assert "Upload PDFs" in source
     assert "Extract / Re-extract PDFs" in source
+    assert "Add One URL To Knowledge Base" in source
+    assert "run_manual_url_pipeline(" in source
 
     removed_url_selection_copy = [
         "Choose URLs",
@@ -54,8 +56,8 @@ def test_sources_tab_keeps_pdf_sources_not_url_selection() -> None:
 def test_sources_tab_uses_lightweight_page_preview_controls() -> None:
     source = _corpus_tab_source()
 
-    assert '"PDF extraction"' in source
-    assert '"Page-by-page markdown"' in source
+    assert '"PDF extraction"' not in source
+    assert '"Page-by-page markdown"' not in source
     source = _sources_tab_source()
 
     assert '"Page number"' not in source
@@ -70,34 +72,42 @@ def test_pdf_extract_actions_handle_missing_docling_without_crashing() -> None:
     app_source = APP_PATH.read_text(encoding="utf-8")
 
     assert "PdfParserUnavailableError" in app_source
-    assert "def _render_pdf_parser_unavailable_error(" in app_source
-    assert "PDF extraction is unavailable until Docling is installed." in app_source
-    assert 'Install `requirements-pdf.txt` in this environment' in app_source
+    assert 'status["state"] = "parser_unavailable"' in app_source
+    assert 'pdf_status.get("state") in {"failed", "parser_unavailable"}' in app_source
+    assert "PDF extraction failed" in app_source
 
 
-def test_corpus_tab_promotes_pdf_extraction_progress() -> None:
+def test_documents_tab_promotes_compact_source_inspection() -> None:
     source = APP_PATH.read_text(encoding="utf-8")
     start = source.index("with tabs[3]:")
     end = source.index("with tabs[4]:", start)
-    corpus = source[start:end]
+    documents = source[start:end]
 
-    assert 'st.subheader("Corpus")' in corpus
-    assert "PDF extraction" in corpus
-    assert "Pages extracted" in corpus
-    assert "Search chunks" in corpus
-    assert "Chunk quality" in corpus
-    assert "Content Inspector" in corpus
-    assert "Registry path:" in corpus
-    assert "Operator Details" in corpus
-    assert "Raw Data Sources" not in corpus
+    assert 'st.subheader("Documents")' in documents
+    assert "PDF extraction" not in documents
+    assert "Choose source type" in documents
+    assert "Scraped URLs" in documents
+    assert "PDF pages" in documents
+    assert "Sources" in documents
+    assert "Preview" in documents
+    assert "Markdown preview" in documents
+    assert "Raw markdown" not in documents
+    assert "Debug normalization report" not in documents
+    assert "Chunk quality" not in documents
+    assert "Content Inspector" not in documents
+    assert "Raw Data Sources" not in documents
+    assert "Source Quality Examples" not in documents
 
 
-def test_corpus_tab_uses_review_oriented_expander_defaults() -> None:
-    corpus = _corpus_tab_source()
+def test_documents_tab_removes_debug_and_pdf_expandables() -> None:
+    documents = _corpus_tab_source()
 
-    assert 'with st.expander("PDF extraction", expanded=bool(page_rows)):' in corpus
-    assert 'with st.expander("Embedding chunks", expanded=False):' in corpus
-    assert 'with st.expander("PDF review queue", expanded=bool(quarantine_rows)):' in corpus
+    assert 'with st.expander("PDF extraction", expanded=bool(page_rows)):' not in documents
+    assert 'with st.expander("Debug normalization report", expanded=False):' not in documents
+    assert 'with st.expander("Raw markdown", expanded=False):' not in documents
+    assert 'with st.expander("Embedding chunks", expanded=False):' not in documents
+    assert 'with st.expander("PDF review queue", expanded=bool(quarantine_rows)):' not in documents
+    assert 'with st.expander("Page-by-page markdown", expanded=bool(page_rows)):' not in documents
 
 
 def test_corpus_tab_hides_raw_registry_path_outside_operator_details() -> None:

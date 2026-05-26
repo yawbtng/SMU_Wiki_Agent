@@ -20,9 +20,10 @@ EXPECTED_OPERATOR_TABS = [
     "Overview",
     "Sources",
     "Runs",
-    "Corpus",
+    "Documents",
     "Wiki",
-    "Retrieval",
+    "Embeddings",
+    "Metrics",
     "Settings",
 ]
 
@@ -38,19 +39,27 @@ OLD_WORKFLOW_LABELS = [
 def _tab_body(tab_index: int) -> list[ast.stmt]:
     tree = ast.parse(Path("app.py").read_text(encoding="utf-8"))
     for node in ast.walk(tree):
-        if not isinstance(node, ast.With):
+        if not isinstance(node, ast.If):
             continue
-        for item in node.items:
-            context_expr = item.context_expr
+        test = node.test
+        if (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == "active_tab"
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1
+        ):
+            comparator = test.comparators[0]
             if (
-                isinstance(context_expr, ast.Subscript)
-                and isinstance(context_expr.value, ast.Name)
-                and context_expr.value.id == "tabs"
-                and isinstance(context_expr.slice, ast.Constant)
-                and context_expr.slice.value == tab_index
+                isinstance(comparator, ast.Subscript)
+                and isinstance(comparator.value, ast.Name)
+                and comparator.value.id == "WORKFLOW_TABS"
+                and isinstance(comparator.slice, ast.Constant)
+                and comparator.slice.value == tab_index
             ):
                 return node.body
-    raise AssertionError(f"tabs[{tab_index}] block not found")
+    raise AssertionError(f"WORKFLOW_TABS[{tab_index}] block not found")
 
 
 def _literal_call_args(nodes: list[ast.stmt]) -> list[str]:
@@ -136,22 +145,22 @@ def test_operator_navigation_uses_decision_oriented_tabs() -> None:
 def test_settings_is_not_rendered_inside_mcp_query_tab() -> None:
     app_source = Path("app.py").read_text(encoding="utf-8")
 
-    settings_tab_start = app_source.index("with tabs[6]:")
+    settings_tab_start = app_source.index("with tabs[7]:")
     settings_subheader = app_source.index('st.subheader("Settings")', settings_tab_start)
 
     assert settings_subheader > settings_tab_start
-    assert 'st.subheader("MCP Query")' not in app_source
+    assert 'st.subheader("Query")' not in app_source
 
 
 def test_settings_has_own_top_level_tab() -> None:
     app_source = Path("app.py").read_text(encoding="utf-8")
-    settings_tab_start = app_source.index("with tabs[6]:")
+    settings_tab_start = app_source.index("with tabs[7]:")
     settings_block = app_source[settings_tab_start:]
 
     assert 'st.subheader("Settings")' in settings_block
     assert f'st.caption("{SETTINGS_CAPTION}")' in settings_block
     assert "settings_tabs = st.tabs" in settings_block
-    assert 'settings_tabs = st.tabs(["Keys", "LLM", "Scraping", "Retrieval", "Research"])' in settings_block
+    assert 'settings_tabs = st.tabs(["Keys", "LLM", "Scraping", "Indexing", "Research"])' in settings_block
     assert "OPENROUTER_API_KEY" in settings_block
     assert "TAVILY_API_KEY" in settings_block
     assert "Save All Settings" in settings_block
@@ -161,7 +170,7 @@ def test_settings_has_own_top_level_tab() -> None:
 
 
 def test_settings_masks_api_key_text_inputs() -> None:
-    settings_body = _tab_body(6)
+    settings_body = _tab_body(7)
     text_inputs = [
         node
         for node in ast.walk(ast.Module(body=settings_body, type_ignores=[]))
@@ -180,7 +189,7 @@ def test_settings_masks_api_key_text_inputs() -> None:
 
 
 def test_settings_does_not_render_api_key_state_outside_password_inputs() -> None:
-    settings_body = _tab_body(6)
+    settings_body = _tab_body(7)
     leaking_calls: list[str] = []
     for node in ast.walk(ast.Module(body=settings_body, type_ignores=[])):
         if not isinstance(node, ast.Call):
@@ -202,7 +211,8 @@ def test_runs_tab_owns_concrete_run_controls_and_activity() -> None:
 
     assert {"button", "progress", "metric"}.issubset(methods)
     assert {"Start New Scrape", "Resume", "Pause"}.issubset(literals)
-    assert {"Current Run", "Recently scraped"}.issubset(literals)
+    assert {"Current Run", "Page outcomes"}.issubset(literals)
+    assert "Website discovery details" not in literals
     assert not any("preserved under Sources" in literal for literal in literals)
 
 
@@ -222,17 +232,9 @@ def test_overview_is_command_center_not_file_path_dump() -> None:
     assert "Server command" not in overview
 
 
-def test_retrieval_tab_exposes_graph_build_inspection_search_and_path_controls() -> None:
-    retrieval_body = _tab_body(5)
-    literals = set(_literal_call_args(retrieval_body))
-    methods = _called_streamlit_methods(retrieval_body)
-    visible_text = "\n".join(literals)
+def test_query_tab_removed_from_operator_workflow() -> None:
+    app_source = Path("app.py").read_text(encoding="utf-8")
 
-    assert {"selectbox", "button", "tabs", "dataframe"}.issubset(methods)
-    assert "Knowledge Graph" in visible_text
-    assert {
-        "Build Deterministic Graph",
-        "Search Matching Pages",
-        "Shortest Path",
-        "Traverse From Page",
-    }.issubset(literals)
+    assert 'st.subheader("Query")' not in app_source
+    assert "Query Wiki Index" not in app_source
+    assert "MCP connection" not in app_source

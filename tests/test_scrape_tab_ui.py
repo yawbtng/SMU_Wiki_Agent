@@ -16,7 +16,9 @@ def test_scrape_tab_keeps_minimal_realtime_controls() -> None:
 
     assert "Start New Scrape" in scrape_tab
     assert "Resume" in scrape_tab
-    assert "All pages and filters" in scrape_tab
+    assert "All Pages" in scrape_tab
+    assert "Wide table" in scrape_tab
+    assert "All pages and filters" not in scrape_tab
     assert "Quick Tavily Retry" not in scrape_tab
     assert "Retry Failed URLs" not in scrape_tab
 
