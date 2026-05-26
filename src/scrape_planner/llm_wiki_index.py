@@ -46,6 +46,15 @@ class IndexedDocument:
     metadata: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class QueryProfile:
+    education_level: str = ""
+    role: str = ""
+    intent: str = ""
+    academic_interest: str = ""
+    query: str = ""
+
+
 def build_llm_wiki_index(
     site_root: Path,
     *,
@@ -137,7 +146,14 @@ def build_llm_wiki_index(
     return report
 
 
-def query_llm_wiki_index(site_root: Path, query: str, *, max_evidence: int = 5, max_candidates: int = 50) -> dict[str, Any]:
+def query_llm_wiki_index(
+    site_root: Path,
+    query: str,
+    *,
+    max_evidence: int = 5,
+    max_candidates: int = 50,
+    profile: QueryProfile | dict[str, Any] | None = None,
+) -> dict[str, Any]:
     layout = site_layout(Path(site_root))
     docs_path = layout.indexes_dir / "llm_wiki_documents.jsonl"
     postings_path = layout.indexes_dir / "llm_wiki_postings.json"
@@ -161,6 +177,7 @@ def query_llm_wiki_index(site_root: Path, query: str, *, max_evidence: int = 5, 
             "metadata": {"site_root": str(layout.site_root.resolve()), "reason": "index_artifacts_malformed"},
         }
 
+    query_profile = infer_query_profile(query, profile)
     tokens = _tokenize(query)
     if max_evidence <= 0 or not tokens:
         return {
@@ -176,7 +193,19 @@ def query_llm_wiki_index(site_root: Path, query: str, *, max_evidence: int = 5, 
         tokens,
         max_candidates=max_candidates,
     )
-    evidence = rerank_candidates(query, candidates, lexical_scores)[:max_evidence]
+    evidence = rerank_candidates(query, candidates, lexical_scores, profile=query_profile)[:max_evidence]
+    if not evidence:
+        return {
+            "status": "insufficient_evidence",
+            "query": query,
+            "evidence": [],
+            "metadata": {
+                "bounded": True,
+                "reason": "no_related_candidates",
+                "routing": _profile_metadata(query_profile, candidate_count=len(candidates)),
+                "site_root": str(layout.site_root.resolve()),
+            },
+        }
     return {
         "status": "ok",
         "query": query,
@@ -188,6 +217,7 @@ def query_llm_wiki_index(site_root: Path, query: str, *, max_evidence: int = 5, 
             "candidate_count": len(candidates),
             "index_version": manifest.get("version"),
             "site_root": str(layout.site_root.resolve()),
+            "routing": _profile_metadata(query_profile, evidence=evidence, candidate_count=len(candidates)),
         },
     }
 
@@ -247,7 +277,13 @@ def search_source_index(site_root: Path, query: str, *, max_evidence: int = 5, m
     }
 
 
-def rerank_candidates(query: str, candidates: list[dict[str, Any]], lexical_scores: dict[str, float]) -> list[dict[str, Any]]:
+def rerank_candidates(
+    query: str,
+    candidates: list[dict[str, Any]],
+    lexical_scores: dict[str, float],
+    *,
+    profile: QueryProfile | None = None,
+) -> list[dict[str, Any]]:
     tokens = _tokenize(query)
     query_vector = _embedding_vector(query)
     raw_candidate_ids = {str(row.get("source_id") or "") for row in candidates if row.get("corpus") == "raw"}
@@ -269,6 +305,7 @@ def rerank_candidates(query: str, candidates: list[dict[str, Any]], lexical_scor
         keyword = _keyword_score(tokens, str(row.get("title") or ""), str(row.get("text") or ""))
         is_wiki = row.get("corpus") == "wiki"
         source_priority = 1.2 if is_wiki else 0.0
+        route_score, route_reasons = _route_score(row, profile)
         freshness = 0.05 if str(row.get("updated_at") or "") else 0.0
         citation = 0.0
         reasons: list[str] = []
@@ -286,11 +323,12 @@ def rerank_candidates(query: str, candidates: list[dict[str, Any]], lexical_scor
             reasons.append("keyword_match")
         if vector > 0:
             reasons.append("vector_match")
+        reasons.extend(route_reasons)
         if not is_wiki and best_wiki_lexical < lexical * 0.5:
             reasons.append("raw_source_fallback")
         if not reasons:
             reasons.append("lexical_match")
-        combined = lexical + (1.5 * vector) + keyword + source_priority + freshness + citation
+        combined = lexical + (1.5 * vector) + keyword + source_priority + route_score + freshness + citation
         scored.append(
             {
                 "id": doc_id,
@@ -305,6 +343,7 @@ def rerank_candidates(query: str, candidates: list[dict[str, Any]], lexical_scor
                     "vector": round(vector, 6),
                     "keyword": round(keyword, 6),
                     "source_priority": round(source_priority, 6),
+                    "route": round(route_score, 6),
                     "freshness": round(freshness, 6),
                     "citation": round(citation, 6),
                     "model_rerank": 0.0,
@@ -547,6 +586,16 @@ def _wiki_documents(site_root: Path, *, chunk_chars: int, overlap: int) -> tuple
         title = str(metadata.get("title") or path.stem.replace("-", " ").title())
         source_ids = [str(value) for value in metadata.get("source_ids", []) if str(value)] if isinstance(metadata.get("source_ids"), list) else []
         tags = [str(value) for value in metadata.get("tags", []) if str(value)] if isinstance(metadata.get("tags"), list) else []
+        route_metadata = {
+            "audiences": _frontmatter_list(metadata, "audiences"),
+            "roles": _frontmatter_list(metadata, "roles"),
+            "intents": _frontmatter_list(metadata, "intents"),
+            "academic_interests": _frontmatter_list(metadata, "academic_interests"),
+            "canonical_facts": _frontmatter_list(metadata, "canonical_facts"),
+            "aliases": _frontmatter_list(metadata, "aliases"),
+            "canonical_owner": str(metadata.get("canonical_owner") or rel_path),
+            "source_priority": str(metadata.get("source_priority") or "curated-wiki"),
+        }
         checksum = checksum_file(path)
         for idx, chunk in enumerate(_chunk_text(_strip_frontmatter(text), chunk_chars=chunk_chars, overlap=overlap), start=1):
             docs.append(
@@ -564,7 +613,7 @@ def _wiki_documents(site_root: Path, *, chunk_chars: int, overlap: int) -> tuple
                     updated_at=str(metadata.get("updated_at") or ""),
                     text=chunk,
                     chunk_index=idx,
-                    metadata={"frontmatter": metadata},
+                    metadata={"frontmatter": metadata, "routing": route_metadata},
                 )
             )
     return docs, invalid
@@ -653,6 +702,183 @@ def _retrieve_candidates_for_corpus(
                 continue
     sorted_candidates = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:max_candidates]
     return [doc_map[doc_id] for doc_id, _score in sorted_candidates if doc_id in doc_map], scores
+
+
+def infer_query_profile(query: str, profile: QueryProfile | dict[str, Any] | None = None) -> QueryProfile:
+    if isinstance(profile, QueryProfile):
+        base = profile
+    elif isinstance(profile, dict):
+        base = QueryProfile(
+            education_level=str(profile.get("education_level") or ""),
+            role=str(profile.get("role") or ""),
+            intent=str(profile.get("intent") or ""),
+            academic_interest=str(profile.get("academic_interest") or profile.get("academic_interest_area") or ""),
+            query=str(profile.get("query") or query or ""),
+        )
+    else:
+        base = QueryProfile(query=query)
+    haystack = f"{base.query or query} {base.education_level} {base.role} {base.intent} {base.academic_interest}".lower()
+    education_level = base.education_level or _first_match(
+        haystack,
+        {
+            "early learner": ("middle school", "young", "kid", "early learner"),
+            "secondary student": ("high school", "secondary"),
+            "undergraduate": ("undergraduate", "freshman", "bachelor", "major"),
+            "graduate": ("graduate", "master", "phd", "doctoral"),
+            "professional": ("professional", "certificate", "executive"),
+        },
+    )
+    role = base.role or _first_match(
+        haystack,
+        {
+            "applicant": ("apply", "admission", "application", "applicant"),
+            "current student": ("current student", "registrar", "transcript"),
+            "parent": ("parent", "family"),
+            "researcher": ("research", "lab"),
+            "visitor": ("visit", "tour"),
+        },
+    )
+    intent = base.intent or _first_match(
+        haystack,
+        {
+            "apply": ("apply", "admission", "application", "deadline", "requirement"),
+            "pay": ("tuition", "fee", "cost", "financial aid", "scholarship"),
+            "study": ("program", "degree", "major", "course", "catalog"),
+            "contact": ("contact", "email", "phone", "office"),
+            "research": ("research", "lab", "faculty"),
+            "visit": ("visit", "tour"),
+            "enroll": ("registrar", "enroll", "transcript"),
+        },
+    )
+    academic_interest = base.academic_interest or _first_match(
+        haystack,
+        {
+            "business": ("business", "mba"),
+            "computer": ("computer", "cs", "software"),
+            "engineering": ("engineering",),
+            "science": ("science",),
+            "arts": ("arts", "music", "theatre"),
+            "law": ("law",),
+        },
+    )
+    return QueryProfile(
+        education_level=education_level,
+        role=role,
+        intent=intent,
+        academic_interest=academic_interest,
+        query=base.query or query,
+    )
+
+
+def _first_match(haystack: str, patterns: dict[str, tuple[str, ...]]) -> str:
+    for label, needles in patterns.items():
+        if any(needle in haystack for needle in needles):
+            return label
+    return ""
+
+
+def _route_score(row: dict[str, Any], profile: QueryProfile | None) -> tuple[float, list[str]]:
+    if profile is None:
+        return 0.0, []
+    routing = _row_routing(row)
+    score = 0.0
+    reasons: list[str] = []
+    if row.get("corpus") == "wiki":
+        score += 0.15
+        reasons.append("routed_wiki_candidate")
+    if profile.intent and _route_value_matches(profile.intent, routing.get("intents", [])):
+        score += 0.9
+        reasons.append("intent_route_match")
+    if profile.role and _route_value_matches(profile.role, routing.get("roles", []) + routing.get("audiences", [])):
+        score += 0.6
+        reasons.append("profile_role_match")
+    if profile.education_level and _route_value_matches(profile.education_level, routing.get("audiences", [])):
+        score += 0.5
+        reasons.append("education_level_match")
+    if profile.academic_interest and _route_value_matches(profile.academic_interest, routing.get("academic_interests", []) + routing.get("tags", [])):
+        score += 0.5
+        reasons.append("academic_interest_match")
+    if _profile_out_of_scope(profile, routing):
+        score -= 1.4
+        reasons.append("profile_scope_penalty")
+    return score, reasons
+
+
+def _profile_out_of_scope(profile: QueryProfile, routing: dict[str, list[str]]) -> bool:
+    audiences = set(routing.get("audiences", []))
+    intents = set(routing.get("intents", []))
+    if profile.education_level in {"early learner", "secondary student"} and {"graduate", "researcher"}.intersection(audiences):
+        return True
+    if profile.intent and intents and not _route_value_matches(profile.intent, list(intents)) and "explore" not in intents:
+        return True
+    return False
+
+
+def _route_value_matches(value: str, candidates: list[str]) -> bool:
+    normalized = _route_token(value)
+    candidate_tokens = {_route_token(candidate) for candidate in candidates}
+    if normalized in candidate_tokens:
+        return True
+    if normalized == "current-student" and "current-student" in candidate_tokens:
+        return True
+    if normalized == "graduate" and "graduate" in candidate_tokens:
+        return True
+    return False
+
+
+def _route_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+
+
+def _row_routing(row: dict[str, Any]) -> dict[str, list[str]]:
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    routing = metadata.get("routing") if isinstance(metadata.get("routing"), dict) else {}
+    frontmatter = metadata.get("frontmatter") if isinstance(metadata.get("frontmatter"), dict) else {}
+    return {
+        "audiences": _metadata_list(routing, "audiences") or _metadata_list(frontmatter, "audiences"),
+        "roles": _metadata_list(routing, "roles") or _metadata_list(frontmatter, "roles"),
+        "intents": _metadata_list(routing, "intents") or _metadata_list(frontmatter, "intents"),
+        "academic_interests": _metadata_list(routing, "academic_interests") or _metadata_list(frontmatter, "academic_interests"),
+        "tags": [str(value) for value in row.get("tags", []) or [] if str(value)],
+    }
+
+
+def _metadata_list(metadata: dict[str, Any], key: str) -> list[str]:
+    value = metadata.get(key)
+    if isinstance(value, list):
+        return [_route_token(str(item)) for item in value if str(item)]
+    if isinstance(value, str) and value.strip():
+        return [_route_token(value)]
+    return []
+
+
+def _frontmatter_list(metadata: dict[str, Any], key: str) -> list[str]:
+    value = metadata.get(key)
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item)]
+    if isinstance(value, str) and value.strip():
+        return [value]
+    return []
+
+
+def _profile_metadata(
+    profile: QueryProfile,
+    *,
+    evidence: list[dict[str, Any]] | None = None,
+    candidate_count: int,
+) -> dict[str, Any]:
+    evidence = evidence or []
+    return {
+        "profile": {
+            "education_level": profile.education_level,
+            "role": profile.role,
+            "intent": profile.intent,
+            "academic_interest": profile.academic_interest,
+        },
+        "candidate_count": candidate_count,
+        "candidate_pages": [str(row.get("path") or "") for row in evidence if row.get("source_kind") == "wiki"],
+        "raw_fallback_used": any("raw_source_fallback" in (row.get("ranking_reasons") or []) for row in evidence),
+    }
 
 
 def _build_postings(rows: list[dict[str, Any]]) -> dict[str, dict[str, int]]:

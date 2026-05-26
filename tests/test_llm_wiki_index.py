@@ -50,6 +50,10 @@ def _write_wiki_page(
     source_ids: list[str],
     body: str,
     updated_at: str = NOW,
+    audiences: list[str] | None = None,
+    roles: list[str] | None = None,
+    intents: list[str] | None = None,
+    academic_interests: list[str] | None = None,
 ) -> Path:
     pages_dir = site_root / "wiki" / "pages"
     pages_dir.mkdir(parents=True, exist_ok=True)
@@ -61,12 +65,22 @@ def _write_wiki_page(
         *[f"  - {tag}" for tag in tags],
         "source_ids:",
         *[f"  - {source_id}" for source_id in source_ids],
+        *(_frontmatter_list("audiences", audiences or [])),
+        *(_frontmatter_list("roles", roles or [])),
+        *(_frontmatter_list("intents", intents or [])),
+        *(_frontmatter_list("academic_interests", academic_interests or [])),
         f"updated_at: {updated_at}",
         "---",
         "",
     ]
     page_path.write_text("\n".join(frontmatter) + body, encoding="utf-8")
     return page_path
+
+
+def _frontmatter_list(key: str, values: list[str]) -> list[str]:
+    if not values:
+        return []
+    return [f"{key}:", *[f"  - {value}" for value in values]]
 
 
 def _fixture_site(tmp_path: Path) -> Path:
@@ -148,6 +162,111 @@ def test_raw_source_fallback_when_wiki_is_weak(tmp_path: Path) -> None:
     assert response["evidence"][0]["source_kind"] == "pdf"
     assert response["evidence"][0]["source_id"] == "pdf_catalog"
     assert "raw_source_fallback" in response["evidence"][0]["ranking_reasons"]
+
+
+def test_profile_routing_prefers_undergraduate_page_over_graduate_noise(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+
+    site_root = tmp_path / "site"
+    undergrad = _write_source(
+        site_root,
+        source_id="web_undergrad",
+        title="Undergraduate Programs",
+        body="# Undergraduate Programs\n\nHigh school students can explore undergraduate computer science majors.",
+    )
+    graduate = _write_source(
+        site_root,
+        source_id="web_grad",
+        title="Graduate Research",
+        body="# Graduate Research\n\nGraduate computer science applicants review doctoral labs and faculty research.",
+    )
+    undergrad["wiki_page_paths"] = ["wiki/pages/undergraduate.md"]
+    graduate["wiki_page_paths"] = ["wiki/pages/graduate.md"]
+    write_registry_rows(site_root / "raw_sources" / "registry.jsonl", [undergrad, graduate])
+    _write_wiki_page(
+        site_root,
+        name="undergraduate",
+        title="Undergraduate Programs",
+        tags=["programs"],
+        source_ids=["web_undergrad"],
+        audiences=["undergraduate", "secondary-student"],
+        roles=["applicant"],
+        intents=["explore", "study"],
+        academic_interests=["computer"],
+        body="# Undergraduate Programs\n\nUndergraduate computer science majors are designed for new college students.",
+    )
+    _write_wiki_page(
+        site_root,
+        name="graduate",
+        title="Graduate Research",
+        tags=["research"],
+        source_ids=["web_grad"],
+        audiences=["graduate", "researcher"],
+        roles=["applicant"],
+        intents=["research", "study"],
+        academic_interests=["computer"],
+        body="# Graduate Research\n\nGraduate doctoral labs focus on computer science research.",
+    )
+    build_llm_wiki_index(site_root, now=NOW)
+
+    response = query_llm_wiki_index(
+        site_root,
+        "computer science programs",
+        profile={"education_level": "secondary student", "intent": "study", "academic_interest": "computer"},
+        max_evidence=3,
+    )
+
+    assert response["status"] == "ok"
+    assert response["evidence"][0]["path"] == "wiki/pages/undergraduate.md"
+    assert "education_level_match" in response["evidence"][0]["ranking_reasons"]
+    assert response["metadata"]["routing"]["profile"]["education_level"] == "secondary student"
+
+
+def test_query_reports_insufficient_evidence_when_no_candidates_match(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+
+    site_root = _fixture_site(tmp_path)
+    build_llm_wiki_index(site_root, now=NOW)
+
+    response = query_llm_wiki_index(site_root, "zzzzqwerty impossible-nohit", max_evidence=3)
+
+    assert response["status"] == "insufficient_evidence"
+    assert response["evidence"] == []
+    assert response["metadata"]["reason"] == "no_related_candidates"
+
+
+def test_canonical_department_page_outranks_broad_raw_leadership_chunk(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+
+    site_root = tmp_path / "site"
+    raw = _write_source(
+        site_root,
+        source_id="web_directory",
+        title="Large Faculty Directory",
+        body="# Large Faculty Directory\n\nThe directory mentions Computer Science chair Jane Rivera alongside many unrelated offices.",
+    )
+    raw["wiki_page_paths"] = ["wiki/pages/computer-science.md"]
+    write_registry_rows(site_root / "raw_sources" / "registry.jsonl", [raw])
+    _write_wiki_page(
+        site_root,
+        name="computer-science",
+        title="Computer Science Department",
+        tags=["departments"],
+        source_ids=["web_directory"],
+        audiences=["graduate", "undergraduate"],
+        roles=["student"],
+        intents=["study", "contact"],
+        academic_interests=["computer"],
+        body="# Computer Science Department\n\n## Fast Answer\n\nThe Computer Science chair is Jane Rivera.\n",
+    )
+    build_llm_wiki_index(site_root, now=NOW)
+
+    response = query_llm_wiki_index(site_root, "Who is the Computer Science chair?", max_evidence=2)
+
+    assert response["status"] == "ok"
+    assert response["evidence"][0]["source_kind"] == "wiki"
+    assert response["evidence"][0]["path"] == "wiki/pages/computer-science.md"
+    assert "wiki_synthesis_boost" in response["evidence"][0]["ranking_reasons"]
 
 
 def test_search_sources_retrieves_raw_candidates_before_filtering_mixed_results(tmp_path: Path) -> None:

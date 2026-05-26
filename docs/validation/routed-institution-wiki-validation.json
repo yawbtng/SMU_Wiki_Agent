@@ -1,0 +1,70 @@
+{
+  "fixture": {
+    "index": {
+      "raw_index_count": 3,
+      "wiki_index_count": 3
+    },
+    "pdf_counts": {
+      "changed": 0,
+      "failed": 0,
+      "needs-review": 0,
+      "new": 1,
+      "ready": 1,
+      "unchanged": 0
+    },
+    "query": {
+      "routing": {
+        "candidate_count": 5,
+        "candidate_pages": [
+          "wiki/pages/programs.md",
+          "wiki/pages/scholarships.md",
+          "wiki/pages/finance.md"
+        ],
+        "profile": {
+          "academic_interest": "computer",
+          "education_level": "graduate",
+          "intent": "apply",
+          "role": "applicant"
+        },
+        "raw_fallback_used": false
+      },
+      "status": "ok",
+      "top_path": "wiki/pages/programs.md"
+    },
+    "site_root": "/var/folders/k0/kty9_m2d281513c86bflx6wr0000gn/T/routed-wiki-fixture-uf_vnddb/sites/fixture-university",
+    "unrelated_query_status": "insufficient_evidence",
+    "web_quality": {
+      "approved": 1,
+      "cleaned": 1,
+      "needs_review": 1,
+      "quarantined": 2
+    },
+    "wiki_pages": [
+      "wiki/pages/finance.md",
+      "wiki/pages/programs.md",
+      "wiki/pages/scholarships.md"
+    ],
+    "wiki_required_files": {
+      "wiki/index.md": true,
+      "wiki/review_queue.md": true,
+      "wiki/routing/audience.md": true,
+      "wiki/routing/intent.md": true,
+      "wiki/routing/topics.md": true,
+      "wiki/source-notes/index.md": true
+    }
+  },
+  "smu_limited": {
+    "generated_pages": [
+      "wiki/pages/programs.md"
+    ],
+    "quality_counts": "source quality already validated on fixture; sample uses existing ready registry rows",
+    "query_status": "ok",
+    "raw_index_count": 28,
+    "sample_site_root": "/var/folders/k0/kty9_m2d281513c86bflx6wr0000gn/T/routed-wiki-fixture-uf_vnddb/smu-sample/sites/smu-limited",
+    "sampled_sources": 5,
+    "source_site_root": "data/sites/www.smu.edu",
+    "status": "complete",
+    "wiki_index_count": 8
+  },
+  "status": "complete"
+}

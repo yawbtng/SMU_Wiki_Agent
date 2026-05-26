@@ -4,7 +4,6 @@ import argparse
 import json
 import re
 import shlex
-import shutil
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -36,6 +35,7 @@ def build_wiki(
     registry_path: Path | None = None,
     wiki_dir: Path | None = None,
     report_path: Path | None = None,
+    tmux_session: str | None = None,
     no_input: bool = False,
     resume: bool = False,
     rebuild: bool = False,
@@ -125,6 +125,9 @@ def build_wiki(
                 page_paths_by_source[str(row.get("source_id") or "")] = _site_relative(page_path, layout.site_root)
 
         _write_index(wiki_root / "index.md", page_entries, timestamp)
+        _write_routing_pages(wiki_root, page_entries, timestamp)
+        _write_optional_canonical_indexes(wiki_root, page_entries, timestamp)
+        _write_source_notes(wiki_root, page_groups, timestamp, layout.site_root)
         _write_review_queue(wiki_root / "review_queue.md", review_items, timestamp)
 
     integrated_sources = 0
@@ -137,6 +140,19 @@ def build_wiki(
                 row["wiki_page_paths"] = [page_paths_by_source[source_id]]
                 integrated_sources += 1
         write_registry_rows(registry, rows)
+    else:
+        integrated_sources = len(
+            [
+                row
+                for row in rows
+                if str(row.get("status") or "").lower() == "ready"
+                and str(row.get("wiki_status") or "").lower() in INTEGRATED_STATES
+            ]
+        )
+        review_items = _parse_review_queue_items(wiki_root / "review_queue.md")
+        pages_created = int(latest_report.get("pages_created") or latest_report.get("created_pages") or 0)
+        pages_updated = int(latest_report.get("pages_updated") or latest_report.get("updated_pages") or 0)
+        page_entries = list(latest_report.get("pages") or []) if isinstance(latest_report.get("pages"), list) else []
 
     destination = Path(report_path) if report_path else reports_dir / f"wiki-build-{_timestamp_slug(timestamp)}.json"
     report = {
@@ -149,6 +165,7 @@ def build_wiki(
         "log_path": str(wiki_root / "log.md"),
         "review_queue_path": str(wiki_root / "review_queue.md"),
         "report_path": str(destination),
+        "tmux_session": str(tmux_session or ""),
         "generated_at": timestamp,
         "updated_at": timestamp,
         "no_input": bool(no_input),
@@ -167,6 +184,14 @@ def build_wiki(
         "failed_source_ids": failed_source_ids,
         "review_queue_count": len(review_items),
         "pages": page_entries,
+        "required_markdown_paths": [
+            "wiki/index.md",
+            "wiki/routing/audience.md",
+            "wiki/routing/intent.md",
+            "wiki/routing/topics.md",
+            "wiki/source-notes/index.md",
+            "wiki/review_queue.md",
+        ],
     }
     if no_op:
         _append_noop_log(wiki_root / "log.md", report, timestamp)
@@ -271,7 +296,7 @@ def launch_wiki_builder(
 ) -> dict[str, Any]:
     layout = ensure_layout_for_site_root(Path(site_root))
     tmux = runner or TmuxRunner()
-    name = session_name or f"llm-wiki-{layout.site_root.name}"
+    name = session_name or _default_session_name(layout.site_root.name, tmux)
     report_path = layout.wiki_dir / "reports" / "wiki-build-latest.json"
     python_command_parts = [
         python_executable or sys.executable,
@@ -285,6 +310,8 @@ def launch_wiki_builder(
         str(layout.wiki_dir),
         "--report-path",
         str(report_path),
+        "--tmux-session",
+        name,
         "--no-input",
     ]
     if resume:
@@ -293,28 +320,44 @@ def launch_wiki_builder(
         python_command_parts.append("--rebuild")
     python_command = " ".join(shlex.quote(part) for part in python_command_parts)
 
-    pi_bin = shutil.which("pi")
-    use_pi = runtime == "pi" and pi_bin is not None
-    if use_pi:
-        skill_path = _repo_root() / ".pi" / "skills" / "karpathy-wiki-builder" / "SKILL.md"
-        pi_prompt = (
-            "Run the wiki builder non-interactively for this repo and site. "
-            "Do not ask questions. Do not edit source files. "
-            f"Execute exactly this command and wait until it exits: {python_command}"
-        )
-        command = " ".join(
-            shlex.quote(part)
-            for part in [
-                pi_bin,
-                "-p",
-                "--skill",
-                str(skill_path),
-                pi_prompt,
-            ]
-        )
-    else:
-        command = python_command
+    command = python_command
     result = tmux.start(name, command, str(_repo_root()))
+    if result.get("ok"):
+        timestamp = utc_now_iso()
+        write_json(
+            report_path,
+            {
+                "status": "running",
+                "job_status": "running",
+                "site_root": str(layout.site_root),
+                "registry_path": str(layout.registry_path),
+                "wiki_dir": str(layout.wiki_dir),
+                "index_path": str(layout.wiki_dir / "index.md"),
+                "log_path": str(layout.wiki_dir / "log.md"),
+                "review_queue_path": str(layout.wiki_dir / "review_queue.md"),
+                "report_path": str(report_path),
+                "generated_at": timestamp,
+                "updated_at": timestamp,
+                "last_progress": "Launch requested",
+                "tmux_session": name,
+                "no_input": True,
+                "resume": bool(resume),
+                "rebuild": bool(rebuild),
+                "no_op": False,
+                "sources_considered": 0,
+                "processed_source_ids": [],
+                "skipped_source_ids": [],
+                "resume_source_ids": [],
+                "pages_created": 0,
+                "created_pages": 0,
+                "pages_updated": 0,
+                "updated_pages": 0,
+                "integrated_sources": 0,
+                "failed_source_ids": [],
+                "review_queue_count": 0,
+                "pages": [],
+            },
+        )
     return {
         **result,
         "session_name": name,
@@ -323,7 +366,7 @@ def launch_wiki_builder(
         "wiki_dir": str(layout.wiki_dir),
         "report_path": str(report_path),
         "builder_command": command,
-        "runtime": "pi" if use_pi else "python",
+        "runtime": "python",
     }
 
 
@@ -340,6 +383,17 @@ def _should_process(row: dict[str, Any], site_root: Path, *, rebuild: bool) -> b
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _default_session_name(site_name: str, runner: TmuxRunner) -> str:
+    base = f"wiki-{_slugify(site_name)}-{_session_timestamp_slug(utc_now_iso())}"
+    name = base
+    suffix = 2
+    session_exists = getattr(runner, "session_exists", None)
+    while callable(session_exists) and session_exists(name):
+        name = f"{base}-{suffix}"
+        suffix += 1
+    return name
 
 
 def _remove_generated_pages(wiki_root: Path) -> None:
@@ -469,22 +523,49 @@ def _render_page(
     summary = _summary_for(category, titles)
     tags = [_slugify(category)]
     rel_page = _site_relative(page_path, site_root)
+    route = _routing_metadata_for(category, rows)
     content_lines = [
         f"# {category}",
         "",
+        "## Fast Answer",
+        "",
         summary,
         "",
-        "## Source Notes",
+        "## Who This Applies To",
+        "",
+        _comma_or_default(route["audiences"], "General institutional users."),
+        "",
+        "## Key Facts",
+        "",
+        *_key_fact_lines(rows),
+        "",
+        "## Steps Or Requirements",
+        "",
+        *_section_lines_for(rows, ("apply", "requirement", "step", "deadline", "enroll")),
+        "",
+        "## Dates, Costs, Or Eligibility",
+        "",
+        *_section_lines_for(rows, ("date", "deadline", "tuition", "fee", "cost", "eligib")),
+        "",
+        "## Contacts And Offices",
+        "",
+        *_section_lines_for(rows, ("contact", "office", "email", "phone")),
+        "",
+        "## Related Pages",
+        "",
+        "- [Audience routes](../routing/audience.md)",
+        "- [Intent routes](../routing/intent.md)",
+        "- [Topic routes](../routing/topics.md)",
+        "- [Source notes](../source-notes/index.md)",
+        "",
+        "## Caveats And Review Notes",
+        "",
+        *_caveat_lines(rows),
+        "",
+        "## Last Verified",
+        "",
+        timestamp,
     ]
-    for row in rows:
-        content_lines.extend(
-            [
-                "",
-                f"### {row.get('title') or 'Untitled source'}",
-                "",
-                _excerpt(str(row.get("_source_text") or "")),
-            ]
-        )
     content_lines.extend(["", "## Sources"])
     for row in rows:
         content_lines.append(f"- `{row.get('source_id')}` - {row.get('markdown_path')}")
@@ -499,6 +580,14 @@ def _render_page(
             "source_paths": source_paths,
             "source_count": len(rows),
             "tags": tags,
+            "audiences": route["audiences"],
+            "roles": route["roles"],
+            "intents": route["intents"],
+            "academic_interests": route["academic_interests"],
+            "canonical_facts": route["canonical_facts"],
+            "aliases": route["aliases"],
+            "source_priority": route["source_priority"],
+            "canonical_owner": route["canonical_owner"],
             "updated_at": timestamp,
         }
     )
@@ -514,6 +603,14 @@ def _render_page(
             "source_ids": source_ids,
             "source_paths": source_paths,
             "tags": tags,
+            "audiences": route["audiences"],
+            "roles": route["roles"],
+            "intents": route["intents"],
+            "academic_interests": route["academic_interests"],
+            "canonical_facts": route["canonical_facts"],
+            "aliases": route["aliases"],
+            "source_priority": route["source_priority"],
+            "canonical_owner": route["canonical_owner"],
         },
     )
 
@@ -529,6 +626,119 @@ def _frontmatter(values: dict[str, Any]) -> str:
             lines.append(f"{key}: {value}")
     lines.append("---")
     return "\n".join(lines)
+
+
+def _routing_metadata_for(category: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    haystack = "\n".join([category, *(str(row.get("title") or "") + "\n" + str(row.get("_source_text") or "") for row in rows)]).lower()
+    intents = _infer_values(
+        haystack,
+        {
+            "apply": ("admission", "apply", "application", "deadline", "requirement"),
+            "pay": ("tuition", "fee", "cost", "financial aid", "billing", "scholarship"),
+            "study": ("program", "degree", "major", "minor", "course", "catalog"),
+            "contact": ("contact", "office", "email", "phone", "address"),
+            "research": ("research", "lab", "faculty", "publication"),
+            "visit": ("visit", "tour", "campus"),
+            "enroll": ("registrar", "enroll", "transcript", "academic calendar"),
+        },
+        default="explore",
+    )
+    audiences = _infer_values(
+        haystack,
+        {
+            "applicant": ("admission", "apply", "application"),
+            "current-student": ("registrar", "student services", "billing", "transcript"),
+            "graduate": ("graduate", "master", "doctoral", "phd"),
+            "undergraduate": ("undergraduate", "bachelor", "major", "minor"),
+            "researcher": ("research", "lab", "faculty"),
+            "parent": ("parent", "family"),
+        },
+        default="general",
+    )
+    roles = _infer_values(
+        haystack,
+        {
+            "student": ("student", "admitted", "current"),
+            "applicant": ("applicant", "admission", "apply"),
+            "faculty-staff": ("faculty", "staff"),
+            "visitor": ("visitor", "visit", "tour"),
+        },
+        default="general",
+    )
+    academic_interests = _infer_academic_interests(haystack)
+    canonical_facts = _infer_values(
+        haystack,
+        {
+            "requirements": ("requirement", "transcript", "application"),
+            "contacts": ("contact", "email", "phone", "office"),
+            "costs": ("tuition", "fee", "cost"),
+            "leadership": ("dean", "chair", "director", "president"),
+            "policies": ("policy", "eligibility", "procedure"),
+            "research": ("research", "lab", "center"),
+        },
+        default=_slugify(category),
+    )
+    return {
+        "audiences": audiences,
+        "roles": roles,
+        "intents": intents,
+        "academic_interests": academic_interests,
+        "canonical_facts": canonical_facts,
+        "aliases": sorted({_slugify(str(row.get("title") or "")) for row in rows if row.get("title")}),
+        "source_priority": "curated-wiki",
+        "canonical_owner": f"wiki/pages/{_slugify(category)}.md",
+    }
+
+
+def _infer_values(haystack: str, patterns: dict[str, tuple[str, ...]], *, default: str) -> list[str]:
+    values = [label for label, needles in patterns.items() if any(needle in haystack for needle in needles)]
+    return values or [default]
+
+
+def _infer_academic_interests(haystack: str) -> list[str]:
+    interests = []
+    for value in ("business", "engineering", "science", "arts", "law", "education", "medicine", "data", "computer"):
+        if value in haystack:
+            interests.append(value)
+    return interests or ["general"]
+
+
+def _comma_or_default(values: list[str], default: str) -> str:
+    return ", ".join(value.replace("-", " ") for value in values) if values else default
+
+
+def _key_fact_lines(rows: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for row in rows:
+        excerpt = _excerpt(str(row.get("_source_text") or "")).replace("\n", " ")
+        lines.append(f"- {row.get('title') or 'Untitled source'}: {excerpt}")
+    return lines or ["- No source-backed facts generated yet."]
+
+
+def _section_lines_for(rows: list[dict[str, Any]], needles: tuple[str, ...]) -> list[str]:
+    lines: list[str] = []
+    for row in rows:
+        for sentence in _sentences(str(row.get("_source_text") or "")):
+            lower = sentence.lower()
+            if any(needle in lower for needle in needles):
+                lines.append(f"- {sentence}")
+                break
+    return lines or ["- No source-backed details found for this section."]
+
+
+def _caveat_lines(rows: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for row in rows:
+        reason = _review_reason(row, str(row.get("_source_text") or ""))
+        if reason:
+            lines.append(f"- `{row.get('source_id')}`: {reason}")
+    return lines or ["- No caveats detected in the current source set."]
+
+
+def _sentences(text: str) -> list[str]:
+    compact = re.sub(r"\s+", " ", text).strip()
+    parts = re.split(r"(?<=[.!?])\s+", compact)
+    return [part.strip("# ").strip() for part in parts if part.strip("# ").strip()]
 
 
 def _write_index(path: Path, page_entries: list[dict[str, Any]], timestamp: str) -> None:
@@ -552,6 +762,113 @@ def _write_index(path: Path, page_entries: list[dict[str, Any]], timestamp: str)
             )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _write_routing_pages(wiki_root: Path, page_entries: list[dict[str, Any]], timestamp: str) -> None:
+    routing_dir = wiki_root / "routing"
+    routing_dir.mkdir(parents=True, exist_ok=True)
+    _write_route_page(
+        routing_dir / "audience.md",
+        "Audience Routes",
+        "audiences",
+        page_entries,
+        timestamp,
+        "General and profile-specific entry points inferred from source metadata.",
+    )
+    _write_route_page(
+        routing_dir / "intent.md",
+        "Intent Routes",
+        "intents",
+        page_entries,
+        timestamp,
+        "Task routes such as explore, apply, enroll, pay, study, contact, research, transfer, and visit.",
+    )
+    _write_route_page(
+        routing_dir / "topics.md",
+        "Topic Routes",
+        "tags",
+        page_entries,
+        timestamp,
+        "Academic and administrative topic routes inferred from generated pages.",
+    )
+
+
+def _write_route_page(
+    path: Path,
+    title: str,
+    metadata_key: str,
+    page_entries: list[dict[str, Any]],
+    timestamp: str,
+    intro: str,
+) -> None:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in page_entries:
+        values = entry.get(metadata_key) or ["general"]
+        for value in values:
+            grouped[str(value or "general")].append(entry)
+    lines = [f"# {title}", "", f"Updated: {timestamp}", "", intro, ""]
+    if not grouped:
+        lines.append("No routes generated yet.")
+    for route in sorted(grouped):
+        lines.extend(["", f"## {route.replace('-', ' ').title()}"])
+        for entry in sorted(grouped[route], key=lambda item: str(item.get("title") or "")):
+            page_ref = str(entry["path"]).removeprefix("wiki/")
+            lines.append(f"- [{entry['title']}](../{page_ref}) - {entry['summary']}")
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _write_source_notes(
+    wiki_root: Path,
+    page_groups: dict[str, list[dict[str, Any]]],
+    timestamp: str,
+    site_root: Path,
+) -> None:
+    notes_dir = wiki_root / "source-notes"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    index_lines = ["# Source Notes", "", f"Updated: {timestamp}", ""]
+    for category, rows in sorted(page_groups.items()):
+        note_path = notes_dir / f"{_slugify(category)}.md"
+        note_lines = [f"# {category} Source Notes", "", f"Updated: {timestamp}", ""]
+        for row in rows:
+            note_lines.extend(
+                [
+                    f"## {row.get('title') or 'Untitled source'}",
+                    "",
+                    f"- Source ID: `{row.get('source_id')}`",
+                    f"- Source path: `{row.get('markdown_path')}`",
+                    "",
+                    _excerpt(str(row.get("_source_text") or "")),
+                    "",
+                ]
+            )
+        note_path.write_text("\n".join(note_lines).rstrip() + "\n", encoding="utf-8")
+        index_lines.append(f"- [{category}]({_site_relative(note_path, site_root).removeprefix('wiki/source-notes/')}) - {len(rows)} source(s).")
+    (notes_dir / "index.md").write_text("\n".join(index_lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _write_optional_canonical_indexes(wiki_root: Path, page_entries: list[dict[str, Any]], timestamp: str) -> None:
+    folder_map = {
+        "Admissions": "student-paths",
+        "Programs": "programs",
+        "Departments": "departments",
+        "Finance": "costs",
+        "Scholarships": "costs",
+        "Registrar": "calendar",
+        "Student Life": "offices",
+    }
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in page_entries:
+        folder = folder_map.get(str(entry.get("category") or ""))
+        if folder:
+            grouped[folder].append(entry)
+    for folder, entries in grouped.items():
+        folder_dir = wiki_root / folder
+        folder_dir.mkdir(parents=True, exist_ok=True)
+        lines = [f"# {folder.replace('-', ' ').title()}", "", f"Updated: {timestamp}", ""]
+        for entry in sorted(entries, key=lambda item: str(item.get("title") or "")):
+            page_ref = str(entry["path"]).removeprefix("wiki/")
+            lines.append(f"- [{entry['title']}](../{page_ref}) - canonical owner: `{entry.get('canonical_owner')}`")
+        (folder_dir / "index.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 def _write_review_queue(path: Path, review_items: list[dict[str, str]], timestamp: str) -> None:
@@ -741,6 +1058,13 @@ def _timestamp_slug(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z]+", "-", value).strip("-")
 
 
+def _session_timestamp_slug(value: str) -> str:
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    if len(digits) >= 14:
+        return f"{digits[:8]}-{digits[8:14]}"
+    return _timestamp_slug(value)
+
+
 def _site_relative(path: Path, site_root: Path) -> str:
     try:
         return str(Path(path).relative_to(site_root))
@@ -754,6 +1078,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--registry-path")
     parser.add_argument("--wiki-dir")
     parser.add_argument("--report-path")
+    parser.add_argument("--tmux-session")
     parser.add_argument("--no-input", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--rebuild", action="store_true")
@@ -774,6 +1099,7 @@ def main(argv: list[str] | None = None) -> int:
             registry_path=Path(args.registry_path) if args.registry_path else None,
             wiki_dir=Path(args.wiki_dir) if args.wiki_dir else None,
             report_path=Path(args.report_path) if args.report_path else None,
+            tmux_session=args.tmux_session,
             no_input=args.no_input,
             resume=args.resume,
             rebuild=args.rebuild,

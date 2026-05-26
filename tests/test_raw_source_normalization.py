@@ -54,6 +54,64 @@ def test_web_scrape_markdown_is_copied_to_raw_sources_and_registered(tmp_path: P
     assert Path(report.report_path).exists()
 
 
+def test_web_quality_gate_cleans_noisy_markdown_and_reports_counts(tmp_path: Path) -> None:
+    site_root = ensure_site_layout(tmp_path, "site-1").site_root
+    run_root = site_root / "run-001"
+    markdown = run_root / "markdown" / "program.md"
+    markdown.parent.mkdir(parents=True)
+    markdown.write_text(
+        "\n".join(
+            [
+                "Home",
+                "Admissions",
+                "Search",
+                "# Program",
+                "Application deadlines, tuition, and requirements are available for students.",
+                "Application deadlines, tuition, and requirements are available for students.",
+                "Application deadlines, tuition, and requirements are available for students.",
+                "Privacy",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    write_json(
+        run_root / "scrape_manifest.json",
+        [{"url": "https://example.edu/program", "status": "success", "markdown_path": str(markdown)}],
+    )
+
+    report = normalize_scraped_markdown(site_root, run_root, now=NOW)
+
+    [row] = read_registry_rows(site_root / "raw_sources" / "registry.jsonl")
+    raw_markdown = (site_root / row["markdown_path"]).read_text(encoding="utf-8")
+    stored_report = json.loads(Path(report.report_path).read_text(encoding="utf-8"))
+    assert row["status"] == "ready"
+    assert row["provenance"]["quality_action"] == "cleaned"
+    assert "Home" not in raw_markdown
+    assert stored_report["quality_summary"]["counts"]["cleaned"] == 1
+
+
+def test_web_quality_gate_quarantines_pdf_markdown_with_diagnostic(tmp_path: Path) -> None:
+    site_root = ensure_site_layout(tmp_path, "site-1").site_root
+    run_root = site_root / "run-001"
+    markdown = run_root / "markdown" / "catalog.md"
+    markdown.parent.mkdir(parents=True)
+    markdown.write_text("%PDF-1.4\n1 0 obj\nstream\n", encoding="utf-8")
+    write_json(
+        run_root / "scrape_manifest.json",
+        [{"url": "https://example.edu/catalog", "status": "success", "markdown_path": str(markdown)}],
+    )
+
+    report = normalize_scraped_markdown(site_root, run_root, now=NOW)
+
+    [row] = read_registry_rows(site_root / "raw_sources" / "registry.jsonl")
+    stored_report = json.loads(Path(report.report_path).read_text(encoding="utf-8"))
+    assert row["status"] == "failed"
+    assert row["markdown_path"] == ""
+    assert row["diagnostic_path"]
+    assert (site_root / row["diagnostic_path"]).exists()
+    assert stored_report["quality_summary"]["counts"]["quarantined"] == 1
+
+
 def test_successful_pdf_scrape_without_markdown_path_is_skipped_by_web_normalizer(tmp_path: Path) -> None:
     site_root = ensure_site_layout(tmp_path, "site-1").site_root
     run_root = site_root / "run-001"
@@ -115,7 +173,7 @@ def test_scrape_manifest_markdown_path_escape_is_rejected_with_diagnostic(tmp_pa
     assert not list((site_root / "raw_sources" / "web").glob("*.md"))
 
 
-def test_pdf_page_markdown_is_combined_under_raw_sources_with_metadata(tmp_path: Path) -> None:
+def test_pdf_page_markdown_is_normalized_as_page_level_raw_sources(tmp_path: Path) -> None:
     site_root = ensure_site_layout(tmp_path, "site-1").site_root
     page_dir = site_root / "sources" / "pdf_pages" / "pdf123"
     page_dir.mkdir(parents=True)
@@ -145,17 +203,102 @@ def test_pdf_page_markdown_is_combined_under_raw_sources_with_metadata(tmp_path:
 
     report = normalize_pdf_pages(site_root, now=NOW)
 
+    rows = read_registry_rows(site_root / "raw_sources" / "registry.jsonl")
+    assert report.counts["ready"] == 2
+    assert len(rows) == 2
+    assert {row["source_kind"] for row in rows} == {"pdf"}
+    assert {row["original_path"] for row in rows} == {"/uploads/catalog.pdf"}
+    assert {row["parser"] for row in rows} == {"docling"}
+    raw_markdowns = [(site_root / row["markdown_path"]).read_text(encoding="utf-8") for row in rows]
+    assert any("Catalog Page 1" in text for text in raw_markdowns)
+    assert any("Catalog Page 2" in text for text in raw_markdowns)
+    assert not any("Catalog Page 1" in text and "Catalog Page 2" in text for text in raw_markdowns)
+    metadata = json.loads((site_root / rows[0]["metadata_path"]).read_text(encoding="utf-8"))
+    assert metadata["source_type"] == "document-page"
+    assert metadata["page_count"] == 1
+    assert metadata["document_page_count"] == 2
+    assert metadata["source_pages"][0]["page_number"] in {1, 2}
+
+
+def test_pdf_page_normalization_preserves_sections_tables_and_quality(tmp_path: Path) -> None:
+    site_root = ensure_site_layout(tmp_path, "site-1").site_root
+    page_dir = site_root / "sources" / "pdf_pages" / "pdf-table"
+    page_dir.mkdir(parents=True)
+    page_1 = page_dir / "page-0001.md"
+    page_1.write_text(
+        "# Graduate Catalog\n\n## Tuition\n\n| Program | Cost |\n| --- | --- |\n| MBA | 100 |\n",
+        encoding="utf-8",
+    )
+    write_json(
+        page_dir / "pages.json",
+        [
+            {
+                "pdf_source_id": "pdf-table",
+                "source_path": "/uploads/catalog.pdf",
+                "page_number": 1,
+                "parser": "docling",
+                "markdown_path": str(page_1),
+            }
+        ],
+    )
+
+    normalize_pdf_pages(site_root, now=NOW)
+
     [row] = read_registry_rows(site_root / "raw_sources" / "registry.jsonl")
-    assert report.counts["ready"] == 1
-    assert row["source_kind"] == "pdf"
-    assert row["original_path"] == "/uploads/catalog.pdf"
-    assert row["parser"] == "docling"
-    raw_markdown = (site_root / row["markdown_path"]).read_text(encoding="utf-8")
-    assert "Catalog Page 1" in raw_markdown
-    assert "Catalog Page 2" in raw_markdown
     metadata = json.loads((site_root / row["metadata_path"]).read_text(encoding="utf-8"))
-    assert metadata["page_count"] == 2
-    assert metadata["source_pages"][0]["page_number"] == 1
+    assert metadata["source_type"] == "document-page"
+    assert metadata["source_pages"][0]["page_start"] == 1
+    assert metadata["source_pages"][0]["section_path"] == "Graduate Catalog > Tuition"
+    assert metadata["tables"][0]["table_id"] == "p0001-t001"
+    assert metadata["tables_path"]
+    assert metadata["document_quality"]["table_count"] == 1
+    assert metadata["document_quality"]["page_coverage_count"] == 1
+
+
+def test_pdf_chunk_fallback_preserves_chunk_provenance_warnings_and_tables(tmp_path: Path) -> None:
+    site_root = ensure_site_layout(tmp_path, "site-1").site_root
+    ingest_dir = site_root / "sources" / "pdf_ingest"
+    ingest_dir.mkdir(parents=True)
+    pdf_path = tmp_path / "catalog.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+    (ingest_dir / "pdf_sources.jsonl").write_text(
+        json.dumps(
+            {
+                "pdf_source_id": "pdf-chunks",
+                "path": str(pdf_path),
+                "parser": "docling",
+                "warning": "table confidence low",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (ingest_dir / "pdf_chunks.jsonl").write_text(
+        json.dumps(
+            {
+                "chunk_id": "chunk-1",
+                "pdf_source_id": "pdf-chunks",
+                "source_path": str(pdf_path),
+                "parser": "docling",
+                "page_number": 4,
+                "chunk_index": 2,
+                "section_path": "Catalog > Aid",
+                "text": "| Aid | Amount |\n| --- | --- |\n| Grant | 10 |",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    normalize_pdf_pages(site_root, now=NOW)
+
+    [row] = read_registry_rows(site_root / "raw_sources" / "registry.jsonl")
+    metadata = json.loads((site_root / row["metadata_path"]).read_text(encoding="utf-8"))
+    assert row["source_kind"] == "pdf"
+    assert metadata["source_chunks"][0]["page_start"] == 4
+    assert metadata["source_chunks"][0]["section_path"] == "Catalog > Aid"
+    assert metadata["tables"][0]["table_id"] == "p0004-t001"
+    assert "table confidence low" in metadata["extraction_warnings"]
 
 
 def test_csv_source_is_rendered_as_markdown_table(tmp_path: Path) -> None:

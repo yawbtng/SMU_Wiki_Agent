@@ -81,12 +81,23 @@ def raw_source_status(layout) -> dict:
     by_kind = Counter(str(row.get("source_kind") or "unknown") for row in rows)
     by_status = Counter(str(row.get("status") or "unknown") for row in rows)
     by_change = Counter(str(row.get("change_state") or "unknown") for row in rows)
+    by_quality_action = Counter(
+        str((row.get("provenance") or {}).get("quality_action") or "unknown")
+        for row in rows
+        if isinstance(row.get("provenance"), dict) and (row.get("provenance") or {}).get("quality_action")
+    )
     latest_report_path, latest_report = latest_json_report(layout.raw_reports_dir, "normalization-*.json")
+    quality_summary = latest_report.get("quality_summary") if isinstance(latest_report.get("quality_summary"), dict) else {}
+    quality_counts = quality_summary.get("counts") if isinstance(quality_summary.get("counts"), dict) else {}
+    if quality_counts:
+        by_quality_action = Counter({str(key): safe_int(value) for key, value in quality_counts.items()})
     return {
         "rows": rows,
         "by_kind": by_kind,
         "by_status": by_status,
         "by_change": by_change,
+        "by_quality_action": by_quality_action,
+        "quality_summary": quality_summary,
         "latest_report_path": latest_report_path,
         "latest_report": latest_report,
         "registry_exists": layout.registry_path.exists(),
@@ -108,13 +119,23 @@ def load_wiki_status(layout, raw_status: dict) -> dict:
     if not report:
         report_path, report = _fallback_report(layout.wiki_dir / "build_report.json")
     review_queue_path = layout.wiki_dir / "review_queue.md"
+    raw_rows = [row for row in raw_status.get("rows", []) if isinstance(row, dict)]
+    ready_rows = [row for row in raw_rows if str(row.get("status") or "").lower() == "ready"]
     integrated_sources = len(
         [
             row
-            for row in raw_status.get("rows", [])
+            for row in ready_rows
             if str(row.get("wiki_status") or "").lower() in {"integrated", "complete", "done"}
         ]
     )
+    pending_rows = [
+        row
+        for row in ready_rows
+        if str(row.get("wiki_status") or "").lower() not in {"integrated", "complete", "done"}
+        or str(row.get("change_state") or "").lower() == "changed"
+    ]
+    pending_by_kind = Counter(str(row.get("source_kind") or "unknown") for row in pending_rows)
+    changed_source_count = len([row for row in ready_rows if str(row.get("change_state") or "").lower() == "changed"])
     pages_created = safe_int(report.get("pages_created") or report.get("created_pages"), 0)
     pages_updated = safe_int(report.get("pages_updated") or report.get("updated_pages"), 0)
     return {
@@ -125,6 +146,10 @@ def load_wiki_status(layout, raw_status: dict) -> dict:
         "pages_created": pages_created,
         "pages_updated": pages_updated,
         "integrated_sources": safe_int(report.get("integrated_sources"), integrated_sources),
+        "source_count": len(ready_rows),
+        "pending_source_count": len(pending_rows),
+        "pending_source_count_by_kind": dict(pending_by_kind),
+        "changed_source_count": changed_source_count,
         "review_queue_count": safe_int(report.get("review_queue_count"), count_markdown_items(review_queue_path)),
         "latest_report_path": report_path,
         "latest_report": report,

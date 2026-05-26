@@ -116,6 +116,58 @@ def test_wiki_builder_noninteractive_writes_pages_index_log_review_report_and_up
     assert rows["web_done"]["wiki_page_paths"] == []
 
 
+def test_wiki_builder_writes_routed_contract_source_notes_and_metadata(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_builder import build_wiki
+
+    site_root = tmp_path / "site"
+    registry_path = site_root / "raw_sources" / "registry.jsonl"
+    program = _write_ready_source(
+        site_root,
+        source_id="web_program",
+        title="Computer Science Graduate Program",
+        body="# Computer Science Graduate Program\n\nGraduate applicants apply by March 1. Tuition and faculty research labs are listed.",
+    )
+    write_registry_rows(registry_path, [program])
+
+    report = build_wiki(site_root, no_input=True, now=NOW)
+
+    page = (site_root / "wiki" / "pages" / "programs.md").read_text(encoding="utf-8")
+    assert (site_root / "wiki" / "routing" / "audience.md").exists()
+    assert (site_root / "wiki" / "routing" / "intent.md").exists()
+    assert (site_root / "wiki" / "routing" / "topics.md").exists()
+    assert (site_root / "wiki" / "source-notes" / "index.md").exists()
+    assert (site_root / "wiki" / "programs" / "index.md").exists()
+    assert "## Fast Answer" in page
+    assert "## Who This Applies To" in page
+    assert "## Source Notes" not in page
+    assert "audiences:\n  - applicant" in page
+    assert "intents:\n  - apply" in page
+    assert "canonical_owner: wiki/pages/programs.md" in page
+    assert "Computer Science Graduate Program" in (site_root / "wiki" / "source-notes" / "programs.md").read_text(encoding="utf-8")
+    assert "smu" not in page.lower()
+    assert "wiki/routing/audience.md" in report["required_markdown_paths"]
+
+
+def test_wiki_builder_report_preserves_tmux_session(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_builder import build_wiki
+
+    site_root = tmp_path / "site"
+    registry_path = site_root / "raw_sources" / "registry.jsonl"
+    admissions = _write_ready_source(
+        site_root,
+        source_id="web_admissions",
+        title="Admissions Requirements",
+        body="# Admissions Requirements\n\nApply by February 1.\n",
+    )
+    write_registry_rows(registry_path, [admissions])
+
+    report = build_wiki(site_root, no_input=True, now=NOW, tmux_session="wiki-site-20260522-120000")
+
+    assert report["tmux_session"] == "wiki-site-20260522-120000"
+    payload = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
+    assert payload["tmux_session"] == "wiki-site-20260522-120000"
+
+
 def test_wiki_builder_resume_processes_pending_rows_after_prior_report(tmp_path: Path) -> None:
     from src.scrape_planner.llm_wiki_builder import build_wiki
 
@@ -411,6 +463,9 @@ def test_wiki_launcher_uses_tmux_with_no_input_paths_and_resume(tmp_path: Path, 
         def __init__(self) -> None:
             self.calls = []
 
+        def session_exists(self, name: str) -> bool:
+            return any(existing_name == name for existing_name, _command, _workdir in self.calls)
+
         def start(self, name: str, command: str, workdir: str):
             self.calls.append((name, command, workdir))
             return {"ok": True, "command": "tmux shell command"}
@@ -442,6 +497,11 @@ def test_wiki_launcher_uses_tmux_with_no_input_paths_and_resume(tmp_path: Path, 
     assert "--no-input" in command
     assert "--resume" in command
     assert str(site_root / "wiki" / "reports" / "wiki-build-latest.json") in command
+    launch_report = json.loads((site_root / "wiki" / "reports" / "wiki-build-latest.json").read_text(encoding="utf-8"))
+    assert launch_report["status"] == "running"
+    assert launch_report["job_status"] == "running"
+    assert launch_report["tmux_session"] == "wiki-test"
+    assert launch_report["report_path"] == str(site_root / "wiki" / "reports" / "wiki-build-latest.json")
 
 
 def test_wiki_builder_cli_refuses_build_without_no_input(tmp_path: Path) -> None:
@@ -475,7 +535,7 @@ def test_wiki_builder_cli_refuses_build_without_no_input(tmp_path: Path) -> None
     assert rows["web_admissions"]["wiki_status"] == "pending"
 
 
-def test_wiki_launcher_can_use_pi_skill_runtime(tmp_path: Path, monkeypatch) -> None:
+def test_wiki_launcher_uses_python_runtime(tmp_path: Path) -> None:
     from src.scrape_planner.llm_wiki_builder import launch_wiki_builder
 
     class FakeRunner:
@@ -486,18 +546,50 @@ def test_wiki_launcher_can_use_pi_skill_runtime(tmp_path: Path, monkeypatch) -> 
             self.calls.append((name, command, workdir))
             return {"ok": True}
 
-    monkeypatch.setattr("src.scrape_planner.llm_wiki_builder.shutil.which", lambda name: "/usr/local/bin/pi" if name == "pi" else None)
     runner = FakeRunner()
     site_root = tmp_path / "site"
-    result = launch_wiki_builder(site_root, runner=runner, runtime="pi")
+    result = launch_wiki_builder(site_root, runner=runner)
     [(name, command, _workdir)] = runner.calls
 
     assert result["ok"] is True
-    assert result["runtime"] == "pi"
-    assert name.startswith("llm-wiki-")
-    assert "/usr/local/bin/pi -p --skill" in command
-    assert ".pi/skills/karpathy-wiki-builder/SKILL.md" in command
+    assert result["runtime"] == "python"
+    assert name.startswith("wiki-site-")
+    assert "--skill" not in command
+    assert ".pi/skills/karpathy-wiki-builder/SKILL.md" not in command
     assert "src.scrape_planner.llm_wiki_builder" in command
+    launch_report = json.loads((site_root / "wiki" / "reports" / "wiki-build-latest.json").read_text(encoding="utf-8"))
+    assert launch_report["status"] == "running"
+    assert launch_report["job_status"] == "running"
+    assert launch_report["tmux_session"] == name
+
+
+def test_wiki_launcher_uses_unique_default_session_names(tmp_path: Path, monkeypatch) -> None:
+    from src.scrape_planner.llm_wiki_builder import launch_wiki_builder
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def session_exists(self, name: str) -> bool:
+            return any(existing_name == name for existing_name, _command, _workdir in self.calls)
+
+        def start(self, name: str, command: str, workdir: str):
+            self.calls.append((name, command, workdir))
+            return {"ok": True, "command": "tmux shell command"}
+
+    runner = FakeRunner()
+    site_root = tmp_path / "site"
+    monkeypatch.setattr("src.scrape_planner.llm_wiki_builder.utc_now_iso", lambda: "2026-05-22T10:11:12+00:00")
+
+    first = launch_wiki_builder(site_root, runner=runner)
+    second = launch_wiki_builder(site_root, runner=runner)
+
+    assert first["session_name"] == "wiki-site-20260522-101112"
+    assert second["session_name"] == "wiki-site-20260522-101112-2"
+    assert runner.calls[0][0] == "wiki-site-20260522-101112"
+    assert runner.calls[1][0] == "wiki-site-20260522-101112-2"
+    latest_report = json.loads((site_root / "wiki" / "reports" / "wiki-build-latest.json").read_text(encoding="utf-8"))
+    assert latest_report["tmux_session"] == "wiki-site-20260522-101112-2"
 
 
 def test_raw_source_normalizer_cli_runs_without_input_and_writes_report(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -119,40 +120,63 @@ def ingest_pdfs(paths: list[str | Path], config: PdfIngestConfig | None = None) 
 
         sources.append(PdfSourceRow(source_id, str(path), size, page_count, True, utc_now_iso()))
         _write_page_markdown_files(source_id, path, parsed, cfg)
-        for chunk_index, chunk_text in enumerate(_chunk_text(markdown, cfg), start=0):
-            chunk_id = _chunk_id(source_id, 0, chunk_index, chunk_text)
-            chunks.append(
-                PdfChunkRow(
-                    chunk_id=chunk_id,
-                    pdf_source_id=source_id,
-                    page_number=0,
-                    chunk_index=chunk_index,
-                    text=chunk_text,
-                    char_count=len(chunk_text),
-                    created_at=utc_now_iso(),
-                    parser=parsed.parser,
-                    source_path=str(path),
+        chunk_pages = parsed.pages or [(0, markdown)]
+        for page_number, page_markdown in chunk_pages:
+            for chunk_index, chunk_text in enumerate(_chunk_text(str(page_markdown or ""), cfg), start=0):
+                chunk_id = _chunk_id(source_id, int(page_number or 0), chunk_index, chunk_text)
+                chunks.append(
+                    PdfChunkRow(
+                        chunk_id=chunk_id,
+                        pdf_source_id=source_id,
+                        page_number=int(page_number or 0),
+                        chunk_index=chunk_index,
+                        text=chunk_text,
+                        char_count=len(chunk_text),
+                        created_at=utc_now_iso(),
+                        parser=parsed.parser,
+                        source_path=str(path),
+                    )
                 )
-            )
 
     return PdfIngestResult(sources=sources, chunks=chunks, quarantine=quarantine)
 
 
 def _parse_pdf_with_docling(path: Path) -> ParsedPdf:
     try:
-        from docling.document_converter import DocumentConverter
+        from docling.datamodel.accelerator_options import AcceleratorOptions
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.document_converter import DocumentConverter, PdfFormatOption
     except ImportError as exc:
         raise PdfParserUnavailableError("Docling is not installed. Install requirements-pdf.txt.") from exc
 
-    converter = DocumentConverter()
+    # Force CPU on Apple Silicon. Docling's auto device selection can choose MPS,
+    # but parts of the layout model still request float64 tensors that MPS rejects.
+    device = os.getenv("DOCLING_DEVICE", "cpu")
+    pipeline_options = PdfPipelineOptions(accelerator_options=AcceleratorOptions(device=device))
+    converter = DocumentConverter(
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
+    )
     result = converter.convert(str(path))
     document = getattr(result, "document", None)
     if document is None:
         raise RuntimeError("Docling returned no document")
     if not hasattr(document, "export_to_markdown"):
         raise RuntimeError("Docling document cannot export markdown")
-    markdown = str(document.export_to_markdown() or "")
-    return ParsedPdf(markdown, _docling_page_count(document), "docling", [(0, markdown)] if markdown.strip() else [])
+    page_count = _docling_page_count(document)
+    markdown = str(document.export_to_markdown(page_break_placeholder="\n\n<!-- page break -->\n\n") or "")
+    pages: list[tuple[int, str]] = []
+    if page_count:
+        for page_no in range(1, int(page_count) + 1):
+            try:
+                page_markdown = str(document.export_to_markdown(page_no=page_no) or "").strip()
+            except Exception:
+                page_markdown = ""
+            if page_markdown:
+                pages.append((page_no, page_markdown))
+    if not pages and markdown.strip():
+        pages = [(0, markdown)]
+    return ParsedPdf(markdown, page_count, "docling", pages)
 
 
 def _docling_page_count(document: object) -> int | None:

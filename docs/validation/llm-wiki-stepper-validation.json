@@ -40,6 +40,7 @@
       "log_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/fixture-site/wiki/log.md",
       "review_queue_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/fixture-site/wiki/review_queue.md",
       "report_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/fixture-site/wiki/reports/wiki-build-2026-05-21T12-00-00-00-00.json",
+      "tmux_session": "",
       "generated_at": "2026-05-21T12:00:00+00:00",
       "updated_at": "2026-05-21T12:00:00+00:00",
       "no_input": true,
@@ -130,12 +131,17 @@
       "changed_document_count": 6,
       "skipped_document_count": 0,
       "term_count": 55,
-      "reranker_ready": true,
+      "reranker_ready": false,
       "index_health": "ready",
       "embedding": {
         "provider": "deterministic-hash-embedding",
         "model": "hashed-token-vector-v1",
         "vector_dimensions": 64
+      },
+      "reranker": {
+        "provider": "",
+        "model": "",
+        "api_url": ""
       },
       "invalid_sources": [],
       "report_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/fixture-site/indexes/reports/embedding-2026-05-21T12-00-00-00-00.json",
@@ -162,6 +168,7 @@
             "source_priority": 1.2,
             "freshness": 0.05,
             "citation": 0.4,
+            "model_rerank": 0.0,
             "combined": 13.751935
           },
           "source_path": "wiki/pages/finance.md",
@@ -213,6 +220,7 @@
             "source_priority": 0.0,
             "freshness": 0.05,
             "citation": 0.25,
+            "model_rerank": 0.0,
             "combined": 9.663664
           },
           "source_path": "raw_sources/pdf/pdf_4792dba855cd2596-7b02d3b341a5.md",
@@ -273,6 +281,7 @@
             "source_priority": 1.2,
             "freshness": 0.05,
             "citation": 0.4,
+            "model_rerank": 0.0,
             "combined": 7.023976
           },
           "source_path": "wiki/pages/programs.md",
@@ -323,6 +332,7 @@
             "source_priority": 1.2,
             "freshness": 0.05,
             "citation": 0.4,
+            "model_rerank": 0.0,
             "combined": 6.829442
           },
           "source_path": "wiki/pages/admissions.md",
@@ -373,6 +383,7 @@
             "source_priority": 0.0,
             "freshness": 0.05,
             "citation": 0.25,
+            "model_rerank": 0.0,
             "combined": 5.883703
           },
           "source_path": "raw_sources/excel/excel_bb1840f1d09e42fa-171ffad4413e.md",
@@ -430,6 +441,7 @@
             "source_priority": 0.0,
             "freshness": 0.05,
             "citation": 0.25,
+            "model_rerank": 0.0,
             "combined": 2.493147
           },
           "source_path": "raw_sources/web/web_9aa9b08b863d383e-d8f58f60a63f.md",
@@ -506,12 +518,17 @@
             "changed_document_count": 6,
             "skipped_document_count": 0,
             "term_count": 55,
-            "reranker_ready": true,
+            "reranker_ready": false,
             "index_health": "ready",
             "embedding": {
               "provider": "deterministic-hash-embedding",
               "model": "hashed-token-vector-v1",
               "vector_dimensions": 64
+            },
+            "reranker": {
+              "provider": "",
+              "model": "",
+              "api_url": ""
             },
             "invalid_sources": []
           },
@@ -551,6 +568,7 @@
                 "source_priority": 1.2,
                 "freshness": 0.05,
                 "citation": 0.4,
+                "model_rerank": 0.0,
                 "combined": 13.751935
               },
               "source_path": "wiki/pages/finance.md",
@@ -602,6 +620,7 @@
                 "source_priority": 0.0,
                 "freshness": 0.05,
                 "citation": 0.25,
+                "model_rerank": 0.0,
                 "combined": 9.663664
               },
               "source_path": "raw_sources/pdf/pdf_4792dba855cd2596-7b02d3b341a5.md",
@@ -662,6 +681,7 @@
                 "source_priority": 1.2,
                 "freshness": 0.05,
                 "citation": 0.4,
+                "model_rerank": 0.0,
                 "combined": 7.023976
               },
               "source_path": "wiki/pages/programs.md",
@@ -751,6 +771,7 @@
                 "source_priority": 1.2,
                 "freshness": 0.05,
                 "citation": 0.4,
+                "model_rerank": 0.0,
                 "combined": 13.751935
               },
               "source_path": "wiki/pages/finance.md",
@@ -802,6 +823,7 @@
                 "source_priority": 0.0,
                 "freshness": 0.05,
                 "citation": 0.25,
+                "model_rerank": 0.0,
                 "combined": 9.663664
               },
               "source_path": "raw_sources/pdf/pdf_4792dba855cd2596-7b02d3b341a5.md",
@@ -862,6 +884,7 @@
                 "source_priority": 1.2,
                 "freshness": 0.05,
                 "citation": 0.4,
+                "model_rerank": 0.0,
                 "combined": 7.023976
               },
               "source_path": "wiki/pages/programs.md",
@@ -914,533 +937,10 @@
     "manual_prompts": 0
   },
   "smu": {
-    "status": "passed",
-    "mode": "bounded_real_artifact_proof",
-    "source_site_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/sites/www.smu.edu",
-    "source_manifest_path": "",
-    "proof_site_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site",
-    "source_rows_selected": 3,
-    "normalization": {
-      "mode": "web",
-      "no_input": true,
-      "site_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site",
-      "registry_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/raw_sources/registry.jsonl",
-      "report_paths": [
-        "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/raw_sources/reports/normalization-web-2026-05-21T12-00-00-00-00.json"
-      ],
-      "counts": {
-        "new": 3,
-        "unchanged": 0,
-        "changed": 0,
-        "ready": 3,
-        "failed": 0,
-        "needs-review": 0
-      }
-    },
-    "wiki": {
-      "status": "complete",
-      "job_status": "complete",
-      "site_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site",
-      "registry_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/raw_sources/registry.jsonl",
-      "wiki_dir": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/wiki",
-      "index_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/wiki/index.md",
-      "log_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/wiki/log.md",
-      "review_queue_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/wiki/review_queue.md",
-      "report_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/wiki/reports/wiki-build-2026-05-21T12-00-00-00-00.json",
-      "generated_at": "2026-05-21T12:00:00+00:00",
-      "updated_at": "2026-05-21T12:00:00+00:00",
-      "no_input": true,
-      "resume": false,
-      "rebuild": true,
-      "no_op": false,
-      "sources_considered": 3,
-      "processed_source_ids": [
-        "web_8956fd5ecfce638f",
-        "web_e0a2a6a50ca241a0",
-        "web_fc1d10cb780d8f7b"
-      ],
-      "skipped_source_ids": [],
-      "resume_source_ids": [],
-      "pages_created": 1,
-      "created_pages": 1,
-      "pages_updated": 0,
-      "updated_pages": 0,
-      "integrated_sources": 3,
-      "failed_source_ids": [],
-      "review_queue_count": 0,
-      "pages": [
-        {
-          "title": "Programs",
-          "category": "Programs",
-          "path": "wiki/pages/programs.md",
-          "summary": "Programs summary from 3 sources.",
-          "source_count": 3,
-          "source_ids": [
-            "web_8956fd5ecfce638f",
-            "web_e0a2a6a50ca241a0",
-            "web_fc1d10cb780d8f7b"
-          ],
-          "source_paths": [
-            "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.md",
-            "raw_sources/web/web_e0a2a6a50ca241a0-8eaf572bff4a.md",
-            "raw_sources/web/web_fc1d10cb780d8f7b-74db0081b2fe.md"
-          ],
-          "tags": [
-            "programs"
-          ]
-        }
-      ]
-    },
-    "index": {
-      "version": "llm-wiki-hybrid-v1",
-      "status": "ready",
-      "site_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site",
-      "documents_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/indexes/llm_wiki_documents.jsonl",
-      "postings_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/indexes/llm_wiki_postings.json",
-      "built_at": "2026-05-21T12:00:00+00:00",
-      "raw_index_count": 10,
-      "wiki_index_count": 2,
-      "raw_documents": 10,
-      "wiki_documents": 2,
-      "raw_count": 10,
-      "wiki_count": 2,
-      "changed_raw_count": 10,
-      "changed_wiki_count": 2,
-      "changed_document_count": 12,
-      "skipped_document_count": 0,
-      "term_count": 607,
-      "reranker_ready": true,
-      "index_health": "ready",
-      "embedding": {
-        "provider": "deterministic-hash-embedding",
-        "model": "hashed-token-vector-v1",
-        "vector_dimensions": 64
-      },
-      "invalid_sources": [],
-      "report_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/indexes/reports/embedding-2026-05-21T12-00-00-00-00.json",
-      "last_build_time": "2026-05-21T12:00:00+00:00"
-    },
-    "query": {
-      "status": "ok",
-      "query": "contentmain content staff directory picture leigh moffett media",
-      "evidence": [
-        {
-          "id": "raw:web_8956fd5ecfce638f:1",
-          "source_kind": "web",
-          "source_id": "web_8956fd5ecfce638f",
-          "source_ids": [
-            "web_8956fd5ecfce638f"
-          ],
-          "path": "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.md",
-          "title": "Staff Directory",
-          "snippet": "[Skip to main content](#main-content) # Staff Directory ![Picture of Leigh Ann Moffett](/-/media/site/businessfinance/riskmgmt/headshots/new-headshots/30667d_004_moffett-5/leighann-moffett-dec2022.jpg?h=2048&iar=0&w=1366&hash=6D1C5C7EAFD0EEAF132F651D54E84F1C) ### Leigh Ann Moffett ##### Senior Associate Vice President,...",
-          "scores": {
-            "lexical": 40.586412,
-            "vector": 0.336022,
-            "keyword": 1.5,
-            "source_priority": 0.0,
-            "freshness": 0.05,
-            "citation": 0.25,
-            "combined": 42.890446
-          },
-          "source_path": "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.md",
-          "checksum": "800f5968bdc874bb159cf5a82673bdc9a1676e5746d1dbf379db602ee4fc266c",
-          "parser": "scrape_worker.markdown",
-          "tags": [],
-          "ranking_reasons": [
-            "cited_by_wiki_candidate",
-            "keyword_match",
-            "vector_match"
-          ],
-          "metadata": {
-            "original_url": "local-smu-markdown://005c5768a716",
-            "original_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/markdown/smu-01.md",
-            "metadata_path": "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.metadata.json",
-            "parser_metadata": {
-              "source_kind": "web",
-              "source_id": "web_8956fd5ecfce638f",
-              "url": "local-smu-markdown://005c5768a716",
-              "run_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run",
-              "scrape_markdown_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/markdown/smu-01.md",
-              "scrape_metadata_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/metadata/smu-01.json",
-              "fetch_mode": "local_markdown_fallback",
-              "normalized_at": "2026-05-21T12:00:00+00:00"
-            },
-            "parser_metadata_checksum": "63cb90af50d0250c05575cb556afea579b95402838ec4c9e7cc84a697a162c1f",
-            "registry_checksum": "800f5968bdc874bb159cf5a82673bdc9a1676e5746d1dbf379db602ee4fc266c",
-            "provenance": {
-              "run_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run",
-              "scrape_manifest_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/scrape_manifest.json"
-            },
-            "change_state": "new",
-            "wiki_page_paths": [
-              "wiki/pages/programs.md"
-            ]
-          }
-        },
-        {
-          "id": "wiki:wiki/pages/programs.md:1",
-          "source_kind": "wiki",
-          "source_id": "wiki/pages/programs.md",
-          "source_ids": [
-            "web_8956fd5ecfce638f",
-            "web_e0a2a6a50ca241a0",
-            "web_fc1d10cb780d8f7b"
-          ],
-          "path": "wiki/pages/programs.md",
-          "title": "Programs",
-          "snippet": "# Programs Programs summary from 3 sources. ## Source Notes ### Staff Directory [Skip to main content](#main-content) # Staff Directory ![Picture of Leigh Ann Moffett](/-/media/site/businessfinance/riskmgmt/headshots/new-headshots/30667d_004_moffett-5/leighann-moffett-dec2022.jpg?h=2048&iar=0&w=1366&hash=6D1C5C7EAFD0EE...",
-          "scores": {
-            "lexical": 29.514767,
-            "vector": 0.282915,
-            "keyword": 0.7,
-            "source_priority": 1.2,
-            "freshness": 0.05,
-            "citation": 0.4,
-            "combined": 32.28914
-          },
-          "source_path": "wiki/pages/programs.md",
-          "checksum": "720271309adb349e41b8b8fed7857e00bb7f9b991eff8e47ae1e4d8b6f98aa16",
-          "parser": "llm-wiki-builder",
-          "tags": [
-            "programs"
-          ],
-          "ranking_reasons": [
-            "wiki_synthesis_boost",
-            "cites_raw_candidate",
-            "keyword_match",
-            "vector_match"
-          ],
-          "metadata": {
-            "frontmatter": {
-              "title": "Programs",
-              "category": "Programs",
-              "page_path": "wiki/pages/programs.md",
-              "page_checksum": "796747b2df4402f8d3f0e7ee4ab2cc6a22dc019367c334122a5e6ae8108ca35f",
-              "source_ids": [
-                "web_8956fd5ecfce638f",
-                "web_e0a2a6a50ca241a0",
-                "web_fc1d10cb780d8f7b"
-              ],
-              "source_paths": [
-                "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.md",
-                "raw_sources/web/web_e0a2a6a50ca241a0-8eaf572bff4a.md",
-                "raw_sources/web/web_fc1d10cb780d8f7b-74db0081b2fe.md"
-              ],
-              "source_count": "3",
-              "tags": [
-                "programs"
-              ],
-              "updated_at": "2026-05-21T12:00:00+00:00"
-            }
-          }
-        },
-        {
-          "id": "raw:web_8956fd5ecfce638f:2",
-          "source_kind": "web",
-          "source_id": "web_8956fd5ecfce638f",
-          "source_ids": [
-            "web_8956fd5ecfce638f"
-          ],
-          "path": "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.md",
-          "title": "Staff Directory",
-          "snippet": "...6034CB21568D6) ### Vacant ##### **Manager, Occupational Safety** 214-768-4203 ![Picture of Allison Russell](/-/media/site/businessfinance/riskmgmt/headshots/allison_russell_2022.jpg?h=2200&iar=0&w=1467&hash=6F68F2489893FA41E9CD9D15A093A1AB) ### Allison Russell ##### Director, Global Safety & Security 214-768-4476 awitu...",
-          "scores": {
-            "lexical": 10.329962,
-            "vector": 0.064369,
-            "keyword": 1.2,
-            "source_priority": 0.0,
-            "freshness": 0.05,
-            "citation": 0.25,
-            "combined": 11.926515
-          },
-          "source_path": "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.md",
-          "checksum": "800f5968bdc874bb159cf5a82673bdc9a1676e5746d1dbf379db602ee4fc266c",
-          "parser": "scrape_worker.markdown",
-          "tags": [],
-          "ranking_reasons": [
-            "cited_by_wiki_candidate",
-            "keyword_match",
-            "vector_match"
-          ],
-          "metadata": {
-            "original_url": "local-smu-markdown://005c5768a716",
-            "original_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/markdown/smu-01.md",
-            "metadata_path": "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.metadata.json",
-            "parser_metadata": {
-              "source_kind": "web",
-              "source_id": "web_8956fd5ecfce638f",
-              "url": "local-smu-markdown://005c5768a716",
-              "run_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run",
-              "scrape_markdown_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/markdown/smu-01.md",
-              "scrape_metadata_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/metadata/smu-01.json",
-              "fetch_mode": "local_markdown_fallback",
-              "normalized_at": "2026-05-21T12:00:00+00:00"
-            },
-            "parser_metadata_checksum": "63cb90af50d0250c05575cb556afea579b95402838ec4c9e7cc84a697a162c1f",
-            "registry_checksum": "800f5968bdc874bb159cf5a82673bdc9a1676e5746d1dbf379db602ee4fc266c",
-            "provenance": {
-              "run_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run",
-              "scrape_manifest_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/scrape_manifest.json"
-            },
-            "change_state": "new",
-            "wiki_page_paths": [
-              "wiki/pages/programs.md"
-            ]
-          }
-        }
-      ],
-      "metadata": {
-        "bounded": true,
-        "max_evidence": 3,
-        "max_candidates": 50,
-        "candidate_count": 9,
-        "index_version": "llm-wiki-hybrid-v1",
-        "site_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site"
-      }
-    },
-    "query_text": "contentmain content staff directory picture leigh moffett media",
-    "mcp": {
-      "direct": {
-        "index_info": {
-          "ok": true,
-          "ready": true,
-          "error": "",
-          "site_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site",
-          "index_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/indexes/llm_wiki_manifest.json",
-          "raw_index_count": 10,
-          "wiki_index_count": 2,
-          "last_build_time": "2026-05-21T12:00:00+00:00",
-          "index_health": "ready",
-          "manifest": {
-            "version": "llm-wiki-hybrid-v1",
-            "status": "ready",
-            "site_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site",
-            "documents_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/indexes/llm_wiki_documents.jsonl",
-            "postings_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/indexes/llm_wiki_postings.json",
-            "built_at": "2026-05-21T12:00:00+00:00",
-            "raw_index_count": 10,
-            "wiki_index_count": 2,
-            "raw_documents": 10,
-            "wiki_documents": 2,
-            "raw_count": 10,
-            "wiki_count": 2,
-            "changed_raw_count": 10,
-            "changed_wiki_count": 2,
-            "changed_document_count": 12,
-            "skipped_document_count": 0,
-            "term_count": 607,
-            "reranker_ready": true,
-            "index_health": "ready",
-            "embedding": {
-              "provider": "deterministic-hash-embedding",
-              "model": "hashed-token-vector-v1",
-              "vector_dimensions": 64
-            },
-            "invalid_sources": []
-          },
-          "config_snippet": {
-            "mcpServers": {
-              "llm-wiki-smu-proof-site": {
-                "command": "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9",
-                "args": [
-                  "-m",
-                  "mcp_servers.llm_wiki_mcp",
-                  "--site-root",
-                  "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site"
-                ]
-              }
-            }
-          }
-        },
-        "query_wiki": {
-          "ok": true,
-          "error": "",
-          "query": "contentmain content staff directory picture leigh moffett media",
-          "evidence": [
-            {
-              "id": "raw:web_8956fd5ecfce638f:1",
-              "source_kind": "web",
-              "source_id": "web_8956fd5ecfce638f",
-              "source_ids": [
-                "web_8956fd5ecfce638f"
-              ],
-              "path": "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.md",
-              "title": "Staff Directory",
-              "snippet": "[Skip to main content](#main-content) # Staff Directory ![Picture of Leigh Ann Moffett](/-/media/site/businessfinance/riskmgmt/headshots/new-headshots/30667d_004_moffett-5/leighann-moffett-dec2022.jpg?h=2048&iar=0&w=1366&hash=6D1C5C7EAFD0EEAF132F651D54E84F1C) ### Leigh Ann Moffett ##### Senior Associate Vice President,...",
-              "scores": {
-                "lexical": 40.586412,
-                "vector": 0.336022,
-                "keyword": 1.5,
-                "source_priority": 0.0,
-                "freshness": 0.05,
-                "citation": 0.25,
-                "combined": 42.890446
-              },
-              "source_path": "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.md",
-              "checksum": "800f5968bdc874bb159cf5a82673bdc9a1676e5746d1dbf379db602ee4fc266c",
-              "parser": "scrape_worker.markdown",
-              "tags": [],
-              "ranking_reasons": [
-                "cited_by_wiki_candidate",
-                "keyword_match",
-                "vector_match"
-              ],
-              "metadata": {
-                "original_url": "local-smu-markdown://005c5768a716",
-                "original_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/markdown/smu-01.md",
-                "metadata_path": "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.metadata.json",
-                "parser_metadata": {
-                  "source_kind": "web",
-                  "source_id": "web_8956fd5ecfce638f",
-                  "url": "local-smu-markdown://005c5768a716",
-                  "run_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run",
-                  "scrape_markdown_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/markdown/smu-01.md",
-                  "scrape_metadata_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/metadata/smu-01.json",
-                  "fetch_mode": "local_markdown_fallback",
-                  "normalized_at": "2026-05-21T12:00:00+00:00"
-                },
-                "parser_metadata_checksum": "63cb90af50d0250c05575cb556afea579b95402838ec4c9e7cc84a697a162c1f",
-                "registry_checksum": "800f5968bdc874bb159cf5a82673bdc9a1676e5746d1dbf379db602ee4fc266c",
-                "provenance": {
-                  "run_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run",
-                  "scrape_manifest_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/scrape_manifest.json"
-                },
-                "change_state": "new",
-                "wiki_page_paths": [
-                  "wiki/pages/programs.md"
-                ]
-              }
-            },
-            {
-              "id": "wiki:wiki/pages/programs.md:1",
-              "source_kind": "wiki",
-              "source_id": "wiki/pages/programs.md",
-              "source_ids": [
-                "web_8956fd5ecfce638f",
-                "web_e0a2a6a50ca241a0",
-                "web_fc1d10cb780d8f7b"
-              ],
-              "path": "wiki/pages/programs.md",
-              "title": "Programs",
-              "snippet": "# Programs Programs summary from 3 sources. ## Source Notes ### Staff Directory [Skip to main content](#main-content) # Staff Directory ![Picture of Leigh Ann Moffett](/-/media/site/businessfinance/riskmgmt/headshots/new-headshots/30667d_004_moffett-5/leighann-moffett-dec2022.jpg?h=2048&iar=0&w=1366&hash=6D1C5C7EAFD0EE...",
-              "scores": {
-                "lexical": 29.514767,
-                "vector": 0.282915,
-                "keyword": 0.7,
-                "source_priority": 1.2,
-                "freshness": 0.05,
-                "citation": 0.4,
-                "combined": 32.28914
-              },
-              "source_path": "wiki/pages/programs.md",
-              "checksum": "720271309adb349e41b8b8fed7857e00bb7f9b991eff8e47ae1e4d8b6f98aa16",
-              "parser": "llm-wiki-builder",
-              "tags": [
-                "programs"
-              ],
-              "ranking_reasons": [
-                "wiki_synthesis_boost",
-                "cites_raw_candidate",
-                "keyword_match",
-                "vector_match"
-              ],
-              "metadata": {
-                "frontmatter": {
-                  "title": "Programs",
-                  "category": "Programs",
-                  "page_path": "wiki/pages/programs.md",
-                  "page_checksum": "796747b2df4402f8d3f0e7ee4ab2cc6a22dc019367c334122a5e6ae8108ca35f",
-                  "source_ids": [
-                    "web_8956fd5ecfce638f",
-                    "web_e0a2a6a50ca241a0",
-                    "web_fc1d10cb780d8f7b"
-                  ],
-                  "source_paths": [
-                    "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.md",
-                    "raw_sources/web/web_e0a2a6a50ca241a0-8eaf572bff4a.md",
-                    "raw_sources/web/web_fc1d10cb780d8f7b-74db0081b2fe.md"
-                  ],
-                  "source_count": "3",
-                  "tags": [
-                    "programs"
-                  ],
-                  "updated_at": "2026-05-21T12:00:00+00:00"
-                }
-              }
-            },
-            {
-              "id": "raw:web_8956fd5ecfce638f:2",
-              "source_kind": "web",
-              "source_id": "web_8956fd5ecfce638f",
-              "source_ids": [
-                "web_8956fd5ecfce638f"
-              ],
-              "path": "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.md",
-              "title": "Staff Directory",
-              "snippet": "...6034CB21568D6) ### Vacant ##### **Manager, Occupational Safety** 214-768-4203 ![Picture of Allison Russell](/-/media/site/businessfinance/riskmgmt/headshots/allison_russell_2022.jpg?h=2200&iar=0&w=1467&hash=6F68F2489893FA41E9CD9D15A093A1AB) ### Allison Russell ##### Director, Global Safety & Security 214-768-4476 awitu...",
-              "scores": {
-                "lexical": 10.329962,
-                "vector": 0.064369,
-                "keyword": 1.2,
-                "source_priority": 0.0,
-                "freshness": 0.05,
-                "citation": 0.25,
-                "combined": 11.926515
-              },
-              "source_path": "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.md",
-              "checksum": "800f5968bdc874bb159cf5a82673bdc9a1676e5746d1dbf379db602ee4fc266c",
-              "parser": "scrape_worker.markdown",
-              "tags": [],
-              "ranking_reasons": [
-                "cited_by_wiki_candidate",
-                "keyword_match",
-                "vector_match"
-              ],
-              "metadata": {
-                "original_url": "local-smu-markdown://005c5768a716",
-                "original_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/markdown/smu-01.md",
-                "metadata_path": "raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.metadata.json",
-                "parser_metadata": {
-                  "source_kind": "web",
-                  "source_id": "web_8956fd5ecfce638f",
-                  "url": "local-smu-markdown://005c5768a716",
-                  "run_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run",
-                  "scrape_markdown_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/markdown/smu-01.md",
-                  "scrape_metadata_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/metadata/smu-01.json",
-                  "fetch_mode": "local_markdown_fallback",
-                  "normalized_at": "2026-05-21T12:00:00+00:00"
-                },
-                "parser_metadata_checksum": "63cb90af50d0250c05575cb556afea579b95402838ec4c9e7cc84a697a162c1f",
-                "registry_checksum": "800f5968bdc874bb159cf5a82673bdc9a1676e5746d1dbf379db602ee4fc266c",
-                "provenance": {
-                  "run_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run",
-                  "scrape_manifest_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site/bounded-smu-run/scrape_manifest.json"
-                },
-                "change_state": "new",
-                "wiki_page_paths": [
-                  "wiki/pages/programs.md"
-                ]
-              }
-            }
-          ],
-          "metadata": {
-            "bounded": true,
-            "max_evidence": 3,
-            "max_candidates": 50,
-            "candidate_count": 9,
-            "index_version": "llm-wiki-hybrid-v1",
-            "site_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/validation/llm-wiki-stepper/smu-proof-site"
-          }
-        },
-        "get_wiki_page": {
-          "ok": true,
-          "error": "",
-          "path": "wiki/pages/programs.md",
-          "markdown": "---\ntitle: Programs\ncategory: Programs\npage_path: wiki/pages/programs.md\npage_checksum: 796747b2df4402f8d3f0e7ee4ab2cc6a22dc019367c334122a5e6ae8108ca35f\nsource_ids:\n  - web_8956fd5ecfce638f\n  - web_e0a2a6a50ca241a0\n  - web_fc1d10cb780d8f7b\nsource_paths:\n  - raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.md\n  - raw_sources/web/web_e0a2a6a50ca241a0-8eaf572bff4a.md\n  - raw_sources/web/web_fc1d10cb780d8f7b-74db0081b2fe.md\nsource_count: 3\ntags:\n  - programs\nupdated_at: 2026-05-21T12:00:00+00:00\n---\n# Programs\n\nPrograms summary from 3 sources.\n\n## Source Notes\n\n### Staff Directory\n\n[Skip to main content](#main-content) # Staff Directory ![Picture of Leigh Ann Moffett](/-/media/site/businessfinance/riskmgmt/headshots/new-headshots/30667d_004_moffett-5/leighann-moffett-dec2022.jpg?h=2048&iar=0&w=1366&hash=6D1C5C7EAFD0EEAF132F651D54E84F1C) ### Leigh Ann Moffett ##### Senior Associate Vice President, Chief Risk & Compliance Officer 214-768-4047 leighannm@smu.edu ![](/-/media/site/businessfinance...\n\n### David S. Huntley \u201980\n\n[Skip to main content](#main-content) # David S. Huntley \u201980 ## [2025](/alumni/events/distinguished-alumni-awards/recipients/2025) ![](/-/media/site/alumni/events/distinguished-alumni-awards/2025/david-huntley_temp.jpg) *Values-centered trailblazer mobilizing ethical changemakers* When Huntley arrived on the Hilltop in 1976, he quickly became involved on campus. A political science major, he served on Student Sena...\n\n### DART GoPass App\n\n[Skip to main content](#main-content) # DART GoPass App ## [Dallas Area Rapid Transportation (DART)](/businessfinance/campusservices/parkingandidcardservices/transportation/dart) ![DART GoPass logo](/-/media/site/businessfinance/campus-services/parkingandcardservices/dart/dart-go-logo.png?h=180&w=180&hash=18BD05960970ED989A9645BF3BA19E5C)With a [DART GoPass](https://gopass.org/ \"DART GoPass\") transit pass, riders...\n\n## Sources\n- `web_8956fd5ecfce638f` - raw_sources/web/web_8956fd5ecfce638f-800f5968bdc8.md\n- `web_e0a2a6a50ca241a0` - raw_sources/web/web_e0a2a6a50ca241a0-8eaf572bff4a.md\n- `web_fc1d10cb780d8f7b` - raw_sources/web/web_fc1d10cb780d8f7b-74db0081b2fe.md\n"
-        }
-      }
-    },
+    "status": "skipped",
+    "mode": "no_local_artifacts",
+    "site_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data/sites/www.smu.edu",
+    "reason": "No local SMU scrape manifest or readable markdown files were found.",
     "manual_prompts": 0
   }
 }

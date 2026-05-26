@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 
 from src.scrape_planner.data_root import resolve_data_root
@@ -43,3 +44,22 @@ def test_unpopulated_worktree_uses_local_data_when_main_has_no_data(tmp_path: Pa
     (worktree_root / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
 
     assert resolve_data_root(worktree_root, {}) == (worktree_root / "data").resolve()
+
+
+def test_app_py_keeps_local_data_root_assignment_for_this_wave() -> None:
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    tree = ast.parse(app_path.read_text(encoding="utf-8"))
+
+    data_root_assign = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "DATA_ROOT" for target in node.targets)
+    )
+
+    assert isinstance(data_root_assign.value, ast.BinOp)
+    assert isinstance(data_root_assign.value.op, ast.Div)
+    assert isinstance(data_root_assign.value.left, ast.Name)
+    assert data_root_assign.value.left.id == "ROOT"
+    assert isinstance(data_root_assign.value.right, ast.Constant)
+    assert data_root_assign.value.right.value == "data"

@@ -4,20 +4,27 @@ import argparse
 import csv
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .site_layout import ensure_layout_for_site_root
+from .source_quality import SourceQualityRecord, assess_source_quality, write_quality_report
 from .source_registry import (
     RegistryMergeResult,
     build_source_row,
     checksum_text,
     merge_registry_rows,
+    read_registry_rows,
     stable_source_id,
     utc_now_iso,
+    write_registry_rows,
 )
 from .storage import read_json, write_json
+
+
+MAX_PDF_RAW_MARKDOWN_CHARS = 20_000
 
 
 @dataclass(frozen=True)
@@ -33,6 +40,8 @@ def normalize_scraped_markdown(site_root: Path, run_root: Path, *, now: str | No
     layout = ensure_layout_for_site_root(site_root)
     manifest = read_json(Path(run_root) / "scrape_manifest.json", [])
     rows: list[dict[str, Any]] = []
+    quality_records: list[SourceQualityRecord] = []
+    seen_checksums: set[str] = set()
 
     for item in manifest if isinstance(manifest, list) else []:
         if not isinstance(item, dict) or str(item.get("status") or "") != "success":
@@ -86,9 +95,62 @@ def normalize_scraped_markdown(site_root: Path, run_root: Path, *, now: str | No
             continue
         source_id = stable_source_id("web", url or str(markdown_path))
         checksum = checksum_text(markdown)
+        quality = assess_source_quality(
+            markdown,
+            source_id=source_id,
+            parser_kind="scrape_worker.markdown",
+            original_path=str(markdown_path),
+            original_url=url,
+            seen_checksums=seen_checksums,
+        )
+        quality_records.append(quality)
+        seen_checksums.add(checksum)
+
+        quality_report_rel = _site_relative(_quality_record_path(layout.site_root, source_id), layout.site_root)
+        if quality.action == "quarantined":
+            diagnostic_path = _write_quality_diagnostic(layout.site_root, quality, now=timestamp)
+            metadata_path = layout.raw_reports_dir / f"{source_id}.metadata.json"
+            write_json(
+                metadata_path,
+                {
+                    "source_kind": "web",
+                    "source_id": source_id,
+                    "status": "failed",
+                    "quality_action": quality.action,
+                    "quality_reasons": quality.reasons,
+                    "normalized_at": timestamp,
+                },
+            )
+            rows.append(
+                build_source_row(
+                    source_id=source_id,
+                    source_kind="web",
+                    title=_extract_markdown_title(markdown, _title_from_identity(url or markdown_path.name)),
+                    original_url=url,
+                    original_path=str(markdown_path),
+                    markdown_path="",
+                    metadata_path=_site_relative(metadata_path, layout.site_root),
+                    checksum=checksum,
+                    parser="scrape_worker.markdown",
+                    status="failed",
+                    now=timestamp,
+                    error_reason=", ".join(quality.reasons) or "Source quarantined by quality gate",
+                    diagnostic_path=_site_relative(diagnostic_path, layout.site_root),
+                    provenance={
+                        "run_root": str(run_root),
+                        "scrape_manifest_path": str(Path(run_root) / "scrape_manifest.json"),
+                        "quality_action": quality.action,
+                        "quality_report_path": quality_report_rel,
+                    },
+                )
+            )
+            continue
+
+        stored_markdown = quality.cleaned_text if quality.action == "cleaned" else markdown
+        checksum = checksum_text(stored_markdown)
         raw_path = layout.raw_web_dir / f"{source_id}-{checksum[:12]}.md"
         metadata_path = layout.raw_web_dir / f"{source_id}-{checksum[:12]}.metadata.json"
-        raw_path.write_text(markdown, encoding="utf-8")
+        raw_path.write_text(stored_markdown, encoding="utf-8")
         write_json(
             metadata_path,
             {
@@ -99,6 +161,11 @@ def normalize_scraped_markdown(site_root: Path, run_root: Path, *, now: str | No
                 "scrape_markdown_path": str(markdown_path),
                 "scrape_metadata_path": str(item.get("metadata_path") or ""),
                 "fetch_mode": str(item.get("fetch_mode") or ""),
+                "quality_action": quality.action,
+                "quality_reasons": quality.reasons,
+                "quality_report_path": quality_report_rel,
+                "original_checksum": quality.checksum,
+                "cleaned": quality.action == "cleaned",
                 "normalized_at": timestamp,
             },
         )
@@ -113,17 +180,20 @@ def normalize_scraped_markdown(site_root: Path, run_root: Path, *, now: str | No
                 metadata_path=_site_relative(metadata_path, layout.site_root),
                 checksum=checksum,
                 parser="scrape_worker.markdown",
-                status="ready",
+                status="needs-review" if quality.action == "needs_review" else "ready",
                 now=timestamp,
+                error_reason=", ".join(quality.reasons) if quality.action == "needs_review" else "",
                 provenance={
                     "run_root": str(run_root),
                     "scrape_manifest_path": str(Path(run_root) / "scrape_manifest.json"),
+                    "quality_action": quality.action,
+                    "quality_report_path": quality_report_rel,
                 },
             )
         )
 
     merge = merge_registry_rows(layout.registry_path, rows, now=timestamp)
-    return _write_report(layout.site_root, "web", merge, rows, timestamp)
+    return _write_report(layout.site_root, "web", merge, rows, timestamp, quality_records=quality_records)
 
 
 def normalize_pdf_pages(site_root: Path, *, now: str | None = None) -> NormalizationReport:
@@ -142,8 +212,7 @@ def normalize_pdf_pages(site_root: Path, *, now: str | None = None) -> Normaliza
                     page_groups.setdefault(source_id, []).append({**item, "_pages_index_path": str(index_path)})
 
     for pdf_source_id, page_rows in sorted(page_groups.items()):
-        normalized = _normalize_pdf_page_group(layout.site_root, pdf_source_id, page_rows, timestamp)
-        rows.append(normalized)
+        rows.extend(_normalize_pdf_page_group(layout.site_root, pdf_source_id, page_rows, timestamp))
 
     rows.extend(
         _normalize_pdf_chunk_fallbacks(
@@ -154,6 +223,11 @@ def normalize_pdf_pages(site_root: Path, *, now: str | None = None) -> Normaliza
         )
     )
 
+    _prune_replaced_pdf_page_rows(
+        layout.registry_path,
+        affected_pdf_source_ids=set(page_groups),
+        incoming_source_ids={str(row.get("source_id") or "") for row in rows},
+    )
     merge = merge_registry_rows(layout.registry_path, rows, now=timestamp)
     return _write_report(layout.site_root, "pdf", merge, rows, timestamp)
 
@@ -291,16 +365,17 @@ def run_normalization_command(
     }
 
 
-def _normalize_pdf_page_group(site_root: Path, pdf_source_id: str, page_rows: list[dict[str, Any]], now: str) -> dict[str, Any]:
+def _normalize_pdf_page_group(site_root: Path, pdf_source_id: str, page_rows: list[dict[str, Any]], now: str) -> list[dict[str, Any]]:
     layout = ensure_layout_for_site_root(site_root)
     source_path = str(next((row.get("source_path") for row in page_rows if row.get("source_path")), ""))
     original_url = _first_text(page_rows, "original_url", "url", "source_url")
     source_identity = _pdf_identity(original_url, source_path, pdf_source_id)
-    source_id = stable_source_id("pdf", source_identity)
     parser_values = sorted({str(row.get("parser") or "") for row in page_rows if row.get("parser")})
     parser = parser_values[0] if len(parser_values) == 1 else ("mixed" if parser_values else "pdf_pages")
-    sections: list[str] = []
-    source_pages: list[dict[str, Any]] = []
+    document_title = Path(source_path).name or pdf_source_id
+    normalized_rows: list[dict[str, Any]] = []
+    page_entries: list[dict[str, Any]] = []
+
     for row in sorted(page_rows, key=lambda item: int(item.get("page_number") or 0)):
         md_path = Path(str(row.get("markdown_path") or ""))
         if not md_path.exists():
@@ -308,62 +383,187 @@ def _normalize_pdf_page_group(site_root: Path, pdf_source_id: str, page_rows: li
         text = md_path.read_text(encoding="utf-8", errors="replace").strip()
         if not text:
             continue
-        page_number = int(row.get("page_number") or 0)
-        sections.append(text)
-        source_pages.append(
+        raw_page_number = int(row.get("page_number") or 0)
+        parts = _split_pdf_markdown_for_raw_sources(text)
+        part_count = len(parts)
+        for part_index, part_text in enumerate(parts, start=1):
+            page_number = raw_page_number if raw_page_number > 0 else part_index
+            section_path = _section_path_from_markdown(part_text)
+            page_tables = _markdown_tables(part_text, page_number=page_number, section_path=section_path)
+            page_entries.append(
+                {
+                    "text": part_text,
+                    "page_number": page_number,
+                    "raw_page_number": raw_page_number,
+                    "part_index": part_index if part_count > 1 else 0,
+                    "part_count": part_count,
+                    "section_path": section_path,
+                    "tables": page_tables,
+                    "source_markdown_path": str(md_path),
+                    "pages_index_path": str(row.get("_pages_index_path") or ""),
+                }
+            )
+
+    if not page_entries:
+        return [
+            _failed_row(
+                layout.site_root,
+                source_kind="pdf",
+                title=document_title,
+                identity=source_identity,
+                original_url=original_url,
+                original_path=source_path,
+                parser=parser,
+                error_reason="No PDF page markdown was readable",
+                now=now,
+                provenance={"pdf_source_id": pdf_source_id},
+            )
+        ]
+
+    document_page_numbers = sorted({int(entry["raw_page_number"] or entry["page_number"] or 0) for entry in page_entries})
+    document_page_count = len(document_page_numbers)
+    for entry in page_entries:
+        page_number = int(entry["page_number"] or 0)
+        raw_page_number = int(entry["raw_page_number"] or 0)
+        part_index = int(entry["part_index"] or 0)
+        part_count = int(entry["part_count"] or 1)
+        page_identity = f"{source_identity}#page={raw_page_number or page_number:04d}"
+        if part_index:
+            page_identity = f"{page_identity}-part={part_index:03d}"
+        source_id = stable_source_id("pdf", page_identity)
+        markdown = str(entry["text"]).strip() + "\n"
+        checksum = checksum_text(markdown)
+        raw_path = layout.raw_pdf_dir / f"{source_id}-{checksum[:12]}.md"
+        metadata_path = layout.raw_pdf_dir / f"{source_id}-{checksum[:12]}.metadata.json"
+        sidecar_path = layout.raw_pdf_dir / f"{source_id}-{checksum[:12]}.tables.json"
+        tables = list(entry["tables"])
+        source_pages = [
             {
                 "page_number": page_number,
-                "markdown_path": str(md_path),
-                "pages_index_path": str(row.get("_pages_index_path") or ""),
+                "page_start": page_number,
+                "page_end": page_number,
+                "raw_page_number": raw_page_number,
+                "part_index": part_index,
+                "part_count": part_count,
+                "section_path": str(entry["section_path"]),
+                "table_ids": [str(table["table_id"]) for table in tables],
+                "char_count": len(markdown),
+                "markdown_path": str(entry["source_markdown_path"]),
+                "pages_index_path": str(entry["pages_index_path"]),
             }
+        ]
+        page_label = f"p. {raw_page_number or page_number}"
+        if part_index:
+            page_label = f"{page_label} part {part_index}"
+        title = f"{document_title} {page_label}"
+        raw_path.write_text(markdown, encoding="utf-8")
+        if tables:
+            write_json(sidecar_path, {"source_id": source_id, "tables": tables, "generated_at": now})
+        write_json(
+            metadata_path,
+            {
+                "source_kind": "pdf",
+                "source_id": source_id,
+                "source_type": "document-page",
+                "pdf_source_id": pdf_source_id,
+                "title": title,
+                "original_url": original_url,
+                "source_path": source_path,
+                "parser": parser,
+                "parser_version": parser,
+                "page_count": 1,
+                "document_page_count": document_page_count,
+                "page_number": page_number,
+                "page_start": page_number,
+                "page_end": page_number,
+                "part_index": part_index,
+                "part_count": part_count,
+                "source_pages": source_pages,
+                "sections": _unique_section_paths(source_pages),
+                "tables": tables,
+                "tables_path": _site_relative(sidecar_path, layout.site_root) if tables else "",
+                "extraction_warnings": [],
+                "document_quality": _document_quality(markdown, source_pages, tables),
+                "normalized_at": now,
+            },
         )
-
-    if not sections:
-        return _failed_row(
-            layout.site_root,
-            source_kind="pdf",
-            title=Path(source_path).name or pdf_source_id,
-            identity=source_identity,
-            original_url=original_url,
-            original_path=source_path,
-            parser=parser,
-            error_reason="No PDF page markdown was readable",
-            now=now,
+        normalized_rows.append(
+            build_source_row(
+                source_id=source_id,
+                source_kind="pdf",
+                title=title,
+                original_url=original_url,
+                original_path=source_path,
+                markdown_path=_site_relative(raw_path, layout.site_root),
+                metadata_path=_site_relative(metadata_path, layout.site_root),
+                checksum=checksum,
+                parser=parser,
+                status="ready",
+                now=now,
+                provenance={
+                    "pdf_source_id": pdf_source_id,
+                    "page_number": page_number,
+                    "raw_page_number": raw_page_number,
+                    "part_index": part_index,
+                    "part_count": part_count,
+                },
+            )
         )
+    return normalized_rows
 
-    markdown = "\n\n---\n\n".join(sections).strip() + "\n"
-    checksum = checksum_text(markdown)
-    raw_path = layout.raw_pdf_dir / f"{source_id}-{checksum[:12]}.md"
-    metadata_path = layout.raw_pdf_dir / f"{source_id}-{checksum[:12]}.metadata.json"
-    raw_path.write_text(markdown, encoding="utf-8")
-    write_json(
-        metadata_path,
-        {
-            "source_kind": "pdf",
-            "source_id": source_id,
-            "pdf_source_id": pdf_source_id,
-            "original_url": original_url,
-            "source_path": source_path,
-            "parser": parser,
-            "page_count": len(source_pages),
-            "source_pages": source_pages,
-            "normalized_at": now,
-        },
-    )
-    return build_source_row(
-        source_id=source_id,
-        source_kind="pdf",
-        title=Path(source_path).name or pdf_source_id,
-        original_url=original_url,
-        original_path=source_path,
-        markdown_path=_site_relative(raw_path, layout.site_root),
-        metadata_path=_site_relative(metadata_path, layout.site_root),
-        checksum=checksum,
-        parser=parser,
-        status="ready",
-        now=now,
-        provenance={"pdf_source_id": pdf_source_id},
-    )
+
+def _split_pdf_markdown_for_raw_sources(text: str) -> list[str]:
+    cleaned = str(text or "").strip()
+    if len(cleaned) <= MAX_PDF_RAW_MARKDOWN_CHARS:
+        return [cleaned] if cleaned else []
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for block in re.split(r"\n{2,}", cleaned):
+        block = block.strip()
+        if not block:
+            continue
+        if len(block) > MAX_PDF_RAW_MARKDOWN_CHARS:
+            if current:
+                chunks.append("\n\n".join(current).strip())
+                current = []
+                current_len = 0
+            for start in range(0, len(block), MAX_PDF_RAW_MARKDOWN_CHARS):
+                chunks.append(block[start : start + MAX_PDF_RAW_MARKDOWN_CHARS].strip())
+            continue
+        projected = current_len + len(block) + (2 if current else 0)
+        if current and projected > MAX_PDF_RAW_MARKDOWN_CHARS:
+            chunks.append("\n\n".join(current).strip())
+            current = [block]
+            current_len = len(block)
+        else:
+            current.append(block)
+            current_len = projected
+    if current:
+        chunks.append("\n\n".join(current).strip())
+    return [chunk for chunk in chunks if chunk]
+
+
+def _prune_replaced_pdf_page_rows(registry_path: Path, *, affected_pdf_source_ids: set[str], incoming_source_ids: set[str]) -> None:
+    if not affected_pdf_source_ids:
+        return
+    rows = read_registry_rows(registry_path)
+    kept: list[dict[str, Any]] = []
+    changed = False
+    for row in rows:
+        provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+        pdf_source_id = str(provenance.get("pdf_source_id") or "")
+        source_id = str(row.get("source_id") or "")
+        if (
+            str(row.get("source_kind") or "") == "pdf"
+            and pdf_source_id in affected_pdf_source_ids
+            and source_id not in incoming_source_ids
+        ):
+            changed = True
+            continue
+        kept.append(row)
+    if changed:
+        write_registry_rows(registry_path, kept)
 
 
 def _normalize_pdf_chunk_fallbacks(
@@ -447,17 +647,39 @@ def _normalize_pdf_chunk_fallbacks(
             checksum = checksum_text(markdown)
             raw_path = layout.raw_pdf_dir / f"{source_id}-{checksum[:12]}.md"
             metadata_path = layout.raw_pdf_dir / f"{source_id}-{checksum[:12]}.metadata.json"
+            source_chunks = _source_chunks_metadata(chunks)
+            tables = [
+                table
+                for chunk in chunks
+                for table in _markdown_tables(
+                    str(chunk.get("text") or ""),
+                    page_number=int(chunk.get("page_number") or 0),
+                    section_path=str(chunk.get("section_path") or ""),
+                )
+            ]
+            sidecar_path = layout.raw_pdf_dir / f"{source_id}-{checksum[:12]}.tables.json"
             raw_path.write_text(markdown, encoding="utf-8")
+            if tables:
+                write_json(sidecar_path, {"source_id": source_id, "tables": tables, "generated_at": now})
             write_json(
                 metadata_path,
                 {
                     "source_kind": "pdf",
                     "source_id": source_id,
+                    "source_type": "document",
                     "pdf_source_id": pdf_source_id,
+                    "title": Path(source_path).name or pdf_source_id,
                     "original_url": original_url,
                     "source_path": source_path,
                     "parser": parser,
+                    "parser_version": parser,
                     "chunk_count": len(chunks),
+                    "source_chunks": source_chunks,
+                    "sections": _unique_section_paths(source_chunks),
+                    "tables": tables,
+                    "tables_path": _site_relative(sidecar_path, layout.site_root) if tables else "",
+                    "extraction_warnings": _pdf_extraction_warnings(source, quarantine, chunks),
+                    "document_quality": _document_quality(markdown, source_chunks, tables),
                     "normalized_at": now,
                 },
             )
@@ -503,6 +725,140 @@ def _pdf_error_reason(quarantine: dict[str, Any], chunks: list[dict[str, Any]]) 
     if chunks:
         return "PDF source produced no usable markdown chunks"
     return "PDF source produced no usable markdown"
+
+
+def _source_chunks_metadata(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in sorted(chunks, key=lambda item: (int(item.get("page_number") or 0), int(item.get("chunk_index") or 0))):
+        page_number = int(row.get("page_number") or 0)
+        text = str(row.get("text") or "")
+        section_path = str(row.get("section_path") or "").strip() or _section_path_from_markdown(text)
+        table_ids = [
+            str(table["table_id"]) for table in _markdown_tables(text, page_number=page_number, section_path=section_path)
+        ]
+        rows.append(
+            {
+                "chunk_id": str(row.get("chunk_id") or ""),
+                "page_number": page_number,
+                "page_start": int(row.get("page_start") or page_number),
+                "page_end": int(row.get("page_end") or page_number),
+                "chunk_index": int(row.get("chunk_index") or 0),
+                "section_path": section_path,
+                "table_ids": table_ids,
+                "char_count": int(row.get("char_count") or len(text)),
+            }
+        )
+    return rows
+
+
+def _section_path_from_markdown(text: str) -> str:
+    headings: list[str] = []
+    for line in text.splitlines():
+        match = re.match(r"^\s{0,3}(#{1,4})\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        level = len(match.group(1))
+        title = re.sub(r"\s+", " ", match.group(2)).strip()
+        headings = headings[: max(0, level - 1)]
+        headings.append(title)
+        if len(headings) >= 3:
+            break
+    return " > ".join(headings)
+
+
+def _markdown_tables(text: str, *, page_number: int, section_path: str) -> list[dict[str, Any]]:
+    tables: list[dict[str, Any]] = []
+    lines = text.splitlines()
+    idx = 0
+    while idx < len(lines) - 1:
+        header = lines[idx].strip()
+        separator = lines[idx + 1].strip()
+        if _is_markdown_table_header(header, separator):
+            table_lines = [header, separator]
+            idx += 2
+            while idx < len(lines) and lines[idx].strip().startswith("|"):
+                table_lines.append(lines[idx].strip())
+                idx += 1
+            table_id = f"p{page_number:04d}-t{len(tables) + 1:03d}"
+            tables.append(
+                {
+                    "table_id": table_id,
+                    "page_number": page_number,
+                    "section_path": section_path,
+                    "row_count": max(0, len(table_lines) - 2),
+                    "markdown": "\n".join(table_lines),
+                }
+            )
+            continue
+        idx += 1
+    return tables
+
+
+def _is_markdown_table_header(header: str, separator: str) -> bool:
+    if not header.startswith("|") or not separator.startswith("|"):
+        return False
+    cells = [cell.strip() for cell in separator.strip("|").split("|")]
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell or "") for cell in cells)
+
+
+def _unique_section_paths(rows: list[dict[str, Any]]) -> list[str]:
+    values: list[str] = []
+    for row in rows:
+        value = str(row.get("section_path") or "").strip()
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _pdf_extraction_warnings(source: dict[str, Any], quarantine: dict[str, Any], chunks: list[dict[str, Any]]) -> list[str]:
+    warnings: list[str] = []
+    for row in [source, quarantine, *chunks]:
+        for key in ("warning", "warnings", "extraction_warning", "extraction_warnings", "detail", "reason"):
+            value = row.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    _append_warning(warnings, str(item))
+            else:
+                _append_warning(warnings, str(value or ""))
+    return warnings
+
+
+def _append_warning(warnings: list[str], value: str) -> None:
+    text = value.strip()
+    if text and text not in warnings:
+        warnings.append(text)
+
+
+def _document_quality(markdown: str, units: list[dict[str, Any]], tables: list[dict[str, Any]]) -> dict[str, Any]:
+    page_numbers = [int(row.get("page_number") or row.get("page_start") or 0) for row in units]
+    page_count = len(set(page_numbers)) if page_numbers else 0
+    char_count = len(markdown)
+    empty_sections = sum(1 for row in units if int(row.get("char_count") or 0) == 0)
+    chars_per_page = round(char_count / page_count, 2) if page_count else 0.0
+    repeated_header_footer = _repeated_header_footer_detected(markdown)
+    warnings: list[str] = []
+    if page_count and chars_per_page < 80:
+        warnings.append("low_chars_per_page")
+    if not tables:
+        warnings.append("no_tables_detected")
+    if repeated_header_footer:
+        warnings.append("repeated_header_footer_detected")
+    return {
+        "page_coverage_count": page_count,
+        "chars_per_page": chars_per_page,
+        "table_count": len(tables),
+        "table_preservation_warnings": [] if tables else ["no_tables_detected"],
+        "ocr_required_pages": [],
+        "repeated_header_footer_detected": repeated_header_footer,
+        "empty_section_count": empty_sections,
+        "warnings": warnings,
+    }
+
+
+def _repeated_header_footer_detected(markdown: str) -> bool:
+    lines = [re.sub(r"\s+", " ", line.strip().lower()) for line in markdown.splitlines() if line.strip()]
+    counts = Counter(lines)
+    return any(count >= 3 and len(line.split()) <= 8 for line, count in counts.items())
 
 
 def _tabular_to_markdown(path: Path) -> tuple[str, dict[str, Any], str]:
@@ -724,14 +1080,25 @@ def _write_report(
     merge: RegistryMergeResult,
     attempted_rows: list[dict[str, Any]],
     now: str,
+    *,
+    quality_records: list[SourceQualityRecord] | None = None,
 ) -> NormalizationReport:
     layout = ensure_layout_for_site_root(site_root)
     report_path = layout.raw_reports_dir / f"normalization-{source_kind}-{_safe_timestamp(now)}.json"
+    quality_report_path = ""
+    quality_summary: dict[str, Any] = {}
+    if quality_records is not None:
+        quality_report_file = _quality_report_path(layout.site_root, now)
+        quality_report = write_quality_report(quality_report_file, generated_at=now, records=quality_records)
+        quality_report_path = str(quality_report_file)
+        quality_summary = quality_report.get("summary", {})
     report = {
         "source_kind": source_kind,
         "generated_at": now,
         "registry_path": str(layout.registry_path),
         "counts": merge.counts,
+        "quality_report_path": quality_report_path,
+        "quality_summary": quality_summary,
         "attempted_source_ids": [str(row.get("source_id") or "") for row in attempted_rows],
         "sources": attempted_rows,
     }
@@ -742,6 +1109,38 @@ def _write_report(
         report_path=str(report_path),
         sources=attempted_rows,
     )
+
+
+def _quality_report_path(site_root: Path, now: str) -> Path:
+    layout = ensure_layout_for_site_root(site_root)
+    return layout.raw_reports_dir / f"source-quality-{_safe_timestamp(now)}.json"
+
+
+def _quality_record_path(site_root: Path, source_id: str) -> Path:
+    layout = ensure_layout_for_site_root(site_root)
+    return layout.raw_reports_dir / f"{source_id}.quality.json"
+
+
+def _write_quality_diagnostic(site_root: Path, quality: SourceQualityRecord, *, now: str) -> Path:
+    diagnostic_path = _write_diagnostic(
+        site_root,
+        source_kind="web",
+        source_id=quality.source_id,
+        original_url=quality.original_url,
+        original_path=quality.original_path,
+        parser=quality.parser_kind,
+        error_reason=", ".join(quality.reasons) or "Source quarantined by quality gate",
+        now=now,
+        metadata={
+            "quality": quality.to_dict(),
+            "recommended_parser_route": quality.recommended_parser_route,
+        },
+    )
+    _quality_record_path(site_root, quality.source_id).write_text(
+        json.dumps(quality.to_dict(), ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return diagnostic_path
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

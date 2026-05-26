@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -82,33 +80,30 @@ def test_docling_happy_path_chunks_deterministically(tmp_path: Path, monkeypatch
     assert [c.chunk_id for c in r1.chunks] == [c.chunk_id for c in r2.chunks]
 
 
-def test_docling_page_count_is_preserved_for_document_level_chunks(
+def test_docling_page_count_is_preserved_for_page_level_chunks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pdf_path = tmp_path / "multi.pdf"
     pdf_path.write_bytes(b"%PDF-1.7\n")
 
-    class FakeDocument:
-        pages = {1: object(), 2: object()}
-
-        def export_to_markdown(self) -> str:
-            return "# Catalog\n\n" + "Admissions requirements and tuition information for students. " * 4
-
-    class FakeConverter:
-        def convert(self, _path: str) -> object:
-            return types.SimpleNamespace(document=FakeDocument())
-
-    docling_module = types.ModuleType("docling")
-    converter_module = types.ModuleType("docling.document_converter")
-    converter_module.DocumentConverter = FakeConverter
-    monkeypatch.setitem(sys.modules, "docling", docling_module)
-    monkeypatch.setitem(sys.modules, "docling.document_converter", converter_module)
+    monkeypatch.setattr(
+        "src.scrape_planner.pdf_ingest._parse_pdf_with_docling",
+        lambda _path: ParsedPdf(
+            "# Catalog\n\n" + "Admissions requirements and tuition information for students. " * 4,
+            2,
+            "docling",
+            [
+                (1, "# Catalog Page 1\n\n" + "Admissions requirements and tuition information for students. " * 3),
+                (2, "# Catalog Page 2\n\n" + "Admissions requirements and tuition information for students. " * 3),
+            ],
+        ),
+    )
 
     result = ingest_pdfs([pdf_path], PdfIngestConfig(min_meaningful_chars=20))
 
     assert result.quarantine == []
     assert result.sources[0].page_count == 2
-    assert {chunk.page_number for chunk in result.chunks} == {0}
+    assert {chunk.page_number for chunk in result.chunks} == {1, 2}
 
 
 def test_missing_docling_raises_setup_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
