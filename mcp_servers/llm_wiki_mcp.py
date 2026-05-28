@@ -34,7 +34,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
 from src.scrape_planner.llm_wiki_index import (  # noqa: E402
     generate_mcp_config_snippet,
     index_info as _index_info,
-    query_llm_wiki_index,
+    query_mcp_wiki_index,
     search_source_index,
 )
 
@@ -170,8 +170,8 @@ def _response_from_query(payload: dict[str, Any]) -> dict[str, Any]:
 
 @mcp.tool()
 def query_wiki(question: str, max_results: int = 5) -> dict[str, Any]:
-    """Return reranked wiki/raw evidence for a question from existing local indexes."""
-    return _response_from_query(query_llm_wiki_index(SITE_ROOT, question, max_evidence=max_results))
+    """Auto-route MCP questions: factual questions try wiki BM25 first; reasoning questions use vector search."""
+    return _response_from_query(query_mcp_wiki_index(SITE_ROOT, question, max_evidence=max_results))
 
 
 @mcp.tool()
@@ -190,7 +190,13 @@ def get_wiki_page(path: str) -> dict[str, Any]:
     wiki_root = (SITE_ROOT / "wiki").resolve()
     pages_root = (wiki_root / "pages").resolve()
     allowed_index = target == wiki_root / "index.md"
-    allowed_page = target.parent == pages_root and target.suffix == ".md"
+    allowed_page = False
+    if target.suffix == ".md":
+        try:
+            target.relative_to(pages_root)
+            allowed_page = True
+        except ValueError:
+            allowed_page = False
     if not allowed_index and not allowed_page:
         return {"ok": False, "error": "path_outside_allowed_subtree", "path": path}
     if not target.exists() or not target.is_file():

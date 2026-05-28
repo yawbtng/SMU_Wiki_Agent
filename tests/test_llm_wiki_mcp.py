@@ -48,6 +48,14 @@ def test_mcp_tool_handlers_query_index_and_block_path_traversal(tmp_path: Path, 
     assert page["path"] == "wiki/pages/admissions.md"
     assert "February 1" in page["markdown"]
 
+    nested_dir = site_root / "wiki" / "pages" / "schools" / "cox"
+    nested_dir.mkdir(parents=True, exist_ok=True)
+    (nested_dir / "graduate.md").write_text("# Cox Graduate\n", encoding="utf-8")
+    nested_page = server.get_wiki_page("wiki/pages/schools/cox/graduate.md")
+    assert nested_page["ok"] is True
+    assert nested_page["path"] == "wiki/pages/schools/cox/graduate.md"
+    assert "Cox Graduate" in nested_page["markdown"]
+
     (site_root / "wiki" / "log.md").write_text("# Build Log\n", encoding="utf-8")
     log_page = server.get_wiki_page("wiki/log.md")
     assert log_page["ok"] is False
