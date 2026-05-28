@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .storage import read_json
+from .wiki_common import INTEGRATED_STATES
 
 FUTURE_MCP_MODULE = "mcp_servers.llm_wiki_mcp"
 
@@ -125,13 +126,13 @@ def load_wiki_status(layout, raw_status: dict) -> dict:
         [
             row
             for row in ready_rows
-            if str(row.get("wiki_status") or "").lower() in {"integrated", "complete", "done"}
+            if str(row.get("wiki_status") or "").lower() in INTEGRATED_STATES
         ]
     )
     pending_rows = [
         row
         for row in ready_rows
-        if str(row.get("wiki_status") or "").lower() not in {"integrated", "complete", "done"}
+        if str(row.get("wiki_status") or "").lower() not in INTEGRATED_STATES
         or str(row.get("change_state") or "").lower() == "changed"
     ]
     pending_by_kind = Counter(str(row.get("source_kind") or "unknown") for row in pending_rows)
@@ -141,6 +142,7 @@ def load_wiki_status(layout, raw_status: dict) -> dict:
     return {
         "tmux_session": str(report.get("tmux_session") or report.get("tmux_session_name") or f"llm-wiki-{layout.site_root.name}"),
         "log_path": str(report.get("log_path") or layout.wiki_dir / "log.md"),
+        "runtime": str(report.get("runtime") or "python"),
         "job_status": str(report.get("status") or report.get("job_status") or ("ready" if report else "not started")),
         "last_progress": str(report.get("last_progress") or report.get("updated_at") or report.get("generated_at") or ""),
         "pages_created": pages_created,

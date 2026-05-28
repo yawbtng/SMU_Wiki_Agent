@@ -13,6 +13,13 @@ from .site_layout import ensure_layout_for_site_root
 from .source_registry import checksum_file, checksum_text, read_registry_rows, utc_now_iso, write_registry_rows
 from .storage import write_json
 from .tmux_runner import TmuxRunner
+from .wiki_common import (
+    INTEGRATED_STATES,
+    parse_markdown_frontmatter,
+    session_timestamp_slug,
+    site_relative,
+    timestamp_slug,
+)
 
 
 DEFAULT_TOPIC_PATTERNS = {
@@ -25,7 +32,35 @@ DEFAULT_TOPIC_PATTERNS = {
     "Registrar Wiki": ["registrar", "calendar", "transcript", "enrollment", "course catalog", "academic records"],
 }
 
-INTEGRATED_STATES = {"integrated", "complete", "done"}
+SCHOOL_ENTITY_PATTERNS = {
+    "cox-school-of-business": ("cox school of business", "cox school", "smu cox", "business school"),
+    "dedman-college": ("dedman college", "dedman college of humanities", "dedman college of humanities and sciences"),
+    "lyle-school-of-engineering": ("lyle school of engineering", "smu lyle", "engineering school"),
+    "meadows-school-of-the-arts": ("meadows school", "meadows school of the arts"),
+    "simmons-school-of-education": ("simmons school", "simmons school of education"),
+    "perkins-school-of-theology": ("perkins school", "perkins school of theology"),
+    "dedman-school-of-law": ("dedman school of law", "smu law", "law school"),
+}
+
+DEPARTMENT_ENTITY_PATTERNS = {
+    "computer-science": ("computer science department", "department of computer science", "computer science"),
+    "finance": ("finance department", "department of finance", "finance"),
+    "accounting": ("accounting department", "department of accounting", "accounting"),
+    "management": ("management department", "department of management", "management"),
+    "marketing": ("marketing department", "department of marketing", "marketing"),
+    "business-analytics": ("business analytics", "analytics department"),
+    "data-science": ("data science", "department of statistics and data science"),
+}
+
+OFFICE_ENTITY_PATTERNS = {
+    "admissions": ("admission office", "office of admission", "admissions office", "graduate admissions", "undergraduate admission"),
+    "registrar": ("registrar", "office of the registrar", "academic records"),
+    "financial-aid": ("financial aid", "office of financial aid", "scholarships and financial aid"),
+    "student-accounts": ("student accounts", "bursar", "billing", "payment plan"),
+    "student-services": ("student services", "student affairs"),
+    "international-student-office": ("international student", "international student office", "isss"),
+}
+
 UNCERTAIN_PATTERNS = ("conflict", "conflicting", "uncertain", "unclear", "unknown", "maybe", "possibly")
 
 
@@ -76,8 +111,15 @@ def build_wiki(
     page_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     review_items: list[dict[str, str]] = []
     failed_source_ids: list[str] = []
+    excluded_source_ids: list[str] = []
+    exclusion_reasons: dict[str, str] = {}
 
-    for row in candidates:
+    total_candidates = len(candidates)
+    if no_input and total_candidates:
+        _emit_progress(f"classify sources 0/{total_candidates}")
+    for idx, row in enumerate(candidates, start=1):
+        if no_input and (idx == 1 or idx % 250 == 0 or idx == total_candidates):
+            _emit_progress(f"classify sources {idx}/{total_candidates}")
         source_issue = _source_text_issue(layout.site_root, row)
         if source_issue:
             source_id = str(row.get("source_id") or "")
@@ -91,7 +133,21 @@ def build_wiki(
                 }
             )
             continue
-        text = _read_source_text(layout.site_root, row)
+        text = _clean_source_text_for_wiki(_read_source_text(layout.site_root, row))
+        exclusion_reason = _source_exclusion_reason(row, text)
+        if exclusion_reason:
+            source_id = str(row.get("source_id") or "")
+            _append_unique(excluded_source_ids, source_id)
+            exclusion_reasons[source_id] = exclusion_reason
+            review_items.append(
+                {
+                    "source_id": source_id,
+                    "title": str(row.get("title") or "Untitled source"),
+                    "path": str(row.get("markdown_path") or ""),
+                    "reason": f"Excluded from student wiki: {exclusion_reason}",
+                }
+            )
+            continue
         category = _category_for(row, text)
         page_groups[category].append({**row, "_source_text": text})
         reason = _review_reason(row, text)
@@ -111,18 +167,61 @@ def build_wiki(
     page_paths_by_source: dict[str, str] = {}
 
     if not no_op:
+        total_pages_to_write = len(page_groups) + sum(len(group_rows) for group_rows in page_groups.values())
+        written_pages = 0
+        if no_input and total_pages_to_write:
+            _emit_progress(f"write markdown pages 0/{total_pages_to_write}")
         for category, group_rows in sorted(page_groups.items()):
-            page_path = pages_dir / f"{_slugify(category)}.md"
+            category_slug = _slugify(category)
+            page_path = pages_dir / f"{category_slug}.md"
             existed = page_path.exists()
             page_text, entry = _render_page(category, group_rows, timestamp, layout.site_root, page_path)
             page_path.write_text(page_text, encoding="utf-8")
             page_entries.append(entry)
+            written_pages += 1
+            if no_input and (written_pages == 1 or written_pages % 250 == 0 or written_pages == total_pages_to_write):
+                _emit_progress(f"write markdown pages {written_pages}/{total_pages_to_write}")
             if existed:
                 updated_pages += 1
             else:
                 created_pages += 1
+            source_pages_dir = pages_dir / category_slug
+            source_pages_dir.mkdir(parents=True, exist_ok=True)
+            used_source_slugs: set[str] = set()
             for row in group_rows:
-                page_paths_by_source[str(row.get("source_id") or "")] = _site_relative(page_path, layout.site_root)
+                source_slug = _source_page_slug(row, used_source_slugs)
+                source_page_path = source_pages_dir / f"{source_slug}.md"
+                source_existed = source_page_path.exists()
+                source_page_text, source_entry = _render_source_page(
+                    category,
+                    row,
+                    timestamp,
+                    layout.site_root,
+                    source_page_path,
+                    category_page_path=_site_relative(page_path, layout.site_root),
+                )
+                source_page_path.write_text(source_page_text, encoding="utf-8")
+                page_entries.append(source_entry)
+                written_pages += 1
+                if no_input and (written_pages == 1 or written_pages % 250 == 0 or written_pages == total_pages_to_write):
+                    _emit_progress(f"write markdown pages {written_pages}/{total_pages_to_write}")
+                if source_existed:
+                    updated_pages += 1
+                else:
+                    created_pages += 1
+                page_paths_by_source[str(row.get("source_id") or "")] = _site_relative(source_page_path, layout.site_root)
+
+        semantic_entries, semantic_created, semantic_updated = _write_semantic_pages(
+            wiki_root,
+            page_groups,
+            timestamp,
+            layout.site_root,
+        )
+        if no_input and semantic_entries:
+            _emit_progress(f"write semantic pages {len(semantic_entries)}")
+        page_entries.extend(semantic_entries)
+        created_pages += semantic_created
+        updated_pages += semantic_updated
 
         _write_index(wiki_root / "index.md", page_entries, timestamp)
         _write_routing_pages(wiki_root, page_entries, timestamp)
@@ -139,6 +238,11 @@ def build_wiki(
                 row["wiki_integrated_at"] = timestamp
                 row["wiki_page_paths"] = [page_paths_by_source[source_id]]
                 integrated_sources += 1
+            elif source_id in exclusion_reasons:
+                row["wiki_status"] = "excluded"
+                row["wiki_excluded_at"] = timestamp
+                row["wiki_exclusion_reason"] = exclusion_reasons[source_id]
+                row["wiki_page_paths"] = []
         write_registry_rows(registry, rows)
     else:
         integrated_sources = len(
@@ -158,6 +262,7 @@ def build_wiki(
     report = {
         "status": "complete",
         "job_status": "complete",
+        "runtime": "python",
         "site_root": str(layout.site_root),
         "registry_path": str(registry),
         "wiki_dir": str(wiki_root),
@@ -182,7 +287,11 @@ def build_wiki(
         "updated_pages": updated_pages,
         "integrated_sources": integrated_sources,
         "failed_source_ids": failed_source_ids,
+        "excluded_source_ids": excluded_source_ids,
+        "excluded_source_count": len(excluded_source_ids),
+        "exclusion_reasons": exclusion_reasons,
         "review_queue_count": len(review_items),
+        "semantic_page_count": len([entry for entry in page_entries if entry.get("page_type") == "semantic"]),
         "pages": page_entries,
         "required_markdown_paths": [
             "wiki/index.md",
@@ -191,12 +300,23 @@ def build_wiki(
             "wiki/routing/topics.md",
             "wiki/source-notes/index.md",
             "wiki/review_queue.md",
+            "wiki/pages/schools/cox.md",
+            "wiki/pages/schools/cox/graduate.md",
+            "wiki/pages/schools/cox/admissions.md",
+            "wiki/pages/schools/cox/courses.md",
+            "wiki/pages/schools/cox/costs-and-aid.md",
         ],
     }
     if no_op:
         _append_noop_log(wiki_root / "log.md", report, timestamp)
     else:
         _append_build_log(wiki_root / "log.md", report, page_entries, timestamp)
+    if no_input:
+        _emit_progress(
+            f"complete status={report['status']} no_op={report['no_op']} "
+            f"sources={report['sources_considered']} pages_created={report['pages_created']} "
+            f"pages_updated={report['pages_updated']} integrated={report['integrated_sources']}"
+        )
     write_json(destination, report)
     if destination.name != "wiki-build-latest.json":
         write_json(reports_dir / "wiki-build-latest.json", {**report, "report_path": str(reports_dir / "wiki-build-latest.json")})
@@ -233,7 +353,7 @@ def lint_wiki(
     missing_index_entries: list[str] = []
     stale_source_checksums: list[str] = []
 
-    for page_path in sorted((wiki_root / "pages").glob("*.md")) if (wiki_root / "pages").exists() else []:
+    for page_path in _iter_wiki_page_paths(wiki_root):
         rel_page = _site_relative(page_path, layout.site_root)
         text = page_path.read_text(encoding="utf-8", errors="replace")
         metadata = _parse_frontmatter(text)
@@ -253,7 +373,7 @@ def lint_wiki(
 
     review_items = _parse_review_queue_items(wiki_root / "review_queue.md")
     represented_review_source_ids = {item["source_id"] for item in review_items if item.get("source_id")}
-    for page_path in sorted((wiki_root / "pages").glob("*.md")) if (wiki_root / "pages").exists() else []:
+    for page_path in _iter_wiki_page_paths(wiki_root):
         for item in _page_contradiction_items(page_path, layout.site_root, represented_review_source_ids):
             review_items.append(item)
             if item.get("source_id"):
@@ -284,6 +404,13 @@ def lint_wiki(
     return report
 
 
+def _iter_wiki_page_paths(wiki_root: Path) -> list[Path]:
+    pages_root = wiki_root / "pages"
+    if not pages_root.exists():
+        return []
+    return sorted(path for path in pages_root.rglob("*.md") if path.is_file())
+
+
 def launch_wiki_builder(
     site_root: Path,
     *,
@@ -298,6 +425,10 @@ def launch_wiki_builder(
     tmux = runner or TmuxRunner()
     name = session_name or _default_session_name(layout.site_root.name, tmux)
     report_path = layout.wiki_dir / "reports" / "wiki-build-latest.json"
+    normalized_runtime = _normalize_wiki_runtime(runtime)
+    if normalized_runtime != "python":
+        return {"ok": False, "error": f"Unsupported wiki builder runtime: {runtime}", "runtime": str(runtime)}
+
     python_command_parts = [
         python_executable or sys.executable,
         "-m",
@@ -321,43 +452,44 @@ def launch_wiki_builder(
     python_command = " ".join(shlex.quote(part) for part in python_command_parts)
 
     command = python_command
+
     result = tmux.start(name, command, str(_repo_root()))
     if result.get("ok"):
         timestamp = utc_now_iso()
-        write_json(
-            report_path,
-            {
-                "status": "running",
-                "job_status": "running",
-                "site_root": str(layout.site_root),
-                "registry_path": str(layout.registry_path),
-                "wiki_dir": str(layout.wiki_dir),
-                "index_path": str(layout.wiki_dir / "index.md"),
-                "log_path": str(layout.wiki_dir / "log.md"),
-                "review_queue_path": str(layout.wiki_dir / "review_queue.md"),
-                "report_path": str(report_path),
-                "generated_at": timestamp,
-                "updated_at": timestamp,
-                "last_progress": "Launch requested",
-                "tmux_session": name,
-                "no_input": True,
-                "resume": bool(resume),
-                "rebuild": bool(rebuild),
-                "no_op": False,
-                "sources_considered": 0,
-                "processed_source_ids": [],
-                "skipped_source_ids": [],
-                "resume_source_ids": [],
-                "pages_created": 0,
-                "created_pages": 0,
-                "pages_updated": 0,
-                "updated_pages": 0,
-                "integrated_sources": 0,
-                "failed_source_ids": [],
-                "review_queue_count": 0,
-                "pages": [],
-            },
-        )
+        launch_report = {
+            "status": "running",
+            "job_status": "running",
+            "runtime": normalized_runtime,
+            "site_root": str(layout.site_root),
+            "registry_path": str(layout.registry_path),
+            "wiki_dir": str(layout.wiki_dir),
+            "index_path": str(layout.wiki_dir / "index.md"),
+            "log_path": str(layout.wiki_dir / "log.md"),
+            "review_queue_path": str(layout.wiki_dir / "review_queue.md"),
+            "report_path": str(report_path),
+            "generated_at": timestamp,
+            "updated_at": timestamp,
+            "last_progress": "Launch requested",
+            "tmux_session": name,
+            "no_input": True,
+            "resume": bool(resume),
+            "rebuild": bool(rebuild),
+            "no_op": False,
+            "sources_considered": 0,
+            "processed_source_ids": [],
+            "skipped_source_ids": [],
+            "resume_source_ids": [],
+            "pages_created": 0,
+            "created_pages": 0,
+            "pages_updated": 0,
+            "updated_pages": 0,
+            "integrated_sources": 0,
+            "failed_source_ids": [],
+            "review_queue_count": 0,
+            "pages": [],
+            "builder_command": command,
+        }
+        write_json(report_path, launch_report)
     return {
         **result,
         "session_name": name,
@@ -366,8 +498,16 @@ def launch_wiki_builder(
         "wiki_dir": str(layout.wiki_dir),
         "report_path": str(report_path),
         "builder_command": command,
-        "runtime": "python",
+        "python_builder_command": python_command,
+        "runtime": normalized_runtime,
     }
+
+
+def _normalize_wiki_runtime(runtime: str) -> str:
+    value = str(runtime or "python").strip().lower().replace("_", "-")
+    if value in {"", "deterministic"}:
+        return "python"
+    return value
 
 
 def _should_process(row: dict[str, Any], site_root: Path, *, rebuild: bool) -> bool:
@@ -394,6 +534,10 @@ def _default_session_name(site_name: str, runner: TmuxRunner) -> str:
         name = f"{base}-{suffix}"
         suffix += 1
     return name
+
+
+def _emit_progress(message: str) -> None:
+    print(f"[llm-wiki] {message}", file=sys.stderr, flush=True)
 
 
 def _remove_generated_pages(wiki_root: Path) -> None:
@@ -468,6 +612,53 @@ def _append_unique(values: list[str], value: str) -> None:
 def _read_source_text(site_root: Path, row: dict[str, Any]) -> str:
     path = site_root / str(row.get("markdown_path") or "")
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _clean_source_text_for_wiki(text: str) -> str:
+    cleaned = str(text or "")
+    footer_match = re.search(r"(?im)^##\s+Cox School of Business\s*$", cleaned)
+    if footer_match and "### Follow us" in cleaned[footer_match.start() :]:
+        cleaned = cleaned[: footer_match.start()].rstrip()
+    removable_headings = {
+        "Follow us",
+        "About",
+        "Degrees & Programs",
+        "Faculty & Research",
+        "AI @ Cox",
+        "Apply",
+        "Did you know?",
+        "Search Submit",
+        "Popular Searches",
+    }
+    social_lines = {"Facebook", "Instagram", "LinkedIn", "X", "TikTok", "YouTube"}
+    output: list[str] = []
+    skipping = False
+    for line in cleaned.splitlines():
+        heading = line.strip().lstrip("#").strip()
+        if line.lstrip().startswith("#"):
+            skipping = heading in removable_headings
+            if skipping:
+                continue
+        if skipping:
+            continue
+        if line.strip() in social_lines:
+            continue
+        output.append(line)
+    return "\n".join(output).strip()
+
+
+def _source_exclusion_reason(row: dict[str, Any], text: str) -> str:
+    title = str(row.get("title") or "").lower().replace("-", " ")
+    lower = str(text or "").lower()
+    if "previous winners" in lower and "company name" in lower and "city" in lower:
+        return "award/company listing, not student guidance"
+    if "previous winners" in title:
+        return "award archive, not student guidance"
+    if title in {"facebook", "instagram", "linkedin", "youtube", "x", "tiktok"}:
+        return "social media/navigation page"
+    if title in {"authentication redirect", "search", "apply"} and len(lower) < 800:
+        return "navigation/redirect page"
+    return ""
 
 
 def _source_text_issue(site_root: Path, row: dict[str, Any]) -> str:
@@ -588,6 +779,9 @@ def _render_page(
             "aliases": route["aliases"],
             "source_priority": route["source_priority"],
             "canonical_owner": route["canonical_owner"],
+            "schools": route["schools"],
+            "departments": route["departments"],
+            "offices": route["offices"],
             "updated_at": timestamp,
         }
     )
@@ -611,8 +805,564 @@ def _render_page(
             "aliases": route["aliases"],
             "source_priority": route["source_priority"],
             "canonical_owner": route["canonical_owner"],
+            "schools": route["schools"],
+            "departments": route["departments"],
+            "offices": route["offices"],
         },
     )
+
+
+def _write_semantic_pages(
+    wiki_root: Path,
+    page_groups: dict[str, list[dict[str, Any]]],
+    timestamp: str,
+    site_root: Path,
+) -> tuple[list[dict[str, Any]], int, int]:
+    rows = [row for group_rows in page_groups.values() for row in group_rows]
+    cox_rows = [row for row in rows if _is_cox_related(row)]
+    if not cox_rows:
+        return [], 0, 0
+
+    page_specs = [
+        {
+            "path": wiki_root / "pages" / "schools" / "cox.md",
+            "title": "Cox School of Business",
+            "topic": "overview",
+            "rows": cox_rows,
+            "summary": "Start here for Cox School of Business graduate programs, admissions, curriculum, costs, and student support.",
+            "related": [
+                "wiki/pages/schools/cox/graduate.md",
+                "wiki/pages/schools/cox/admissions.md",
+                "wiki/pages/schools/cox/courses.md",
+                "wiki/pages/schools/cox/costs-and-aid.md",
+            ],
+        },
+        {
+            "path": wiki_root / "pages" / "schools" / "cox" / "graduate.md",
+            "title": "Cox Graduate Student Guide",
+            "topic": "graduate",
+            "rows": _semantic_rows(cox_rows, ("graduate", "mba", "master", "m.s.", "ms ", "admission", "tuition", "course")),
+            "summary": "For prospective or new Cox graduate students, this page connects programs, courses, costs, admissions, and next steps.",
+            "related": [
+                "wiki/pages/schools/cox/admissions.md",
+                "wiki/pages/schools/cox/courses.md",
+                "wiki/pages/schools/cox/costs-and-aid.md",
+            ],
+        },
+        {
+            "path": wiki_root / "pages" / "schools" / "cox" / "admissions.md",
+            "title": "Cox Graduate Admissions",
+            "topic": "admissions",
+            "rows": _semantic_rows(cox_rows, ("admission", "apply", "application", "deadline", "requirement", "gmat", "gre", "transcript")),
+            "summary": "Cox admissions pages and catalog sources for application process, requirements, deadlines, and applicant next steps.",
+            "related": ["wiki/pages/schools/cox/graduate.md", "wiki/pages/schools/cox/costs-and-aid.md"],
+        },
+        {
+            "path": wiki_root / "pages" / "schools" / "cox" / "courses.md",
+            "title": "Cox Courses And Curriculum",
+            "topic": "courses",
+            "rows": _semantic_rows(cox_rows, ("course", "curriculum", "credit", "elective", "degree requirement", "class")),
+            "summary": "Cox curriculum and course evidence, including MBA, specialized master's, certificate, and catalog course details where available.",
+            "related": ["wiki/pages/schools/cox/graduate.md", "wiki/pages/schools/cox/admissions.md"],
+        },
+        {
+            "path": wiki_root / "pages" / "schools" / "cox" / "costs-and-aid.md",
+            "title": "Cox Costs, Fees, And Aid",
+            "topic": "costs",
+            "rows": _semantic_rows(cox_rows, ("tuition", "fee", "cost", "scholarship", "aid", "financial")),
+            "summary": "Cox tuition, fee, scholarship, and aid evidence for graduate applicants and students.",
+            "related": ["wiki/pages/schools/cox/graduate.md", "wiki/pages/schools/cox/admissions.md"],
+        },
+    ]
+
+    entries: list[dict[str, Any]] = []
+    created = 0
+    updated = 0
+    for spec in page_specs:
+        spec_rows = list(spec["rows"] or cox_rows)
+        spec_rows = _dedupe_semantic_rows(spec_rows)[:80]
+        path = Path(spec["path"])
+        existed = path.exists()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        page_text, entry = _render_semantic_page(
+            title=str(spec["title"]),
+            topic=str(spec["topic"]),
+            summary=str(spec["summary"]),
+            rows=spec_rows,
+            related_pages=[str(value) for value in spec["related"]],
+            timestamp=timestamp,
+            site_root=site_root,
+            page_path=path,
+        )
+        path.write_text(page_text, encoding="utf-8")
+        entries.append(entry)
+        if existed:
+            updated += 1
+        else:
+            created += 1
+    return entries, created, updated
+
+
+def _is_cox_related(row: dict[str, Any]) -> bool:
+    return _cox_relevance_score(row) >= 3.0
+
+
+def _cox_relevance_score(row: dict[str, Any], topic_needles: tuple[str, ...] = ()) -> float:
+    title_path = f"{row.get('title', '')}\n{row.get('markdown_path', '')}".lower()
+    text = _safe_semantic_text(str(row.get("_source_text") or "")).lower()
+    score = 0.0
+    title_terms = (
+        "cox",
+        "mba",
+        "business-analytics",
+        "business analytics",
+        "ms-business",
+        "ms accounting",
+        "ms-finance",
+        "ms finance",
+        "executive-mba",
+        "online-mba",
+        "school-of-business",
+    )
+    title = str(row.get("title") or "").lower()
+    for term in title_terms:
+        if term in title_path:
+            score += 5.0
+    landing_titles = {
+        "online-mba",
+        "executive-mba",
+        "two-year-mba",
+        "one-year-mba",
+        "professional-mba",
+        "mba-programs",
+        "all-mba-programs",
+        "mba-programs-at-cox",
+        "ms-business-analytics",
+        "ms-finance",
+        "ms-accounting",
+        "ms-management",
+        "emba-admissions-process-criteria",
+        "online-mba-financial-aid-guide",
+        "cox-mba-advantage",
+        "cox-school",
+    }
+    if title in landing_titles:
+        score += 8.0
+    text_terms = (
+        "cox school of business",
+        "cox graduate",
+        "cox mba",
+        "cox online mba",
+        "cox school",
+        "business school",
+        "master of business administration",
+    )
+    for term in text_terms:
+        if term in text:
+            score += 1.5
+    for needle in topic_needles:
+        if needle in title_path:
+            score += 3.0
+        elif needle in text:
+            score += 0.75
+    low_value_title_terms = (
+        "class-notes",
+        "distinguished-alumni",
+        "memories",
+        "magazine",
+        "commencement",
+        "celebrates",
+        "honors",
+        "families",
+    )
+    if any(term in title_path for term in low_value_title_terms):
+        score -= 3.0
+    if re.match(r"^20\d\d-", title):
+        score -= 5.0
+    return score
+
+
+def _semantic_rows(rows: list[dict[str, Any]], needles: tuple[str, ...]) -> list[dict[str, Any]]:
+    scored = [(_cox_relevance_score(row, needles), row) for row in rows]
+    selected = [row for score, row in sorted(scored, key=lambda item: (-item[0], str(item[1].get("title") or ""))) if score >= 3.0]
+    return selected or rows
+
+
+def _dedupe_semantic_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    unique = []
+    for row in sorted(rows, key=lambda item: (-_cox_relevance_score(item), str(item.get("title") or ""))):
+        source_id = str(row.get("source_id") or "")
+        if source_id and source_id not in seen:
+            seen.add(source_id)
+            unique.append(row)
+    return unique
+
+
+def _render_semantic_page(
+    *,
+    title: str,
+    topic: str,
+    summary: str,
+    rows: list[dict[str, Any]],
+    related_pages: list[str],
+    timestamp: str,
+    site_root: Path,
+    page_path: Path,
+) -> tuple[str, dict[str, Any]]:
+    rel_page = _site_relative(page_path, site_root)
+    source_ids = [str(row.get("source_id") or "") for row in rows if str(row.get("source_id") or "")]
+    source_paths = [str(row.get("markdown_path") or "") for row in rows if str(row.get("markdown_path") or "")]
+    tags = ["cox", "business", "graduate", topic]
+    entities = _infer_institution_entities(
+        "\n".join(f"{row.get('title', '')}\n{row.get('_source_text', '')}" for row in rows)
+    )
+    content_lines = [
+        f"# {title}",
+        "",
+        "## Fast Answer",
+        "",
+        summary,
+        "",
+        *_semantic_overview_bullets(rows),
+        "",
+        "## Who This Applies To",
+        "",
+        "Prospective and new graduate students evaluating Cox School of Business programs, especially MBA and specialized master's pathways.",
+        "",
+        "## Courses / Curriculum",
+        "",
+        *_semantic_evidence_lines(rows, ("course", "curriculum", "credit", "elective", "degree requirement", "class"), max_items=8),
+        "",
+        "## Costs / Fees / Aid",
+        "",
+        *_semantic_evidence_lines(rows, ("tuition", "fee", "cost", "scholarship", "aid", "financial"), max_items=8),
+        "",
+        "## Admissions / Requirements / Deadlines",
+        "",
+        *_semantic_evidence_lines(rows, ("admission", "apply", "application", "deadline", "requirement", "gmat", "gre", "transcript"), max_items=8),
+        "",
+        "## Contacts / Offices",
+        "",
+        *_semantic_evidence_lines(rows, ("contact", "admission", "office", "email", "phone"), max_items=6),
+        "",
+        "## Related Pages",
+        "",
+        *[f"- [{Path(path).stem.replace('-', ' ').title()}]({ _semantic_relative_link(rel_page, path) })" for path in related_pages],
+        "",
+        "## Sources",
+        "",
+        *_semantic_source_lines(rows),
+        "",
+        "## Last Verified",
+        "",
+        timestamp,
+    ]
+    content = "\n".join(content_lines).rstrip() + "\n"
+    metadata = {
+        "title": title,
+        "category": "Cox School of Business",
+        "page_type": "semantic",
+        "page_path": rel_page,
+        "page_checksum": checksum_text(content),
+        "school": "cox",
+        "schools": sorted({"cox-school-of-business", *entities["schools"]}),
+        "departments": entities["departments"],
+        "offices": entities["offices"],
+        "programs": _semantic_programs(rows),
+        "degree_levels": ["graduate"],
+        "topics": tags,
+        "source_ids": source_ids,
+        "source_paths": source_paths,
+        "source_count": len(source_ids),
+        "tags": tags,
+        "audiences": ["prospective-graduate-student", "new-graduate-student"],
+        "roles": ["student", "applicant"],
+        "intents": ["study", "apply", "pay"],
+        "academic_interests": ["business"],
+        "canonical_facts": ["courses", "costs", "admissions", "contacts"],
+        "aliases": ["cox graduate", "cox admissions", "cox courses", "cox fees", "cox mba"],
+        "related_pages": related_pages,
+        "source_priority": "semantic-wiki",
+        "canonical_owner": rel_page,
+        "updated_at": timestamp,
+    }
+    return (
+        f"{_frontmatter(metadata)}\n{content}",
+        {
+            "title": title,
+            "category": "Cox School of Business",
+            "path": rel_page,
+            "summary": summary,
+            "source_count": len(source_ids),
+            "source_ids": source_ids,
+            "source_paths": source_paths,
+            "tags": tags,
+            "audiences": metadata["audiences"],
+            "roles": metadata["roles"],
+            "intents": metadata["intents"],
+            "academic_interests": metadata["academic_interests"],
+            "canonical_facts": metadata["canonical_facts"],
+            "aliases": metadata["aliases"],
+            "source_priority": "semantic-wiki",
+            "canonical_owner": rel_page,
+            "page_type": "semantic",
+            "school": "cox",
+            "schools": metadata["schools"],
+            "departments": metadata["departments"],
+            "offices": metadata["offices"],
+            "programs": metadata["programs"],
+            "degree_levels": metadata["degree_levels"],
+            "topics": tags,
+            "related_pages": related_pages,
+        },
+    )
+
+
+def _semantic_overview_bullets(rows: list[dict[str, Any]]) -> list[str]:
+    source_by_title = {str(row.get("title") or "").lower(): str(row.get("source_id") or "") for row in rows}
+    online_mba = source_by_title.get("online-mba") or _first_source_id(rows)
+    msba = source_by_title.get("ms-business-analytics") or online_mba
+    admissions = source_by_title.get("emba-admissions-process-criteria") or online_mba
+    aid = source_by_title.get("online-mba-financial-aid-guide") or online_mba
+    return [
+        f"- Start with the program-specific Cox page, then verify the admissions checklist and financial-aid page for your cohort. [`{online_mba}`]",
+        f"- Online MBA evidence says the program uses live weekday evening classes, asynchronous coursework, electives, and required immersion experiences; MSBA evidence describes a 33-credit-hour analytics degree with full-time and part-time options. [`{online_mba}`, `{msba}`]",
+        f"- Cost evidence for the Online MBA gives per-credit tuition/fees and estimated program totals, while financial-aid evidence explains FAFSA/private-loan funding and payment-plan contacts. [`{aid}`]",
+        f"- Admissions evidence emphasizes transcripts, degree/GPA information, application submission, and direct contact with Cox Graduate Admissions for program-specific requirements. [`{admissions}`]",
+    ]
+
+
+def _first_source_id(rows: list[dict[str, Any]]) -> str:
+    return next((str(row.get("source_id") or "") for row in rows if str(row.get("source_id") or "")), "source")
+
+
+def _semantic_evidence_lines(rows: list[dict[str, Any]], needles: tuple[str, ...], *, max_items: int) -> list[str]:
+    candidates: list[tuple[float, str, str]] = []
+    for row in rows:
+        source_id = str(row.get("source_id") or "")
+        row_score = _cox_relevance_score(row, needles)
+        title = str(row.get("title") or "")
+        for sentence in _sentences(_safe_semantic_text(str(row.get("_source_text") or ""))):
+            lower = sentence.lower()
+            if not any(needle in lower for needle in needles):
+                continue
+            if _is_low_value_semantic_sentence(lower):
+                continue
+            keyword_hits = sum(1 for needle in needles if needle in lower)
+            fact_bonus = 2.0 if re.search(r"\b\d+[\d,.$%–—-]*", sentence) else 0.0
+            title_bonus = 2.0 if any(needle in title.lower() for needle in needles) else 0.0
+            compact = _excerpt(sentence, max_chars=280)
+            candidates.append((row_score + keyword_hits + fact_bonus + title_bonus, compact, source_id))
+    lines: list[str] = []
+    seen: set[str] = set()
+    for _score, compact, source_id in sorted(candidates, key=lambda item: (-item[0], item[1].lower())):
+        key = compact.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"- {compact} [`{source_id}`]")
+        if len(lines) >= max_items:
+            break
+    return lines or ["- No source-backed details found yet; inspect related source pages and admissions/program pages."]
+
+
+def _is_low_value_semantic_sentence(lower_sentence: str) -> bool:
+    low_value = (
+        "previous cards",
+        "next cards",
+        "popular searches",
+        "follow us",
+        "share - facebook",
+        "up next",
+        "search submit",
+        "also in smu cox school of business",
+        "coxtoday",
+    )
+    return any(term in lower_sentence for term in low_value)
+
+
+def _safe_semantic_text(text: str) -> str:
+    without_controls = "".join(ch if ch.isprintable() or ch.isspace() else " " for ch in text)
+    without_replacement = without_controls.replace("�", " ")
+    return re.sub(r"\s+", " ", without_replacement).strip()
+
+
+def _semantic_source_lines(rows: list[dict[str, Any]]) -> list[str]:
+    lines = []
+    for row in rows[:40]:
+        lines.append(f"- `{row.get('source_id')}` - {row.get('title') or 'Untitled source'} ({row.get('markdown_path')})")
+    return lines or ["- No source rows attached."]
+
+
+def _semantic_programs(rows: list[dict[str, Any]]) -> list[str]:
+    haystack = "\n".join(f"{row.get('title', '')}\n{row.get('_source_text', '')}" for row in rows).lower()
+    programs = []
+    patterns = {
+        "online-mba": ("online mba",),
+        "mba": ("mba", "master of business administration"),
+        "business-analytics": ("business analytics", "msba"),
+        "finance": ("finance",),
+        "accounting": ("accounting",),
+        "management": ("management",),
+    }
+    for label, needles in patterns.items():
+        if any(needle in haystack for needle in needles):
+            programs.append(label)
+    return programs or ["cox-graduate"]
+
+
+def _semantic_relative_link(current_rel_page: str, target_rel_page: str) -> str:
+    current_dir = Path(current_rel_page).parent
+    try:
+        return Path(target_rel_page).relative_to(current_dir).as_posix()
+    except ValueError:
+        return Path(target_rel_page).as_posix()
+
+
+def _source_page_slug(row: dict[str, Any], used_slugs: set[str]) -> str:
+    base = _slugify(str(row.get("title") or row.get("source_id") or "source"))
+    source_id = _slugify(str(row.get("source_id") or ""))
+    slug = f"{base}-{source_id}" if source_id and source_id not in base else base
+    candidate = slug
+    suffix = 2
+    while candidate in used_slugs:
+        candidate = f"{slug}-{suffix}"
+        suffix += 1
+    used_slugs.add(candidate)
+    return candidate
+
+
+def _render_source_page(
+    category: str,
+    row: dict[str, Any],
+    timestamp: str,
+    site_root: Path,
+    page_path: Path,
+    *,
+    category_page_path: str,
+) -> tuple[str, dict[str, Any]]:
+    source_id = str(row.get("source_id") or "")
+    source_path = str(row.get("markdown_path") or "")
+    title = str(row.get("title") or "Untitled source")
+    text = str(row.get("_source_text") or "")
+    rel_page = _site_relative(page_path, site_root)
+    route = _routing_metadata_for(category, [row])
+    tags = [_slugify(category), _slugify(str(row.get("source_kind") or "source"))]
+    summary = _excerpt(text, max_chars=220) or f"Source-backed {category.lower()} page."
+    content_lines = [
+        f"# {title}",
+        "",
+        "## Fast Answer",
+        "",
+        summary,
+        "",
+        "## Category",
+        "",
+        f"- [{category}](../{Path(category_page_path).name})",
+        "",
+        "## Main Content",
+        "",
+        _clean_source_body_for_wiki(text),
+        "",
+        "## Key Facts",
+        "",
+        *_key_fact_lines([row]),
+        "",
+        "## Dates, Costs, Or Eligibility",
+        "",
+        *_section_lines_for([row], ("date", "deadline", "tuition", "fee", "cost", "eligib")),
+        "",
+        "## Contacts And Offices",
+        "",
+        *_section_lines_for([row], ("contact", "office", "email", "phone")),
+        "",
+        "## Caveats And Review Notes",
+        "",
+        *_caveat_lines([row]),
+        "",
+        "## Sources",
+        "",
+        f"- `{source_id}` - {source_path}",
+        "",
+        "## Last Verified",
+        "",
+        timestamp,
+    ]
+    content = "\n".join(content_lines).rstrip() + "\n"
+    frontmatter = _frontmatter(
+        {
+            "title": title,
+            "category": category,
+            "page_type": "source",
+            "page_path": rel_page,
+            "page_checksum": checksum_text(content),
+            "source_ids": [source_id],
+            "source_paths": [source_path],
+            "source_count": 1,
+            "tags": tags,
+            "audiences": route["audiences"],
+            "roles": route["roles"],
+            "intents": route["intents"],
+            "academic_interests": route["academic_interests"],
+            "canonical_facts": route["canonical_facts"],
+            "aliases": route["aliases"],
+            "source_priority": route["source_priority"],
+            "canonical_owner": rel_page,
+            "category_page": category_page_path,
+            "schools": route["schools"],
+            "departments": route["departments"],
+            "offices": route["offices"],
+            "updated_at": timestamp,
+        }
+    )
+    return (
+        f"{frontmatter}\n{content}",
+        {
+            "title": title,
+            "category": category,
+            "path": rel_page,
+            "summary": summary,
+            "source_count": 1,
+            "source_ids": [source_id],
+            "source_paths": [source_path],
+            "tags": tags,
+            "audiences": route["audiences"],
+            "roles": route["roles"],
+            "intents": route["intents"],
+            "academic_interests": route["academic_interests"],
+            "canonical_facts": route["canonical_facts"],
+            "aliases": route["aliases"],
+            "source_priority": route["source_priority"],
+            "canonical_owner": rel_page,
+            "page_type": "source",
+            "schools": route["schools"],
+            "departments": route["departments"],
+            "offices": route["offices"],
+        },
+    )
+
+
+def _clean_source_body_for_wiki(text: str, *, max_chars: int = 12000) -> str:
+    lines = []
+    boilerplate_patterns = (
+        "skip to", "main navigation", "secondary navigation", "footer", "cookie", "privacy policy",
+        "share this", "follow us", "copyright", "all rights reserved",
+    )
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if lines and lines[-1]:
+                lines.append("")
+            continue
+        lower = stripped.lower()
+        if any(pattern in lower for pattern in boilerplate_patterns) and len(stripped) < 160:
+            continue
+        lines.append(stripped)
+    cleaned = "\n".join(lines).strip()
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars].rstrip() + "\n\n..."
+    return cleaned or "No cleaned source content available."
 
 
 def _frontmatter(values: dict[str, Any]) -> str:
@@ -678,6 +1428,7 @@ def _routing_metadata_for(category: str, rows: list[dict[str, Any]]) -> dict[str
         },
         default=_slugify(category),
     )
+    entities = _infer_institution_entities(haystack)
     return {
         "audiences": audiences,
         "roles": roles,
@@ -687,7 +1438,23 @@ def _routing_metadata_for(category: str, rows: list[dict[str, Any]]) -> dict[str
         "aliases": sorted({_slugify(str(row.get("title") or "")) for row in rows if row.get("title")}),
         "source_priority": "curated-wiki",
         "canonical_owner": f"wiki/pages/{_slugify(category)}.md",
+        "schools": entities["schools"],
+        "departments": entities["departments"],
+        "offices": entities["offices"],
     }
+
+
+def _infer_institution_entities(haystack: str) -> dict[str, list[str]]:
+    text = str(haystack or "").lower()
+    return {
+        "schools": _infer_entity_values(text, SCHOOL_ENTITY_PATTERNS),
+        "departments": _infer_entity_values(text, DEPARTMENT_ENTITY_PATTERNS),
+        "offices": _infer_entity_values(text, OFFICE_ENTITY_PATTERNS),
+    }
+
+
+def _infer_entity_values(haystack: str, patterns: dict[str, tuple[str, ...]]) -> list[str]:
+    return sorted(label for label, needles in patterns.items() if any(needle in haystack for needle in needles))
 
 
 def _infer_values(haystack: str, patterns: dict[str, tuple[str, ...]], *, default: str) -> list[str]:
@@ -884,7 +1651,6 @@ def _append_build_log(path: Path, report: dict[str, Any], page_entries: list[dic
     _append_log_line(path, f"| {timestamp} | ingest | sources_considered={report['sources_considered']} |")
     for entry in sorted(page_entries, key=lambda item: str(item["path"])):
         _append_log_line(path, f"| {timestamp} | page-create | {entry['path'].removeprefix('wiki/')} | sources={entry['source_count']} |")
-        _append_log_line(path, f"| {timestamp} | query-derived-page-create | {entry['path'].removeprefix('wiki/')} | sources={entry['source_count']} |")
     _append_log_line(
         path,
         f"| {timestamp} | rebuild | status={report['status']} created={report['pages_created']} "
@@ -915,22 +1681,7 @@ def _append_log_line(path: Path, line: str) -> None:
 
 
 def _parse_frontmatter(text: str) -> dict[str, Any]:
-    if not text.startswith("---\n"):
-        return {}
-    end = text.find("\n---", 4)
-    if end < 0:
-        return {}
-    metadata: dict[str, Any] = {}
-    current_key = ""
-    for line in text[4:end].splitlines():
-        if line.startswith("  - ") and current_key:
-            metadata.setdefault(current_key, []).append(line[4:].strip())
-            continue
-        if ":" in line:
-            key, value = line.split(":", 1)
-            current_key = key.strip()
-            metadata[current_key] = value.strip() if value.strip() else []
-    return metadata
+    return parse_markdown_frontmatter(text)
 
 
 def _source_ids_from_metadata(metadata: dict[str, Any], text: str) -> list[str]:
@@ -1055,21 +1806,15 @@ def _slugify(value: str) -> str:
 
 
 def _timestamp_slug(value: str) -> str:
-    return re.sub(r"[^0-9A-Za-z]+", "-", value).strip("-")
+    return timestamp_slug(value)
 
 
 def _session_timestamp_slug(value: str) -> str:
-    digits = "".join(ch for ch in str(value) if ch.isdigit())
-    if len(digits) >= 14:
-        return f"{digits[:8]}-{digits[8:14]}"
-    return _timestamp_slug(value)
+    return session_timestamp_slug(value)
 
 
 def _site_relative(path: Path, site_root: Path) -> str:
-    try:
-        return str(Path(path).relative_to(site_root))
-    except ValueError:
-        return str(path)
+    return site_relative(path, site_root)
 
 
 def main(argv: list[str] | None = None) -> int:

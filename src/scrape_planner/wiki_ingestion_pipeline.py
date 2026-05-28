@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .llm_wiki_builder import build_wiki
-from .llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+from .llm_wiki_index import build_llm_wiki_index, query_mcp_wiki_index
 from .raw_source_normalizer import (
     NormalizationReport,
     normalize_pdf_pages,
@@ -34,11 +34,7 @@ def run_wiki_ingestion_pipeline(
     query: str | None = None,
     now: str | None = None,
 ) -> dict[str, Any]:
-    """Run raw-source normalization, wiki build, index build, and optional query smoke test.
-
-    This is the non-interactive end-to-end operator path. It intentionally reuses the
-    individual durable pipeline stages rather than introducing a second artifact format.
-    """
+    """Run normalization, wiki build, index build, and optional query smoke test."""
     timestamp = now or utc_now_iso()
     layout = ensure_layout_for_site_root(Path(site_root))
     tabular = [Path(path) for path in (tabular_paths or [])]
@@ -89,9 +85,91 @@ def run_wiki_ingestion_pipeline(
         result["index"] = build_llm_wiki_index(layout.site_root, now=timestamp)
 
     if query:
-        result["query"] = query_llm_wiki_index(layout.site_root, query, max_evidence=5)
+        result["query"] = query_mcp_wiki_index(layout.site_root, query, max_evidence=5)
 
+    result["stages"] = _stage_summary(result)
     return result
+
+
+def _stage_summary(result: dict[str, Any]) -> dict[str, Any]:
+    normalization = result.get("normalization") if isinstance(result.get("normalization"), dict) else {}
+    wiki = result.get("wiki") if isinstance(result.get("wiki"), dict) else {}
+    index = result.get("index") if isinstance(result.get("index"), dict) else {}
+    query = result.get("query") if isinstance(result.get("query"), dict) else None
+    lint = wiki.get("lint") if isinstance(wiki.get("lint"), dict) else {}
+    return {
+        "ingest": {
+            "status": "skipped" if normalization.get("skipped") else "complete",
+            "counts": normalization.get("counts") or {},
+            "kinds": normalization.get("kinds") or [],
+        },
+        "clean": {
+            "status": "complete" if not wiki.get("skipped") else "skipped",
+            "excluded_source_count": int(wiki.get("excluded_source_count") or 0),
+        },
+        "standardize": {
+            "status": "complete" if not wiki.get("skipped") else "skipped",
+            "sources_considered": int(wiki.get("sources_considered") or 0),
+        },
+        "lint": {
+            "status": str(lint.get("status") or ("pending" if not wiki.get("skipped") else "skipped")),
+            "quality_flags": lint.get("quality_flags") or {},
+        },
+        "build_wiki": {
+            "status": str(wiki.get("status") or ("skipped" if wiki.get("skipped") else "unknown")),
+            "pages_created": int(wiki.get("pages_created") or 0),
+            "pages_updated": int(wiki.get("pages_updated") or 0),
+            "integrated_sources": int(wiki.get("integrated_sources") or 0),
+        },
+        "build_index": {
+            "status": str(index.get("status") or ("skipped" if index.get("skipped") else "unknown")),
+            "raw_index_count": int(index.get("raw_index_count") or 0),
+            "wiki_index_count": int(index.get("wiki_index_count") or 0),
+        },
+        "verify": {
+            "status": str(query.get("status") if query else "skipped"),
+            "evidence_count": len(query.get("evidence") or []) if query else 0,
+        },
+    }
+
+
+def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
+    wiki = result.get("wiki") if isinstance(result.get("wiki"), dict) else {}
+    index = result.get("index") if isinstance(result.get("index"), dict) else {}
+    query = result.get("query") if isinstance(result.get("query"), dict) else None
+    return {
+        "status": result.get("status"),
+        "site_root": result.get("site_root"),
+        "generated_at": result.get("generated_at"),
+        "stages": result.get("stages") or {},
+        "registry": result.get("registry") or {},
+        "wiki": {
+            "status": wiki.get("status"),
+            "no_op": wiki.get("no_op"),
+            "sources_considered": wiki.get("sources_considered"),
+            "pages_created": wiki.get("pages_created"),
+            "pages_updated": wiki.get("pages_updated"),
+            "integrated_sources": wiki.get("integrated_sources"),
+            "excluded_source_count": wiki.get("excluded_source_count"),
+            "review_queue_count": wiki.get("review_queue_count"),
+            "report_path": wiki.get("report_path"),
+        },
+        "index": {
+            "status": index.get("status"),
+            "raw_index_count": index.get("raw_index_count"),
+            "wiki_index_count": index.get("wiki_index_count"),
+            "changed_raw_count": index.get("changed_raw_count"),
+            "changed_wiki_count": index.get("changed_wiki_count"),
+            "manifest_path": index.get("manifest_path"),
+        },
+        "query": {
+            "status": query.get("status"),
+            "evidence_count": len(query.get("evidence") or []),
+            "top_paths": [str(item.get("path") or "") for item in (query.get("evidence") or [])[:5]],
+        }
+        if query
+        else None,
+    }
 
 
 def _resolve_kinds(
@@ -188,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rebuild", action="store_true")
     parser.add_argument("--query", default="", help="Optional smoke query after index build.")
     parser.add_argument("--now", default=None)
+    parser.add_argument("--compact-output", action="store_true", help="Print a compact operator summary instead of the full nested report.")
     args = parser.parse_args(argv)
 
     try:
@@ -207,7 +286,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(json.dumps({"status": "failed", "error": str(exc)}, sort_keys=True), file=sys.stderr)
         return 1
-    print(json.dumps(result, indent=2, sort_keys=True))
+    output = _compact_result(result) if args.compact_output else result
+    print(json.dumps(output, indent=2, sort_keys=True))
     return 0
 
 

@@ -7,7 +7,7 @@ APP_SOURCE = Path(__file__).resolve().parents[1] / "app.py"
 def _metrics_tab_source() -> str:
     source = APP_SOURCE.read_text(encoding="utf-8")
     start = source.index("if active_tab == WORKFLOW_TABS[6]:")
-    end = source.index("# with tabs[7]:", start)
+    end = source.index("if active_tab == WORKFLOW_TABS[7]:", start)
     return source[start:end]
 
 

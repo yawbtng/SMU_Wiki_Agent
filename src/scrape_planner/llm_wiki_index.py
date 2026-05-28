@@ -16,6 +16,7 @@ import requests
 from .run_persistence import _append_jsonl, _write_json_atomic
 from .site_layout import ensure_layout_for_site_root, site_layout
 from .source_registry import checksum_file, read_registry_rows, utc_now_iso
+from .wiki_common import parse_markdown_frontmatter, site_relative, strip_markdown_frontmatter, timestamp_slug
 
 
 INDEX_VERSION = "llm-wiki-hybrid-v1"
@@ -26,6 +27,36 @@ RERANK_PROVIDER = "openrouter"
 RERANK_API_URL = "https://openrouter.ai/api/v1/rerank"
 RERANK_MODEL = "cohere/rerank-4-pro"
 TOKEN_RE = re.compile(r"[a-z0-9]+")
+BM25_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "whom",
+    "whose",
+    "with",
+}
 
 
 @dataclass(frozen=True)
@@ -153,6 +184,7 @@ def query_llm_wiki_index(
     max_evidence: int = 5,
     max_candidates: int = 50,
     profile: QueryProfile | dict[str, Any] | None = None,
+    retrieval_strategy: str = "hybrid",
 ) -> dict[str, Any]:
     layout = site_layout(Path(site_root))
     docs_path = layout.indexes_dir / "llm_wiki_documents.jsonl"
@@ -187,13 +219,18 @@ def query_llm_wiki_index(
             "metadata": {"bounded": True, "reason": "empty_query_or_zero_limit"},
         }
 
-    candidates, lexical_scores = _retrieve_candidates_by_corpus(
+    retrieval = _select_retrieval_candidates(
         docs,
         postings if isinstance(postings, dict) else {},
+        query,
         tokens,
         max_candidates=max_candidates,
+        retrieval_strategy=retrieval_strategy,
     )
-    evidence = rerank_candidates(query, candidates, lexical_scores, profile=query_profile)[:max_evidence]
+    candidates = retrieval["candidates"]
+    lexical_scores = retrieval["lexical_scores"]
+    evidence = _dedupe_evidence_by_path(rerank_candidates(query, candidates, lexical_scores, profile=query_profile))[:max_evidence]
+    _apply_retrieval_annotations(evidence, retrieval)
     if not evidence:
         return {
             "status": "insufficient_evidence",
@@ -203,6 +240,7 @@ def query_llm_wiki_index(
                 "bounded": True,
                 "reason": "no_related_candidates",
                 "routing": _profile_metadata(query_profile, candidate_count=len(candidates)),
+                "retrieval": _retrieval_metadata(retrieval),
                 "site_root": str(layout.site_root.resolve()),
             },
         }
@@ -218,8 +256,28 @@ def query_llm_wiki_index(
             "index_version": manifest.get("version"),
             "site_root": str(layout.site_root.resolve()),
             "routing": _profile_metadata(query_profile, evidence=evidence, candidate_count=len(candidates)),
+            "retrieval": _retrieval_metadata(retrieval),
         },
     }
+
+
+def query_mcp_wiki_index(
+    site_root: Path,
+    query: str,
+    *,
+    max_evidence: int = 5,
+    max_candidates: int = 50,
+    profile: QueryProfile | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Query the wiki for MCP with factual BM25-first and reasoning vector routing."""
+    return query_llm_wiki_index(
+        site_root,
+        query,
+        max_evidence=max_evidence,
+        max_candidates=max_candidates,
+        profile=profile,
+        retrieval_strategy="mcp_auto",
+    )
 
 
 def search_source_index(site_root: Path, query: str, *, max_evidence: int = 5, max_candidates: int = 50) -> dict[str, Any]:
@@ -275,6 +333,18 @@ def search_source_index(site_root: Path, query: str, *, max_evidence: int = 5, m
             "source_only": True,
         },
     }
+
+
+def _dedupe_evidence_by_path(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for item in evidence:
+        key = str(item.get("path") or item.get("id") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
 
 
 def rerank_candidates(
@@ -575,7 +645,7 @@ def _wiki_documents(site_root: Path, *, chunk_chars: int, overlap: int) -> tuple
     docs: list[IndexedDocument] = []
     invalid: list[dict[str, Any]] = []
     pages_dir = site_root / "wiki" / "pages"
-    for path in sorted(pages_dir.glob("*.md")) if pages_dir.exists() else []:
+    for path in sorted(pages_dir.rglob("*.md")) if pages_dir.exists() else []:
         rel_path = _site_relative(path, site_root)
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -587,6 +657,15 @@ def _wiki_documents(site_root: Path, *, chunk_chars: int, overlap: int) -> tuple
         source_ids = [str(value) for value in metadata.get("source_ids", []) if str(value)] if isinstance(metadata.get("source_ids"), list) else []
         tags = [str(value) for value in metadata.get("tags", []) if str(value)] if isinstance(metadata.get("tags"), list) else []
         route_metadata = {
+            "page_type": str(metadata.get("page_type") or "source"),
+            "school": str(metadata.get("school") or ""),
+            "schools": _frontmatter_list(metadata, "schools"),
+            "departments": _frontmatter_list(metadata, "departments"),
+            "offices": _frontmatter_list(metadata, "offices"),
+            "programs": _frontmatter_list(metadata, "programs"),
+            "degree_levels": _frontmatter_list(metadata, "degree_levels"),
+            "topics": _frontmatter_list(metadata, "topics"),
+            "related_pages": _frontmatter_list(metadata, "related_pages"),
             "audiences": _frontmatter_list(metadata, "audiences"),
             "roles": _frontmatter_list(metadata, "roles"),
             "intents": _frontmatter_list(metadata, "intents"),
@@ -659,6 +738,290 @@ def _document_row_current(row: dict[str, Any], doc: IndexedDocument) -> bool:
     return True
 
 
+def _select_retrieval_candidates(
+    docs: list[dict[str, Any]],
+    postings: dict[str, Any],
+    query: str,
+    tokens: list[str],
+    *,
+    max_candidates: int,
+    retrieval_strategy: str,
+) -> dict[str, Any]:
+    requested = _normalize_retrieval_strategy(retrieval_strategy)
+    query_type, classifier_reason = _classify_query_type(query)
+    if requested in {"auto", "mcp_auto"}:
+        if query_type == "factual":
+            bm25 = _wiki_bm25_retrieval(docs, query, tokens, max_candidates=max_candidates)
+            bm25.update(
+                {
+                    "requested_strategy": requested,
+                    "query_type": query_type,
+                    "classifier_reason": classifier_reason,
+                    "attempted_strategies": ["wiki_bm25"],
+                }
+            )
+            if bm25["candidates"]:
+                return bm25
+            hybrid = _hybrid_retrieval(docs, postings, tokens, max_candidates=max_candidates)
+            hybrid.update(
+                {
+                    "strategy": "hybrid_fallback",
+                    "requested_strategy": requested,
+                    "query_type": query_type,
+                    "classifier_reason": classifier_reason,
+                    "attempted_strategies": ["wiki_bm25", "hybrid"],
+                    "fallback_reason": "wiki_bm25_no_hits",
+                    "bm25_backend": bm25.get("bm25_backend", ""),
+                }
+            )
+            return hybrid
+        vector = _vector_retrieval(docs, query, max_candidates=max_candidates)
+        vector.update(
+            {
+                "requested_strategy": requested,
+                "query_type": query_type,
+                "classifier_reason": classifier_reason,
+                "attempted_strategies": ["vector"],
+            }
+        )
+        if vector["candidates"]:
+            return vector
+        hybrid = _hybrid_retrieval(docs, postings, tokens, max_candidates=max_candidates)
+        hybrid.update(
+            {
+                "strategy": "hybrid_fallback",
+                "requested_strategy": requested,
+                "query_type": query_type,
+                "classifier_reason": classifier_reason,
+                "attempted_strategies": ["vector", "hybrid"],
+                "fallback_reason": "vector_no_hits",
+            }
+        )
+        return hybrid
+    if requested in {"bm25", "wiki_bm25", "factual"}:
+        retrieval = _wiki_bm25_retrieval(docs, query, tokens, max_candidates=max_candidates)
+        retrieval.update(
+            {
+                "requested_strategy": requested,
+                "query_type": "factual",
+                "classifier_reason": "forced_bm25",
+                "attempted_strategies": ["wiki_bm25"],
+            }
+        )
+        return retrieval
+    if requested in {"vector", "reasoning"}:
+        retrieval = _vector_retrieval(docs, query, max_candidates=max_candidates)
+        retrieval.update(
+            {
+                "requested_strategy": requested,
+                "query_type": "reasoning",
+                "classifier_reason": "forced_vector",
+                "attempted_strategies": ["vector"],
+            }
+        )
+        return retrieval
+    retrieval = _hybrid_retrieval(docs, postings, tokens, max_candidates=max_candidates)
+    retrieval.update(
+        {
+            "requested_strategy": requested,
+            "query_type": query_type,
+            "classifier_reason": classifier_reason,
+            "attempted_strategies": ["hybrid"],
+        }
+    )
+    return retrieval
+
+
+def _normalize_retrieval_strategy(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "hybrid").lower()).strip("_")
+    return normalized or "hybrid"
+
+
+def _classify_query_type(query: str) -> tuple[str, str]:
+    normalized = re.sub(r"\s+", " ", str(query or "").lower()).strip()
+    reasoning_patterns = (
+        r"\bwhy\b",
+        r"\bcompare\b",
+        r"\bcontrast\b",
+        r"\bdifferences?\b",
+        r"\brecommend\b",
+        r"\bshould\b",
+        r"\bbest\b",
+        r"\bpros?\b",
+        r"\bcons?\b",
+        r"\btrade\s*-?\s*offs?\b",
+        r"\bexplain\b",
+        r"\banaly[sz]e\b",
+        r"\bevaluate\b",
+        r"\bhelp me choose\b",
+    )
+    factual_patterns = (
+        r"\bwho\b",
+        r"\bwhat\b",
+        r"\bwhen\b",
+        r"\bwhere\b",
+        r"\bhow many\b",
+        r"\bhow much\b",
+        r"\bdeadline\b",
+        r"\bdate\b",
+        r"\btuition\b",
+        r"\bfee\b",
+        r"\bcost\b",
+        r"\brequirements?\b",
+        r"\bemail\b",
+        r"\bphone\b",
+        r"\bcontact\b",
+        r"\baddress\b",
+        r"\bhours?\b",
+    )
+    multi_aspect_student_fact = (
+        any(token in normalized for token in ("cox", "business", "mba"))
+        and any(token in normalized for token in ("course", "curriculum", "class"))
+        and any(token in normalized for token in ("fee", "tuition", "cost", "aid"))
+        and any(token in normalized for token in ("admission", "apply", "application", "process"))
+    )
+    if multi_aspect_student_fact:
+        return "factual", "student_multi_aspect_fact"
+    if any(re.search(pattern, normalized) for pattern in reasoning_patterns):
+        return "reasoning", "reasoning_marker"
+    if any(re.search(pattern, normalized) for pattern in factual_patterns):
+        return "factual", "factual_marker"
+    if len(_content_tokens(normalized)) <= 6:
+        return "factual", "short_fact_like_query"
+    return "reasoning", "default_reasoning"
+
+
+def _hybrid_retrieval(
+    docs: list[dict[str, Any]],
+    postings: dict[str, Any],
+    tokens: list[str],
+    *,
+    max_candidates: int,
+) -> dict[str, Any]:
+    candidates, lexical_scores = _retrieve_candidates_by_corpus(docs, postings, tokens, max_candidates=max_candidates)
+    return {
+        "strategy": "hybrid",
+        "candidates": candidates,
+        "lexical_scores": lexical_scores,
+        "reasons_by_id": {},
+        "scores_by_id": {},
+    }
+
+
+def _wiki_bm25_retrieval(
+    docs: list[dict[str, Any]],
+    query: str,
+    tokens: list[str],
+    *,
+    max_candidates: int,
+) -> dict[str, Any]:
+    wiki_docs = [row for row in docs if row.get("corpus") == "wiki"]
+    query_tokens = _content_tokens(query) or [token for token in tokens if token]
+    bm25_scores, backend = _bm25_wiki_scores(query_tokens, wiki_docs, query=query, max_candidates=max_candidates)
+    doc_map = {str(row.get("id") or ""): row for row in wiki_docs}
+    _boost_semantic_wiki_scores(bm25_scores, doc_map, query)
+    ranked_wiki = sorted(bm25_scores.items(), key=lambda item: (-item[1], item[0]))[:max_candidates]
+    wiki_candidates = [doc_map[doc_id] for doc_id, _score in ranked_wiki if doc_id in doc_map]
+    support_candidates, support_scores = _supporting_raw_candidates_for_wiki_hits(
+        docs,
+        wiki_candidates,
+        query_tokens,
+        max_candidates=max_candidates,
+    )
+    candidates = _dedupe_candidates(wiki_candidates + support_candidates)
+    lexical_scores = {**support_scores, **{doc_id: score for doc_id, score in ranked_wiki}}
+    reasons_by_id = {str(row.get("id") or ""): "bm25_wiki_match" for row in wiki_candidates}
+    reasons_by_id.update({str(row.get("id") or ""): "bm25_cited_raw_support" for row in support_candidates})
+    scores_by_id = {doc_id: {"bm25": score} for doc_id, score in ranked_wiki}
+    for doc_id, score in support_scores.items():
+        scores_by_id.setdefault(doc_id, {})["bm25"] = score
+    return {
+        "strategy": "wiki_bm25",
+        "candidates": candidates,
+        "lexical_scores": lexical_scores,
+        "reasons_by_id": reasons_by_id,
+        "scores_by_id": scores_by_id,
+        "bm25_backend": backend,
+    }
+
+
+def _boost_semantic_wiki_scores(bm25_scores: dict[str, float], doc_map: dict[str, dict[str, Any]], query: str) -> None:
+    query_lower = str(query or "").lower()
+    wants_cox = any(token in query_lower for token in ("cox", "business", "mba"))
+    wants_grad = any(token in query_lower for token in ("grad", "graduate", "master", "mba"))
+    wants_multi_aspect = sum(
+        1
+        for group in (
+            ("course", "curriculum", "class"),
+            ("fee", "tuition", "cost", "aid"),
+            ("admission", "apply", "application", "deadline"),
+        )
+        if any(token in query_lower for token in group)
+    ) >= 2
+    for doc_id, row in doc_map.items():
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        frontmatter = metadata.get("frontmatter") if isinstance(metadata.get("frontmatter"), dict) else {}
+        routing = metadata.get("routing") if isinstance(metadata.get("routing"), dict) else {}
+        page_type = str(frontmatter.get("page_type") or routing.get("page_type") or "")
+        source_priority = str(routing.get("source_priority") or frontmatter.get("source_priority") or "")
+        path = str(row.get("path") or "")
+        if page_type == "semantic" or source_priority == "semantic-wiki":
+            bm25_scores[doc_id] = bm25_scores.get(doc_id, 0.0) * 4.0 + 25.0
+            if wants_cox and "wiki/pages/schools/cox" in path:
+                bm25_scores[doc_id] += 40.0
+            if wants_grad and path.endswith("/graduate.md"):
+                bm25_scores[doc_id] += 20.0
+            if wants_multi_aspect and "wiki/pages/schools/cox" in path:
+                bm25_scores[doc_id] += 20.0
+        elif page_type == "source" and doc_id in bm25_scores:
+            bm25_scores[doc_id] = bm25_scores.get(doc_id, 0.0) * 0.85
+
+
+def _vector_retrieval(docs: list[dict[str, Any]], query: str, *, max_candidates: int) -> dict[str, Any]:
+    candidates, vector_scores = _retrieve_vector_candidates_by_corpus(docs, query, max_candidates=max_candidates)
+    return {
+        "strategy": "vector",
+        "candidates": candidates,
+        "lexical_scores": {},
+        "reasons_by_id": {str(row.get("id") or ""): "vector_candidate" for row in candidates},
+        "scores_by_id": {doc_id: {"retrieval_vector": score} for doc_id, score in vector_scores.items()},
+    }
+
+
+def _retrieval_metadata(retrieval: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "requested_strategy": str(retrieval.get("requested_strategy") or retrieval.get("strategy") or ""),
+        "selected_strategy": str(retrieval.get("strategy") or ""),
+        "query_type": str(retrieval.get("query_type") or ""),
+        "classifier_reason": str(retrieval.get("classifier_reason") or ""),
+        "attempted_strategies": [str(value) for value in retrieval.get("attempted_strategies", []) or [] if str(value)],
+        "fallback_reason": str(retrieval.get("fallback_reason") or ""),
+        "bm25_backend": str(retrieval.get("bm25_backend") or ""),
+    }
+
+
+def _apply_retrieval_annotations(evidence: list[dict[str, Any]], retrieval: dict[str, Any]) -> None:
+    reasons_by_id = retrieval.get("reasons_by_id") if isinstance(retrieval.get("reasons_by_id"), dict) else {}
+    scores_by_id = retrieval.get("scores_by_id") if isinstance(retrieval.get("scores_by_id"), dict) else {}
+    for item in evidence:
+        doc_id = str(item.get("id") or "")
+        reason = str(reasons_by_id.get(doc_id) or "")
+        if reason:
+            reasons = list(item.get("ranking_reasons") or [])
+            if reason not in reasons:
+                reasons.insert(0, reason)
+            item["ranking_reasons"] = reasons
+        score_updates = scores_by_id.get(doc_id)
+        if isinstance(score_updates, dict):
+            scores = dict(item.get("scores") or {})
+            for key, value in score_updates.items():
+                try:
+                    scores[str(key)] = round(float(value), 6)
+                except (TypeError, ValueError):
+                    continue
+            item["scores"] = scores
+
+
 def _retrieve_candidates_by_corpus(
     docs: list[dict[str, Any]],
     postings: dict[str, Any],
@@ -702,6 +1065,268 @@ def _retrieve_candidates_for_corpus(
                 continue
     sorted_candidates = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:max_candidates]
     return [doc_map[doc_id] for doc_id, _score in sorted_candidates if doc_id in doc_map], scores
+
+
+def _retrieve_vector_candidates_by_corpus(
+    docs: list[dict[str, Any]],
+    query: str,
+    *,
+    max_candidates: int,
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    query_text = " ".join(_content_tokens(query)) or query
+    query_vector = _embedding_vector(query_text)
+    raw_candidates, raw_scores = _retrieve_vector_candidates_for_corpus(
+        docs,
+        query_vector,
+        corpus="raw",
+        max_candidates=max_candidates,
+    )
+    wiki_candidates, wiki_scores = _retrieve_vector_candidates_for_corpus(
+        docs,
+        query_vector,
+        corpus="wiki",
+        max_candidates=max_candidates,
+    )
+    return _dedupe_candidates(raw_candidates + wiki_candidates), {**raw_scores, **wiki_scores}
+
+
+def _retrieve_vector_candidates_for_corpus(
+    docs: list[dict[str, Any]],
+    query_vector: list[float],
+    *,
+    corpus: str,
+    max_candidates: int,
+    min_score: float = 0.05,
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    scored: list[tuple[str, float]] = []
+    doc_map: dict[str, dict[str, Any]] = {}
+    for row in docs:
+        if row.get("corpus") != corpus:
+            continue
+        doc_id = str(row.get("id") or "")
+        if not doc_id:
+            continue
+        score = _cosine_similarity(query_vector, row.get("embedding_vector"))
+        if score < min_score:
+            continue
+        doc_map[doc_id] = row
+        scored.append((doc_id, score))
+    ranked = sorted(scored, key=lambda item: (-item[1], item[0]))[:max_candidates]
+    return [doc_map[doc_id] for doc_id, _score in ranked if doc_id in doc_map], {doc_id: score for doc_id, score in ranked}
+
+
+def _bm25_wiki_scores(
+    query_tokens: list[str],
+    wiki_docs: list[dict[str, Any]],
+    *,
+    query: str,
+    max_candidates: int,
+) -> tuple[dict[str, float], str]:
+    if not query_tokens or not wiki_docs or max_candidates <= 0:
+        return {}, ""
+    bm25s_scores = _bm25s_wiki_scores(query_tokens, wiki_docs, max_candidates=max_candidates)
+    if bm25s_scores is not None:
+        return bm25s_scores, "bm25s"
+    return _python_bm25_wiki_scores(query_tokens, wiki_docs), "python-bm25"
+
+
+def _bm25s_wiki_scores(
+    query_tokens: list[str], wiki_docs: list[dict[str, Any]], *, max_candidates: int
+) -> dict[str, float] | None:
+    try:
+        import bm25s  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    try:
+        corpus = [_bm25_document_text(row) for row in wiki_docs]
+        if not corpus:
+            return {}
+        tokenized_corpus = _bm25s_tokenize(bm25s, corpus)
+        retriever = bm25s.BM25()
+        try:
+            retriever.index(tokenized_corpus, show_progress=False)
+        except TypeError:
+            retriever.index(tokenized_corpus)
+        tokenized_query = _bm25s_tokenize(bm25s, [" ".join(query_tokens)])
+        k = min(max_candidates, len(wiki_docs))
+        retrieve_result: tuple[Any, Any] | None = None
+        for kwargs in (
+            {"k": k, "show_progress": False},
+            {"k": k},
+            {"corpus": list(range(len(wiki_docs))), "k": k, "show_progress": False},
+            {"corpus": list(range(len(wiki_docs))), "k": k},
+        ):
+            try:
+                retrieve_result = retriever.retrieve(tokenized_query, **kwargs)
+                break
+            except TypeError:
+                continue
+        if retrieve_result is None:
+            return None
+        results, score_rows = retrieve_result
+        result_values = _first_bm25s_row(results)
+        score_values = _first_bm25s_row(score_rows)
+        scores: dict[str, float] = {}
+        for result, score in zip(result_values, score_values):
+            index = _bm25s_result_index(result, wiki_docs)
+            if index is None:
+                continue
+            try:
+                numeric_score = float(score)
+            except (TypeError, ValueError):
+                continue
+            if numeric_score <= 0:
+                continue
+            doc_id = str(wiki_docs[index].get("id") or "")
+            if doc_id:
+                scores[doc_id] = numeric_score
+        return scores
+    except Exception:
+        return None
+
+
+def _bm25s_tokenize(bm25s_module: Any, texts: list[str]) -> Any:
+    try:
+        return bm25s_module.tokenize(texts, stopwords="en", show_progress=False)
+    except TypeError:
+        try:
+            return bm25s_module.tokenize(texts, show_progress=False)
+        except TypeError:
+            return bm25s_module.tokenize(texts)
+
+
+def _first_bm25s_row(value: Any) -> list[Any]:
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, tuple):
+        value = list(value)
+    if not isinstance(value, list):
+        return []
+    if len(value) == 1:
+        first = value[0]
+        if hasattr(first, "tolist"):
+            first = first.tolist()
+        if isinstance(first, tuple):
+            first = list(first)
+        if isinstance(first, list):
+            return first
+    return value
+
+
+def _bm25s_result_index(value: Any, wiki_docs: list[dict[str, Any]]) -> int | None:
+    try:
+        index = int(value)
+    except (TypeError, ValueError):
+        if isinstance(value, dict):
+            doc_id = str(value.get("id") or "")
+            for idx, row in enumerate(wiki_docs):
+                if str(row.get("id") or "") == doc_id:
+                    return idx
+        return None
+    if 0 <= index < len(wiki_docs):
+        return index
+    return None
+
+
+def _python_bm25_wiki_scores(query_tokens: list[str], wiki_docs: list[dict[str, Any]]) -> dict[str, float]:
+    token_set = [token for token in dict.fromkeys(query_tokens) if token]
+    if not token_set:
+        return {}
+    document_counts: list[tuple[str, dict[str, int], int]] = []
+    document_frequency: dict[str, int] = {}
+    for row in wiki_docs:
+        counts = _content_token_counts(_bm25_document_text(row))
+        doc_length = sum(counts.values())
+        if doc_length <= 0:
+            continue
+        doc_id = str(row.get("id") or "")
+        document_counts.append((doc_id, counts, doc_length))
+        for token in set(counts):
+            document_frequency[token] = document_frequency.get(token, 0) + 1
+    if not document_counts:
+        return {}
+    avg_doc_length = sum(length for _doc_id, _counts, length in document_counts) / len(document_counts)
+    k1 = 1.5
+    b = 0.75
+    scores: dict[str, float] = {}
+    document_count = len(document_counts)
+    for doc_id, counts, doc_length in document_counts:
+        score = 0.0
+        for token in token_set:
+            tf = counts.get(token, 0)
+            if tf <= 0:
+                continue
+            df = document_frequency.get(token, 0)
+            if df <= 0:
+                continue
+            idf = math.log(1.0 + (document_count - df + 0.5) / (df + 0.5))
+            denominator = tf + k1 * (1.0 - b + b * (doc_length / avg_doc_length))
+            score += idf * ((tf * (k1 + 1.0)) / denominator)
+        if score > 0.0 and doc_id:
+            scores[doc_id] = score
+    return scores
+
+
+def _supporting_raw_candidates_for_wiki_hits(
+    docs: list[dict[str, Any]],
+    wiki_candidates: list[dict[str, Any]],
+    query_tokens: list[str],
+    *,
+    max_candidates: int,
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    source_ids = {
+        str(source_id)
+        for row in wiki_candidates
+        for source_id in row.get("source_ids", []) or []
+        if str(source_id)
+    }
+    if not source_ids:
+        return [], {}
+    raw_rows = [row for row in docs if row.get("corpus") == "raw" and str(row.get("source_id") or "") in source_ids]
+    scores: dict[str, float] = {}
+    for row in raw_rows:
+        doc_id = str(row.get("id") or "")
+        if not doc_id:
+            continue
+        counts = _content_token_counts(_bm25_document_text(row))
+        score = float(sum(counts.get(token, 0) for token in set(query_tokens)))
+        if score <= 0:
+            score = 0.01
+        # Raw rows are supporting citations for a wiki BM25 hit, not primary answers.
+        # Keep their lexical contribution bounded so factual MCP queries surface
+        # organized wiki evidence first while still returning raw provenance.
+        scores[doc_id] = min(score * 0.05, 0.25)
+    ranked = sorted(raw_rows, key=lambda row: (-scores.get(str(row.get("id") or ""), 0.0), str(row.get("id") or "")))[
+        :max_candidates
+    ]
+    return ranked, {str(row.get("id") or ""): scores[str(row.get("id") or "")] for row in ranked if str(row.get("id") or "")}
+
+
+def _dedupe_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for row in candidates:
+        doc_id = str(row.get("id") or "")
+        if not doc_id or doc_id in seen:
+            continue
+        seen.add(doc_id)
+        deduped.append(row)
+    return deduped
+
+
+def _content_tokens(text: str) -> list[str]:
+    return [token for token in _tokenize(text) if token not in BM25_STOPWORDS]
+
+
+def _content_token_counts(text: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for token in _content_tokens(text):
+        counts[token] = counts.get(token, 0) + 1
+    return counts
+
+
+def _bm25_document_text(row: dict[str, Any]) -> str:
+    return f"{row.get('title') or ''}\n{row.get('text') or ''}"
 
 
 def infer_query_profile(query: str, profile: QueryProfile | dict[str, Any] | None = None) -> QueryProfile:
@@ -1026,43 +1651,19 @@ def _snippet(text: str, tokens: list[str], *, chars: int = 320) -> str:
 
 
 def _parse_frontmatter(text: str) -> dict[str, Any]:
-    if not text.startswith("---\n"):
-        return {}
-    end = text.find("\n---", 4)
-    if end < 0:
-        return {}
-    metadata: dict[str, Any] = {}
-    current_key = ""
-    for line in text[4:end].splitlines():
-        if line.startswith("  - ") and current_key:
-            metadata.setdefault(current_key, []).append(line[4:].strip())
-            continue
-        if ":" in line:
-            key, value = line.split(":", 1)
-            current_key = key.strip()
-            metadata[current_key] = value.strip() if value.strip() else []
-    return metadata
+    return parse_markdown_frontmatter(text)
 
 
 def _strip_frontmatter(text: str) -> str:
-    if not text.startswith("---\n"):
-        return text
-    end = text.find("\n---", 4)
-    if end < 0:
-        return text
-    return text[end + 4 :].lstrip()
+    return strip_markdown_frontmatter(text)
 
 
 def _site_relative(path: Path, site_root: Path) -> str:
-    try:
-        return str(path.resolve().relative_to(site_root.resolve()))
-    except ValueError:
-        return str(path)
+    return site_relative(path, site_root, resolve=True)
 
 
 def _timestamp_slug(value: str) -> str:
-    cleaned = re.sub(r"[^0-9A-Za-z]+", "-", value).strip("-")
-    return cleaned or hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
+    return timestamp_slug(value, fallback_hash=True)
 
 
 def main(argv: list[str] | None = None) -> int:

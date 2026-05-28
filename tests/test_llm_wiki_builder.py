@@ -87,8 +87,12 @@ def test_wiki_builder_noninteractive_writes_pages_index_log_review_report_and_up
 
     assert report["status"] == "complete"
     assert report["sources_considered"] == 2
+    admissions_source_page = site_root / "wiki" / "pages" / "admissions" / "admissions-requirements-web-admissions.md"
+    finance_source_page = site_root / "wiki" / "pages" / "finance" / "tuition-and-fees-web-tuition.md"
     assert admissions_page.exists()
     assert finance_page.exists()
+    assert admissions_source_page.exists()
+    assert finance_source_page.exists()
     page_text = admissions_page.read_text(encoding="utf-8")
     assert page_text.startswith("---\n")
     assert "page_path: wiki/pages/admissions.md" in page_text
@@ -112,7 +116,7 @@ def test_wiki_builder_noninteractive_writes_pages_index_log_review_report_and_up
     assert report_payload["review_queue_count"] == 1
     rows = {row["source_id"]: row for row in read_registry_rows(registry_path)}
     assert rows["web_admissions"]["wiki_status"] == "integrated"
-    assert rows["web_admissions"]["wiki_page_paths"] == ["wiki/pages/admissions.md"]
+    assert rows["web_admissions"]["wiki_page_paths"] == ["wiki/pages/admissions/admissions-requirements-web-admissions.md"]
     assert rows["web_done"]["wiki_page_paths"] == []
 
 
@@ -137,6 +141,7 @@ def test_wiki_builder_writes_routed_contract_source_notes_and_metadata(tmp_path:
     assert (site_root / "wiki" / "routing" / "topics.md").exists()
     assert (site_root / "wiki" / "source-notes" / "index.md").exists()
     assert (site_root / "wiki" / "programs" / "index.md").exists()
+    assert (site_root / "wiki" / "pages" / "programs" / "computer-science-graduate-program-web-program.md").exists()
     assert "## Fast Answer" in page
     assert "## Who This Applies To" in page
     assert "## Source Notes" not in page
@@ -146,6 +151,113 @@ def test_wiki_builder_writes_routed_contract_source_notes_and_metadata(tmp_path:
     assert "Computer Science Graduate Program" in (site_root / "wiki" / "source-notes" / "programs.md").read_text(encoding="utf-8")
     assert "smu" not in page.lower()
     assert "wiki/routing/audience.md" in report["required_markdown_paths"]
+
+
+def test_wiki_builder_adds_school_department_and_office_metadata(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_builder import build_wiki
+
+    site_root = tmp_path / "site"
+    registry_path = site_root / "raw_sources" / "registry.jsonl"
+    registrar = _write_ready_source(
+        site_root,
+        source_id="web_registrar_cs",
+        title="Lyle Computer Science Registrar Office Guide",
+        body=(
+            "# Lyle Computer Science Registrar Office Guide\n\n"
+            "The Lyle School of Engineering Department of Computer Science works with the Office of the Registrar "
+            "on enrollment, transcripts, academic records, and course catalog updates.\n"
+        ),
+    )
+    write_registry_rows(registry_path, [registrar])
+
+    build_wiki(site_root, no_input=True, rebuild=True, now=NOW)
+
+    source_page = site_root / "wiki" / "pages" / "registrar" / "lyle-computer-science-registrar-office-guide-web-registrar-cs.md"
+    text = source_page.read_text(encoding="utf-8")
+    assert "schools:\n  - lyle-school-of-engineering" in text
+    assert "departments:\n  - computer-science" in text
+    assert "offices:\n  - registrar" in text
+
+
+def test_wiki_builder_writes_cox_semantic_pages(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_builder import build_wiki
+
+    site_root = tmp_path / "site"
+    registry_path = site_root / "raw_sources" / "registry.jsonl"
+    admissions = _write_ready_source(
+        site_root,
+        source_id="web_cox_admissions",
+        title="Cox Graduate Admissions",
+        body="# Cox Graduate Admissions\n\nGraduate MBA applicants apply by February 1. Admissions requirements include transcripts and GMAT review. Contact Graduate Admissions for next steps.\n",
+    )
+    courses = _write_ready_source(
+        site_root,
+        source_id="web_cox_courses",
+        title="Online MBA Curriculum",
+        body="# Online MBA Curriculum\n\nThe Cox Online MBA curriculum includes live classes, electives, immersion experiences, and course credits.\n",
+    )
+    costs = _write_ready_source(
+        site_root,
+        source_id="web_cox_costs",
+        title="Online MBA Tuition",
+        body="# Online MBA Tuition\n\nTuition is charged per credit hour. Applicants are considered for scholarships and financial aid.\n",
+    )
+    write_registry_rows(registry_path, [admissions, courses, costs])
+
+    report = build_wiki(site_root, no_input=True, rebuild=True, now=NOW)
+
+    graduate = site_root / "wiki" / "pages" / "schools" / "cox" / "graduate.md"
+    admissions_page = site_root / "wiki" / "pages" / "schools" / "cox" / "admissions.md"
+    courses_page = site_root / "wiki" / "pages" / "schools" / "cox" / "courses.md"
+    costs_page = site_root / "wiki" / "pages" / "schools" / "cox" / "costs-and-aid.md"
+    for page in (graduate, admissions_page, courses_page, costs_page):
+        assert page.exists()
+        text = page.read_text(encoding="utf-8")
+        assert "page_type: semantic" in text
+        assert "school: cox" in text
+        assert "## Courses / Curriculum" in text
+        assert "## Costs / Fees / Aid" in text
+        assert "## Admissions / Requirements / Deadlines" in text
+        assert "## Sources" in text
+    graduate_text = graduate.read_text(encoding="utf-8")
+    assert "web_cox_admissions" in graduate_text
+    assert "web_cox_courses" in graduate_text
+    assert "web_cox_costs" in graduate_text
+    assert report["semantic_page_count"] >= 5
+
+
+def test_wiki_builder_excludes_award_lists_and_strips_site_footer(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_builder import build_wiki
+
+    site_root = tmp_path / "site"
+    registry_path = site_root / "raw_sources" / "registry.jsonl"
+    award_list = _write_ready_source(
+        site_root,
+        source_id="web_awards",
+        title="2018 Winners",
+        body="# Previous Winners\n\nCompany Name\nCity\n1\nExample Co\nDallas\n\n## Cox School of Business\n6214 Bishop Blvd.\n### Follow us\n- Facebook\n### About\n- Alumni Association\n",
+    )
+    admissions = _write_ready_source(
+        site_root,
+        source_id="web_admissions",
+        title="Cox Graduate Admissions",
+        body="# Cox Graduate Admissions\n\nApply by February 1. Tuition and course details are listed.\n\n## Cox School of Business\n6214 Bishop Blvd.\n### Follow us\n- Facebook\n### Popular Searches\n- Apply\n",
+    )
+    write_registry_rows(registry_path, [award_list, admissions])
+
+    report = build_wiki(site_root, no_input=True, rebuild=True, now=NOW)
+
+    rows = {row["source_id"]: row for row in read_registry_rows(registry_path)}
+    assert rows["web_awards"]["wiki_status"] == "excluded"
+    assert rows["web_awards"]["wiki_page_paths"] == []
+    assert "web_awards" in report["excluded_source_ids"]
+    assert not list((site_root / "wiki" / "pages").rglob("*winners*.md"))
+    admissions_pages = list((site_root / "wiki" / "pages").rglob("*cox-graduate-admissions*.md"))
+    assert admissions_pages
+    page_text = admissions_pages[0].read_text(encoding="utf-8")
+    assert "Follow us" not in page_text
+    assert "Popular Searches" not in page_text
+    assert "Cox Graduate Admissions" in page_text
 
 
 def test_wiki_builder_report_preserves_tmux_session(tmp_path: Path) -> None:
@@ -297,8 +409,12 @@ def test_wiki_builder_resume_retries_explicit_ids_only_when_processable(tmp_path
     assert report["sources_considered"] == 2
     rows = {row["source_id"]: row for row in read_registry_rows(registry_path)}
     assert rows["web_unchanged_failed"]["wiki_page_paths"] == ["wiki/pages/old.md"]
-    assert rows["web_changed_pending"]["wiki_page_paths"] == ["wiki/pages/finance.md"]
-    assert rows["web_not_integrated_failed"]["wiki_page_paths"] == ["wiki/pages/programs.md"]
+    assert rows["web_changed_pending"]["wiki_page_paths"] == [
+        "wiki/pages/finance/changed-pending-tuition-web-changed-pending.md"
+    ]
+    assert rows["web_not_integrated_failed"]["wiki_page_paths"] == [
+        "wiki/pages/programs/failed-programs-web-not-integrated-failed.md"
+    ]
     assert rows["web_skipped"]["wiki_page_paths"] == ["wiki/pages/old.md"]
 
 
@@ -431,6 +547,9 @@ def test_wiki_lint_reports_orphans_missing_citations_stale_checksums_review_item
         "---\ntitle: Orphan\nsource_ids:\n  - missing\nsource_paths:\n  - raw_sources/web/missing.md\nsource_count: 1\ntags:\n  - orphan\nupdated_at: 2026-05-21T00:00:00+00:00\n---\n\n## Sources\n- `missing` - raw_sources/web/missing.md\n",
         encoding="utf-8",
     )
+    nested = pages / "schools" / "cox"
+    nested.mkdir(parents=True)
+    (nested / "graduate.md").write_text("# Cox Graduate\n\nNested page without citations.\n", encoding="utf-8")
     (site_root / "wiki" / "index.md").write_text("# Wiki Index\n\n", encoding="utf-8")
     (site_root / "wiki" / "review_queue.md").write_text(
         "# Wiki Review Queue\n\n"
@@ -442,7 +561,9 @@ def test_wiki_lint_reports_orphans_missing_citations_stale_checksums_review_item
     report = lint_wiki(site_root, now=NOW)
 
     assert "wiki/pages/orphan.md" in report["orphan_pages"]
+    assert "wiki/pages/schools/cox/graduate.md" in report["orphan_pages"]
     assert "wiki/pages/admissions.md" in report["missing_citations"]
+    assert "wiki/pages/schools/cox/graduate.md" in report["missing_citations"]
     assert "web_admissions" in report["stale_source_checksums"]
     assert report["review_queue_count"] == 2
     assert report["review_items"][0]["source_id"] == "web_admissions"
@@ -452,6 +573,7 @@ def test_wiki_lint_reports_orphans_missing_citations_stale_checksums_review_item
     assert report["review_items"][1]["source_id"] == "pdf_catalog"
     assert report["review_items"][1]["type"] == "review"
     assert "wiki/pages/admissions.md" in report["missing_index_entries"]
+    assert "wiki/pages/schools/cox/graduate.md" in report["missing_index_entries"]
     assert Path(report["report_path"]).exists()
     assert "| 2026-05-21T10:00:00+00:00 | lint |" in (site_root / "wiki" / "log.md").read_text(encoding="utf-8")
 
@@ -561,6 +683,20 @@ def test_wiki_launcher_uses_python_runtime(tmp_path: Path) -> None:
     assert launch_report["status"] == "running"
     assert launch_report["job_status"] == "running"
     assert launch_report["tmux_session"] == name
+
+
+def test_wiki_launcher_rejects_unsupported_runtime(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_builder import launch_wiki_builder
+
+    class FakeRunner:
+        def start(self, name: str, command: str, workdir: str):
+            raise AssertionError("unsupported runtime should not launch tmux")
+
+    result = launch_wiki_builder(tmp_path / "site", runner=FakeRunner(), runtime="agent")
+
+    assert result["ok"] is False
+    assert result["runtime"] == "agent"
+    assert "Unsupported wiki builder runtime" in result["error"]
 
 
 def test_wiki_launcher_uses_unique_default_session_names(tmp_path: Path, monkeypatch) -> None:

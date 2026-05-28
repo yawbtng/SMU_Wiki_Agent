@@ -181,7 +181,7 @@ def test_sources_tab_hides_deep_pdf_details_by_default() -> None:
 
 def test_documents_review_source_uses_formatted_table_picker() -> None:
     source = APP_SOURCE.read_text(encoding="utf-8")
-    documents_source = source[source.index("if active_tab == WORKFLOW_TABS[3]:") : source.index("# with tabs[4]:")]
+    documents_source = source[source.index("if active_tab == WORKFLOW_TABS[3]:") : source.index("if active_tab == WORKFLOW_TABS[4]:")]
 
     assert "def _document_source_picker(" in source
     assert "_document_source_picker(visible_docs, source_group=str(source_group))" in documents_source
@@ -189,17 +189,18 @@ def test_documents_review_source_uses_formatted_table_picker() -> None:
     assert "def _document_source_subtitle(" in source
     assert "st.button(" in source
     assert "type=\"primary\" if selected else \"secondary\"" in source
-    assert "Source website:" in source
+    assert "Source:" in source
     assert "st.dataframe(" not in documents_source
     assert "st.selectbox(\n                    \"Review source\"" not in documents_source
     assert "render_operator_details(\n                        \"Selected source\"" not in documents_source
     assert "{row['kind']} · {row['status']} · {row['title']} · {row['source_id']}" not in documents_source
 
 
-def test_wiki_markdown_rendering_is_user_toggleable() -> None:
+def test_wiki_markdown_preview_renders_generated_markdown() -> None:
     wiki_literals = set(_literal_call_args(_tab_body(4)))
 
-    assert "Show rendered Markdown" in wiki_literals
+    assert "### Generated Markdown" in wiki_literals
+    assert "Preview" in wiki_literals
 
 
 def test_wiki_stage_exposes_build_update_and_rebuild_actions() -> None:
@@ -207,7 +208,7 @@ def test_wiki_stage_exposes_build_update_and_rebuild_actions() -> None:
 
     assert "Build Wiki" in wiki_literals
     assert "Update Wiki" in wiki_literals
-    assert "Rebuild Wiki" in wiki_literals
+    assert "Rebuild Wiki" not in wiki_literals
     assert "Sources Waiting" in wiki_literals
     assert "PDF Waiting" in wiki_literals
 

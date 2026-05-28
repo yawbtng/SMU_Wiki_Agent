@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -22,6 +23,7 @@ try:
 except Exception:
     st_autorefresh = None
 
+from src.scrape_planner.app import APP_STATE_DEFAULTS, AppContext
 from src.scrape_planner.failure_classifier import classify_failure
 from src.scrape_planner.markdown_graph import (
     answer_context as graph_answer_context,
@@ -99,6 +101,17 @@ from src.scrape_planner.ui_preview_quality import (
     build_chunk_quality_summary,
     classify_chunk_row,
 )
+from src.scrape_planner.wiki_markdown_ui import (
+    filter_wiki_markdown_records as _filter_wiki_markdown_records,
+    list_wiki_markdown_files as _list_wiki_markdown_files,
+    parse_markdown_frontmatter as _parse_markdown_frontmatter,
+    read_wiki_markdown as _read_wiki_markdown,
+    rewrite_wiki_markdown_links as _rewrite_wiki_markdown_links,
+    safe_wiki_markdown_rel_path as _safe_wiki_markdown_rel_path,
+    strip_markdown_frontmatter as _strip_markdown_frontmatter,
+    strip_temp_clipboard_images as _strip_temp_clipboard_images,
+    wiki_markdown_records as _wiki_markdown_records,
+)
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT / "data"
@@ -106,6 +119,17 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 ENV_PATH = ROOT / ".env"
 APP_STATE_PATH = DATA_ROOT / "app_state.json"
+
+
+def _app_context() -> AppContext:
+    if "app_context" not in st.session_state:
+        st.session_state["app_context"] = AppContext.build(
+            data_root=DATA_ROOT,
+            session_state=st.session_state,
+            app_state_path=APP_STATE_PATH,
+            app_state_defaults={**APP_STATE_DEFAULTS, "ollama_base_url": OLLAMA_BASE_URL},
+        )
+    return st.session_state["app_context"]
 
 
 def _site_slug(url: str) -> str:
@@ -187,7 +211,7 @@ def _get_tmux_runner() -> TmuxRunner:
 
 
 def _run_root(site_id: str, run_id: str) -> Path:
-    return DATA_ROOT / "sites" / site_id / run_id
+    return _app_context().site_artifacts.run_root(site_id, run_id)
 
 
 def _load_scrape_runtime(site_id: str, run_id: str, max_events: int = 1500) -> tuple[dict, list[dict], list[dict]]:
@@ -747,7 +771,7 @@ def _source_next_action(*, selected_url_count: int, pdf_count: int, run_state: s
 
 
 def _discovered_json_path(site_id: str) -> Path:
-    return DATA_ROOT / "sites" / site_id / "discovered_urls.json"
+    return _app_context().site_artifacts.discovered_path(site_id)
 
 
 def _to_discovered_rows(items: list[DiscoveredURL]) -> list[dict]:
@@ -792,69 +816,53 @@ def _render_paginated_df(df: pd.DataFrame, *, key_prefix: str, default_page_size
 
 
 def _load_app_state() -> dict:
-    return read_json(
-        APP_STATE_PATH,
-        {
-            "active_workspace_id": "",
-            "workspaces": [],
-            "last_site_url": "",
-            "last_site_id": "",
-            "last_run_id": "",
-            "last_run_by_site": {},
-            "manual_urls": "",
-            "ollama_model": "",
-            "llm_provider": "openrouter",
-            "ollama_base_url": OLLAMA_BASE_URL,
-            "site_history": [],
-        },
-    )
+    return _app_context().app_state.load()
+
+
+def _app_state_payload() -> dict:
+    return {
+        "active_workspace_id": st.session_state.get("active_workspace_id", ""),
+        "workspaces": st.session_state.get("workspaces", []),
+        "last_site_url": st.session_state.get("site_url", ""),
+        "last_site_id": st.session_state.get("site_id", ""),
+        "last_run_id": st.session_state.get("run_id", ""),
+        "last_run_by_site": st.session_state.get("last_run_by_site", {}),
+        "manual_urls": st.session_state.get("manual_urls", ""),
+        "ollama_model": st.session_state.get("ollama_model", ""),
+        "llm_provider": st.session_state.get("llm_provider", "openrouter"),
+        "ollama_base_url": st.session_state.get("ollama_base_url", OLLAMA_BASE_URL),
+        "scrape_browser_mode": st.session_state.get("scrape_browser_mode", "none"),
+        "lightpanda_cdp_url": st.session_state.get("lightpanda_cdp_url", ""),
+        "site_history": st.session_state.get("site_history", []),
+        "tavily_api_key": st.session_state.get("tavily_api_key", ""),
+        "default_or_model": st.session_state.get("default_or_model", "deepseek/deepseek-v4-flash"),
+        "default_llm_cap": int(st.session_state.get("default_llm_cap", 150)),
+        "default_llm_batch_size": int(st.session_state.get("default_llm_batch_size", 250)),
+        "default_llm_sleep_sec": float(st.session_state.get("default_llm_sleep_sec", 0.0)),
+        "url_reasoning_provider": st.session_state.get("url_reasoning_provider", "openrouter"),
+        "url_reasoning_openrouter_model": st.session_state.get("url_reasoning_openrouter_model", "deepseek/deepseek-v4-flash"),
+        "url_reasoning_ollama_model": st.session_state.get("url_reasoning_ollama_model", "qwen2.5:3b"),
+        "graph_enrichment_provider": st.session_state.get("graph_enrichment_provider", "openrouter"),
+        "graph_enrichment_openrouter_model": st.session_state.get("graph_enrichment_openrouter_model", "openai/gpt-4.1-mini"),
+        "graph_enrichment_ollama_model": st.session_state.get("graph_enrichment_ollama_model", "qwen2.5:3b"),
+        "graph_answer_provider": st.session_state.get("graph_answer_provider", "openrouter"),
+        "graph_answer_openrouter_model": st.session_state.get("graph_answer_openrouter_model", "deepseek/deepseek-v4-flash"),
+        "graph_answer_ollama_model": st.session_state.get("graph_answer_ollama_model", "qwen2.5:3b"),
+        "scrape_concurrency": int(st.session_state.get("scrape_concurrency", 10)),
+        "embedding_enabled": bool(st.session_state.get("embedding_enabled", True)),
+        "embedding_model": st.session_state.get("embedding_model", "nomic-embed-text:latest"),
+        "zvec_enabled": bool(st.session_state.get("zvec_enabled", True)),
+        "zvec_index_path": st.session_state.get("zvec_index_path", ""),
+        "zvec_collection": st.session_state.get("zvec_collection", "university_wiki"),
+        "use_tavily_for_map": bool(st.session_state.get("use_tavily_for_map", False)),
+        "tavily_cost_per_call_usd": float(st.session_state.get("tavily_cost_per_call_usd", 0.0)),
+        "ollama_input_per_m_usd": float(st.session_state.get("ollama_input_per_m_usd", 0.0)),
+        "ollama_output_per_m_usd": float(st.session_state.get("ollama_output_per_m_usd", 0.0)),
+    }
 
 
 def _save_app_state() -> None:
-    write_json(
-        APP_STATE_PATH,
-        {
-            "active_workspace_id": st.session_state.get("active_workspace_id", ""),
-            "workspaces": st.session_state.get("workspaces", []),
-            "last_site_url": st.session_state.get("site_url", ""),
-            "last_site_id": st.session_state.get("site_id", ""),
-            "last_run_id": st.session_state.get("run_id", ""),
-            "last_run_by_site": st.session_state.get("last_run_by_site", {}),
-            "manual_urls": st.session_state.get("manual_urls", ""),
-            "ollama_model": st.session_state.get("ollama_model", ""),
-            "llm_provider": st.session_state.get("llm_provider", "openrouter"),
-            "ollama_base_url": st.session_state.get("ollama_base_url", OLLAMA_BASE_URL),
-            "scrape_browser_mode": st.session_state.get("scrape_browser_mode", "none"),
-            "lightpanda_cdp_url": st.session_state.get("lightpanda_cdp_url", ""),
-            "site_history": st.session_state.get("site_history", []),
-            "tavily_api_key": st.session_state.get("tavily_api_key", ""),
-            "default_or_model": st.session_state.get("default_or_model", "deepseek/deepseek-v4-flash"),
-            "default_llm_cap": int(st.session_state.get("default_llm_cap", 150)),
-            "default_llm_batch_size": int(st.session_state.get("default_llm_batch_size", 250)),
-            "default_llm_sleep_sec": float(st.session_state.get("default_llm_sleep_sec", 0.0)),
-            "url_reasoning_provider": st.session_state.get("url_reasoning_provider", "openrouter"),
-            "url_reasoning_openrouter_model": st.session_state.get("url_reasoning_openrouter_model", "deepseek/deepseek-v4-flash"),
-            "url_reasoning_ollama_model": st.session_state.get("url_reasoning_ollama_model", "qwen2.5:3b"),
-            "graph_enrichment_provider": st.session_state.get("graph_enrichment_provider", "openrouter"),
-            "graph_enrichment_openrouter_model": st.session_state.get("graph_enrichment_openrouter_model", "openai/gpt-4.1-mini"),
-            "graph_enrichment_ollama_model": st.session_state.get("graph_enrichment_ollama_model", "qwen2.5:3b"),
-            "graph_answer_provider": st.session_state.get("graph_answer_provider", "openrouter"),
-            "graph_answer_openrouter_model": st.session_state.get("graph_answer_openrouter_model", "deepseek/deepseek-v4-flash"),
-            "graph_answer_ollama_model": st.session_state.get("graph_answer_ollama_model", "qwen2.5:3b"),
-            "scrape_concurrency": int(st.session_state.get("scrape_concurrency", 10)),
-            "scrape_browser_mode": st.session_state.get("scrape_browser_mode", "none"),
-            "lightpanda_cdp_url": st.session_state.get("lightpanda_cdp_url", ""),
-            "embedding_enabled": bool(st.session_state.get("embedding_enabled", True)),
-            "embedding_model": st.session_state.get("embedding_model", "nomic-embed-text:latest"),
-            "zvec_enabled": bool(st.session_state.get("zvec_enabled", True)),
-            "zvec_index_path": st.session_state.get("zvec_index_path", ""),
-            "zvec_collection": st.session_state.get("zvec_collection", "university_wiki"),
-            "use_tavily_for_map": bool(st.session_state.get("use_tavily_for_map", False)),
-            "tavily_cost_per_call_usd": float(st.session_state.get("tavily_cost_per_call_usd", 0.0)),
-            "ollama_input_per_m_usd": float(st.session_state.get("ollama_input_per_m_usd", 0.0)),
-            "ollama_output_per_m_usd": float(st.session_state.get("ollama_output_per_m_usd", 0.0)),
-        },
-    )
+    _app_context().app_state.save(_app_state_payload())
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
@@ -873,8 +881,7 @@ def _load_env_file(path: Path) -> dict[str, str]:
 def _hydrate_site_workspace(site_id: str) -> None:
     if not site_id:
         return
-    discovered_path = _discovered_json_path(site_id)
-    rows = read_json(discovered_path, [])
+    rows = _app_context().site_artifacts.load_discovered_rows(site_id)
     if rows:
         st.session_state["discovered"] = rows
         st.session_state["selected_df"] = pd.DataFrame(rows)
@@ -1244,7 +1251,8 @@ def _document_row_display_fields(row: dict) -> dict[str, object]:
     if kind == "pdf":
         document_label = _pdf_document_label(row)
         pdf_source_id = str(row.get("pdf_source_id") or "")
-        category_identity = pdf_source_id or document_label.lower()
+        source_identity = hashlib.sha1(source.lower().encode("utf-8")).hexdigest()[:12] if source else ""
+        category_identity = pdf_source_id or source_identity or document_label.lower()
         category_key = f"pdf:{category_identity}"
         page_number = _document_page_number(row)
         display_path = f"{document_label} · page {page_number}" if page_number else document_label
@@ -1288,12 +1296,59 @@ def _compact_source_rows(rows: list[dict], layout) -> list[dict]:
             "source_path": source_path,
             "markdown": markdown_path,
             "source_id": str(row.get("source_id") or ""),
-            "pdf_source_id": str(provenance.get("pdf_source_id") or ""),
+            "pdf_source_id": str(provenance.get("pdf_source_id") or row.get("pdf_source_id") or ""),
             "page_number": _coerce_int(provenance.get("raw_page_number") or provenance.get("page_number") or row.get("page_number"), 0),
             "part_index": _coerce_int(provenance.get("part_index") or row.get("part_index"), 0),
         }
         compact_row.update(_document_row_display_fields(compact_row))
         compact_rows.append(compact_row)
+    return _disambiguate_pdf_document_labels(compact_rows)
+
+
+def _pdf_document_hint(row: dict) -> str:
+    token = str(row.get("pdf_source_id") or row.get("source_id") or "").replace("pdf_", "")
+    if token:
+        return token[:8]
+    source = str(row.get("original_path") or row.get("source_path") or row.get("url_or_path") or "").strip()
+    if source:
+        source_path = unquote(urlparse(source).path or "") if _looks_like_url(source) else source
+        parent = Path(source_path).parent.name
+        parent_label = _document_index_label(parent)
+        if parent_label and parent_label not in {".", "/"}:
+            return parent_label
+    return ""
+
+
+def _disambiguate_pdf_document_labels(compact_rows: list[dict]) -> list[dict]:
+    label_to_keys: dict[str, set[str]] = {}
+    key_to_rows: dict[str, list[dict]] = {}
+    for row in compact_rows:
+        if row.get("kind") != "pdf":
+            continue
+        base_label = str(row.get("collection_label") or row.get("category_label") or "Uploaded PDF")
+        category_key = str(row.get("category_key") or base_label.lower())
+        label_to_keys.setdefault(base_label.lower(), set()).add(category_key)
+        key_to_rows.setdefault(category_key, []).append(row)
+
+    duplicate_keys = {
+        category_key
+        for keys in label_to_keys.values()
+        if len(keys) > 1
+        for category_key in keys
+    }
+    for category_key in duplicate_keys:
+        rows = key_to_rows.get(category_key) or []
+        if not rows:
+            continue
+        first = rows[0]
+        base_label = str(first.get("collection_label") or first.get("category_label") or "Uploaded PDF")
+        hint = _pdf_document_hint(first)
+        display_label = f"{base_label} · {hint}" if hint and hint.lower() not in base_label.lower() else base_label
+        for row in rows:
+            row["category_label"] = display_label
+            page_number = _document_page_number(row)
+            row["display_path"] = f"{display_label} · page {page_number}" if page_number else display_label
+            row["sort_path"] = f"{display_label.lower()}::{page_number:08d}::{row.get('source_id') or ''}"
     return compact_rows
 
 
@@ -1602,78 +1657,6 @@ def _read_source_markdown(layout, markdown_path: str, *, max_chars: int | None =
     return (text[:max_chars] if max_chars is not None else text), ""
 
 
-def _list_wiki_markdown_files(wiki_dir: Path) -> list[str]:
-    if not wiki_dir.exists():
-        return []
-    paths: list[str] = []
-    for path in sorted(wiki_dir.rglob("*.md")):
-        try:
-            rel = path.relative_to(wiki_dir)
-        except ValueError:
-            continue
-        if rel.parts and rel.parts[0] == "reports":
-            continue
-        paths.append(str(rel))
-    return paths
-
-
-def _wiki_markdown_title(rel_path: str) -> str:
-    path = Path(rel_path)
-    stem = path.stem
-    if stem.lower() == "index":
-        if len(path.parts) <= 1:
-            return "Overview"
-        return _document_index_label(path.parts[-2]) or path.parts[-2]
-    return _document_index_label(stem) or stem or rel_path
-
-
-def _wiki_markdown_category(rel_path: str) -> str:
-    path = Path(rel_path)
-    if len(path.parts) <= 1:
-        return "Overview"
-    return _document_index_label(path.parts[0]) or path.parts[0]
-
-
-def _wiki_markdown_records(wiki_markdown_files: list[str]) -> list[dict]:
-    records = [
-        {
-            "path": rel_path,
-            "title": _wiki_markdown_title(rel_path),
-            "category": _wiki_markdown_category(rel_path),
-            "search_text": " ".join(
-                [
-                    rel_path,
-                    _wiki_markdown_title(rel_path),
-                    _wiki_markdown_category(rel_path),
-                    " ".join(_document_index_label(part) for part in Path(rel_path).parts),
-                ]
-            ).lower(),
-        }
-        for rel_path in wiki_markdown_files
-    ]
-    return sorted(
-        records,
-        key=lambda row: (
-            str(row["category"]).lower() != "overview",
-            str(row["category"]).lower(),
-            str(row["title"]).lower(),
-            str(row["path"]).lower(),
-        ),
-    )
-
-
-def _filter_wiki_markdown_records(records: list[dict], query: str) -> list[dict]:
-    tokens = [token.lower() for token in re.split(r"\s+", query.strip()) if token.strip()]
-    if not tokens:
-        return records
-    filtered: list[dict] = []
-    for record in records:
-        haystack = str(record.get("search_text") or "").lower()
-        if all(token in haystack for token in tokens):
-            filtered.append(record)
-    return filtered
-
-
 def _wiki_markdown_picker(records: list[dict], *, max_cards: int = 220) -> dict | None:
     return _source_index_picker(
         records,
@@ -1689,43 +1672,29 @@ def _wiki_markdown_picker(records: list[dict], *, max_cards: int = 220) -> dict 
     )
 
 
-def _read_wiki_markdown(layout, rel_path: str, *, max_chars: int = 60000) -> tuple[str, str]:
+WIKI_FILE_QUERY_VIEW = {"view": "wiki_file"}
+
+
+def _apply_wiki_file_query_state() -> None:
+    if str(st.query_params.get("view", "") or "").strip() != WIKI_FILE_QUERY_VIEW["view"]:
+        return
+    rel_path = _safe_wiki_markdown_rel_path(st.query_params.get("wiki_file", ""))
     if not rel_path:
-        return "", "No wiki Markdown file selected."
-    candidate = layout.wiki_dir / rel_path
-    try:
-        resolved = candidate.resolve()
-        resolved.relative_to(layout.wiki_dir.resolve())
-    except ValueError:
-        return "", "Wiki Markdown path is outside this workspace."
-    if not resolved.exists() or not resolved.is_file():
-        return "", "Wiki Markdown file was not found."
-    return resolved.read_text(encoding="utf-8", errors="replace")[:max_chars], ""
-
-
-def _parse_markdown_frontmatter(text: str) -> dict:
-    if not text.startswith("---\n"):
-        return {}
-    end = text.find("\n---", 4)
-    if end < 0:
-        return {}
-    metadata: dict = {}
-    current_key = ""
-    for line in text[4:end].splitlines():
-        if line.startswith("  - ") and current_key:
-            metadata.setdefault(current_key, []).append(line[4:].strip())
-        elif ":" in line:
-            key, value = line.split(":", 1)
-            current_key = key.strip()
-            metadata[current_key] = value.strip() if value.strip() else []
-    return metadata
-
-
-def _strip_markdown_frontmatter(text: str) -> str:
-    if not text.startswith("---\n"):
-        return text
-    end = text.find("\n---", 4)
-    return text[end + 4 :].lstrip() if end >= 0 else text
+        return
+    site_id = str(st.query_params.get("site_id", "") or "").strip()
+    if site_id and is_safe_route_part(site_id):
+        workspace = next((w for w in st.session_state.get("workspaces", []) if w.get("id") == site_id), None)
+        st.session_state["active_workspace_id"] = site_id
+        st.session_state["site_id"] = site_id
+        if workspace:
+            st.session_state["site_url"] = workspace.get("url", st.session_state.get("site_url", ""))
+    query_key = f"{site_id}:{rel_path}"
+    if st.session_state.get("_last_wiki_file_query") == query_key:
+        return
+    st.session_state["workflow_active_tab"] = WORKFLOW_TABS[4]
+    st.session_state["wiki_markdown_file_browser"] = rel_path
+    st.session_state["wiki_loading_markdown_file"] = rel_path
+    st.session_state["_last_wiki_file_query"] = query_key
 
 
 def _load_run_analytics_inputs(site_id: str, run_id: str, run_root: Path) -> tuple[list[dict], list[dict], dict, list[dict]]:
@@ -1924,6 +1893,105 @@ def _build_run_metrics_row(
         "total_tokens": float(billable_trace["total_tokens"].sum()) if not billable_trace.empty else 0.0,
         "cost_usd": float(billable_trace["cost_usd"].sum()) if not billable_trace.empty else 0.0,
         "failure_records": len(failures),
+    }
+
+
+def _nice_metric_axis_max(value: float, *, minimum: float = 1.0) -> float:
+    max_value = max(float(value or 0.0), 0.0)
+    if max_value <= 0:
+        return minimum
+    target = max(max_value * 1.14, minimum)
+    magnitude = 10 ** math.floor(math.log10(target))
+    normalized = target / magnitude
+    if normalized <= 1:
+        nice = 1
+    elif normalized <= 2:
+        nice = 2
+    elif normalized <= 5:
+        nice = 5
+    else:
+        nice = 10
+    return float(nice * magnitude)
+
+
+def _metric_money_axis_format(max_value: float) -> str:
+    value = abs(float(max_value or 0.0))
+    if value < 0.01:
+        return "$,.4f"
+    if value < 1:
+        return "$,.3f"
+    if value < 1000:
+        return "$,.2f"
+    return "$,.0f"
+
+
+def _metrics_usage_grain(chart_metrics_df: pd.DataFrame) -> str:
+    dated = chart_metrics_df.dropna(subset=["run_ts"]).sort_values("run_ts")
+    if dated.empty or len(dated) <= 12:
+        return "run"
+    span_days = max(1, int((dated["run_ts"].max() - dated["run_ts"].min()).days))
+    if span_days <= 45:
+        return "day"
+    if span_days <= 210:
+        return "week"
+    return "month"
+
+
+def _metrics_period_bucket(series: pd.Series, grain: str) -> pd.Series:
+    if grain == "day":
+        return series.dt.floor("D")
+    naive = series.dt.tz_convert("UTC").dt.tz_localize(None)
+    if grain == "week":
+        return pd.to_datetime(naive.dt.to_period("W").dt.start_time, utc=True)
+    return pd.to_datetime(naive.dt.to_period("M").dt.start_time, utc=True)
+
+
+def _metrics_usage_chart_data(filtered_metrics_df: pd.DataFrame) -> dict[str, object]:
+    chart_metrics_df = filtered_metrics_df.dropna(subset=["run_ts"]).sort_values("run_ts").copy()
+    if chart_metrics_df.empty:
+        return {}
+    grain = _metrics_usage_grain(chart_metrics_df)
+    if grain == "run":
+        chart_metrics_df["bucket"] = chart_metrics_df["run_label"].fillna(chart_metrics_df["run_id"]).astype(str)
+        x_sort = chart_metrics_df["bucket"].tolist()
+        x_title = "Run"
+        x_axis = alt.Axis(labelAngle=-30 if len(x_sort) > 5 else 0, labelLimit=140)
+        x_encoding = alt.X("bucket:N", title=x_title, sort=x_sort, axis=x_axis)
+    else:
+        chart_metrics_df["bucket"] = _metrics_period_bucket(chart_metrics_df["run_ts"], grain)
+        x_sort = None
+        x_title = {"day": "Day", "week": "Week", "month": "Month"}.get(grain, "Date")
+        x_format = "%b %d" if grain in {"day", "week"} else "%b %Y"
+        x_axis = alt.Axis(format=x_format, tickCount=min(8, max(2, int(chart_metrics_df["bucket"].nunique()))))
+        x_encoding = alt.X("bucket:T", title=x_title, axis=x_axis)
+
+    grouped = (
+        chart_metrics_df.groupby("bucket", as_index=False, sort=False)
+        .agg(
+            runs=("run_id", "count"),
+            scraped_pages=("scraped_pages", "sum"),
+            failed_pages=("failed_pages", "sum"),
+            cost_usd=("cost_usd", "sum"),
+            provider_requests=("provider_requests", "sum"),
+        )
+        .sort_values("bucket", kind="stable")
+    )
+    grouped["page_total"] = grouped["scraped_pages"] + grouped["failed_pages"]
+    page_columns = ["scraped_pages"] + (["failed_pages"] if float(grouped["failed_pages"].sum()) > 0 else [])
+    pages_long = grouped.melt(
+        id_vars=["bucket", "runs", "provider_requests"],
+        value_vars=page_columns,
+        var_name="page_type",
+        value_name="pages",
+    )
+    pages_long["page_type"] = pages_long["page_type"].map({"scraped_pages": "Scraped", "failed_pages": "Failed"}).fillna(pages_long["page_type"])
+    return {
+        "grain": grain,
+        "x_encoding": x_encoding,
+        "x_sort": x_sort,
+        "x_title": x_title,
+        "grouped": grouped,
+        "pages_long": pages_long,
     }
 
 
@@ -2509,6 +2577,48 @@ def _apply_compact_ui_styles() -> None:
             border-color: rgba(var(--primary-rgb), 0.12) !important;
             background: rgba(255,255,255,0.56) !important;
         }
+        [class*="st-key-documents_markdown_preview"] [data-testid="stMarkdownContainer"],
+        [class*="st-key-wiki_markdown_preview"] [data-testid="stMarkdownContainer"] {
+            font-size: 0.9rem !important;
+            line-height: 1.5 !important;
+        }
+        [class*="st-key-documents_markdown_preview"] [data-testid="stMarkdownContainer"] h1,
+        [class*="st-key-wiki_markdown_preview"] [data-testid="stMarkdownContainer"] h1 {
+            font-family: var(--display-font) !important;
+            font-size: 1.65rem !important;
+            line-height: 1.16 !important;
+            letter-spacing: -0.025em !important;
+            margin: 0.55rem 0 0.45rem !important;
+        }
+        [class*="st-key-documents_markdown_preview"] [data-testid="stMarkdownContainer"] h2,
+        [class*="st-key-wiki_markdown_preview"] [data-testid="stMarkdownContainer"] h2 {
+            font-size: 1.28rem !important;
+            line-height: 1.22 !important;
+            margin: 0.85rem 0 0.38rem !important;
+        }
+        [class*="st-key-documents_markdown_preview"] [data-testid="stMarkdownContainer"] h3,
+        [class*="st-key-wiki_markdown_preview"] [data-testid="stMarkdownContainer"] h3 {
+            font-size: 1.08rem !important;
+            line-height: 1.25 !important;
+            margin: 0.7rem 0 0.28rem !important;
+        }
+        [class*="st-key-documents_markdown_preview"] [data-testid="stMarkdownContainer"] h4,
+        [class*="st-key-documents_markdown_preview"] [data-testid="stMarkdownContainer"] h5,
+        [class*="st-key-documents_markdown_preview"] [data-testid="stMarkdownContainer"] h6,
+        [class*="st-key-wiki_markdown_preview"] [data-testid="stMarkdownContainer"] h4,
+        [class*="st-key-wiki_markdown_preview"] [data-testid="stMarkdownContainer"] h5,
+        [class*="st-key-wiki_markdown_preview"] [data-testid="stMarkdownContainer"] h6 {
+            font-size: 0.98rem !important;
+            line-height: 1.3 !important;
+            margin: 0.6rem 0 0.24rem !important;
+        }
+        [class*="st-key-documents_markdown_preview"] [data-testid="stMarkdownContainer"] p,
+        [class*="st-key-documents_markdown_preview"] [data-testid="stMarkdownContainer"] li,
+        [class*="st-key-wiki_markdown_preview"] [data-testid="stMarkdownContainer"] p,
+        [class*="st-key-wiki_markdown_preview"] [data-testid="stMarkdownContainer"] li {
+            font-size: 0.9rem !important;
+            line-height: 1.5 !important;
+        }
         [class*="st-key-runs_control_panel"] {
             border: 1px solid var(--hairline);
             border-radius: var(--radius-lg);
@@ -2837,6 +2947,7 @@ if active_workspace_for_recovery:
         st.session_state["site_id"] = active_workspace_for_recovery.get("id", "")
     if not st.session_state.get("site_url"):
         st.session_state["site_url"] = active_workspace_for_recovery.get("url", "")
+_apply_wiki_file_query_state()
 if "last_run_by_site" not in st.session_state:
     st.session_state["last_run_by_site"] = loaded_app_state.get("last_run_by_site", {})
 if not st.session_state.get("run_id"):
@@ -2945,7 +3056,6 @@ if active_ws:
 
 active_tab = _render_workflow_navigation(WORKFLOW_TABS)
 
-# with tabs[0]:
 if active_tab == WORKFLOW_TABS[0]:
     st.subheader("Overview")
     if active_ws:
@@ -3070,7 +3180,6 @@ if active_tab == WORKFLOW_TABS[0]:
     else:
         st.warning("No active workspace selected. Go back to the workspace list and open one.")
 
-# with tabs[1]:
 if active_tab == WORKFLOW_TABS[1]:
     st.subheader("Sources")
     discovered_path = _discovered_json_path(st.session_state["site_id"])
@@ -3330,7 +3439,6 @@ if active_tab == WORKFLOW_TABS[1]:
             prepared_cols[1].metric("Search chunks", f"{len(chunk_rows):,}")
             prepared_cols[2].metric("Needs review", f"{len(quarantine_rows):,}")
 
-# with tabs[2]:
 if active_tab == WORKFLOW_TABS[2]:
     st.subheader("Runs")
     runs_site_id = st.session_state.get("site_id", "")
@@ -3674,7 +3782,6 @@ if active_tab == WORKFLOW_TABS[2]:
                 st.info(f"Ready to scrape {len(runs_selected_url_strings):,} selected URL(s).")
             else:
                 st.info("No selected URLs yet.")
-# with tabs[3]:
 if active_tab == WORKFLOW_TABS[3]:
     st.subheader("Documents")
     site_id = st.session_state.get("site_id", "")
@@ -3789,7 +3896,6 @@ if active_tab == WORKFLOW_TABS[3]:
             st.info("Normalize scraped pages, PDFs, or tabular files to populate document rows.")
 
 
-# with tabs[4]:
 if active_tab == WORKFLOW_TABS[4]:
     st.subheader("Wiki")
     site_id = st.session_state.get("site_id", "")
@@ -3817,7 +3923,8 @@ if active_tab == WORKFLOW_TABS[4]:
         if not raw_sources_ready:
             st.warning("Blocked: prepare source documents before building the LLM Wiki.")
 
-        st.caption("Wiki builder runs locally in Python. Pi extensions can be added later.")
+        selected_wiki_runtime = "python"
+        st.caption("Wiki builder runtime: `Python deterministic` — runs the local non-interactive wiki builder directly in tmux.")
         source_cols = st.columns(5)
         source_cols[0].metric("Sources Ready", f"{int(wiki_status.get('source_count') or 0):,}")
         source_cols[1].metric("Sources Waiting", f"{int(wiki_status.get('pending_source_count') or 0):,}")
@@ -3827,75 +3934,47 @@ if active_tab == WORKFLOW_TABS[4]:
         if pending_other_sources:
             st.caption(f"Other source types waiting: `{pending_other_sources:,}`")
 
-        build_col, update_col, rebuild_col, refresh_col = st.columns([1, 1, 1, 1])
-        build_disabled = not raw_sources_ready or int(wiki_status.get("integrated_sources") or 0) > 0
+        build_col, update_col = st.columns([1, 1])
+        build_disabled = not raw_sources_ready
         update_disabled = not raw_sources_ready or int(wiki_status.get("pending_source_count") or 0) <= 0
-        rebuild_disabled = not raw_sources_ready
         if build_col.button("Build Wiki", type="primary", disabled=build_disabled, key="build_llm_wiki"):
-            launch_result = launch_wiki_builder(layout.site_root, runner=tmux_runner, resume=True)
+            launch_result = launch_wiki_builder(layout.site_root, runner=tmux_runner, resume=False, rebuild=True, runtime=selected_wiki_runtime)
             if launch_result.get("ok"):
+                launch_runtime = launch_result.get("runtime", selected_wiki_runtime)
                 st.session_state["wiki_build_launch_notice"] = {
                     "tmux_session": launch_result["session_name"],
                     "report_path": launch_result["report_path"],
-                    "runtime": launch_result.get("runtime", "python"),
+                    "runtime": launch_runtime,
                 }
                 st.success("Started wiki build.")
-                st.caption(f"Runtime: `{launch_result.get('runtime', 'python')}`")
-                render_operator_details(
-                    "Operator Details",
-                    {
-                        "tmux_session": launch_result["session_name"],
-                        "report_path": launch_result["report_path"],
-                        "runtime": launch_result.get("runtime", "python"),
-                    },
-                )
+                st.caption(f"Runtime: `{launch_runtime}`")
                 st.rerun()
             else:
                 st.error(launch_result.get("error") or "Failed to start LLM Wiki builder.")
         if update_col.button("Update Wiki", type="primary", disabled=update_disabled, key="update_llm_wiki"):
-            launch_result = launch_wiki_builder(layout.site_root, runner=tmux_runner, resume=True)
+            launch_result = launch_wiki_builder(layout.site_root, runner=tmux_runner, resume=True, runtime=selected_wiki_runtime)
             if launch_result.get("ok"):
+                launch_runtime = launch_result.get("runtime", selected_wiki_runtime)
                 st.session_state["wiki_build_launch_notice"] = {
                     "tmux_session": launch_result["session_name"],
                     "report_path": launch_result["report_path"],
-                    "runtime": launch_result.get("runtime", "python"),
+                    "runtime": launch_runtime,
                 }
                 st.success("Started wiki update.")
-                st.caption(f"Runtime: `{launch_result.get('runtime', 'python')}`")
-                render_operator_details(
-                    "Operator Details",
-                    {
-                        "tmux_session": launch_result["session_name"],
-                        "report_path": launch_result["report_path"],
-                        "runtime": launch_result.get("runtime", "python"),
-                    },
-                )
+                st.caption(f"Runtime: `{launch_runtime}`")
                 st.rerun()
             else:
                 st.error(launch_result.get("error") or "Failed to start LLM Wiki update.")
-        if rebuild_col.button("Rebuild Wiki", disabled=rebuild_disabled, key="rebuild_llm_wiki"):
-            launch_result = launch_wiki_builder(layout.site_root, runner=tmux_runner, resume=False, rebuild=True)
-            if launch_result.get("ok"):
-                st.session_state["wiki_build_launch_notice"] = {
-                    "tmux_session": launch_result["session_name"],
-                    "report_path": launch_result["report_path"],
-                    "runtime": launch_result.get("runtime", "python"),
-                }
-                st.success("Started full wiki rebuild.")
-                st.caption(f"Runtime: `{launch_result.get('runtime', 'python')}`")
-                render_operator_details(
-                    "Operator Details",
-                    {
-                        "tmux_session": launch_result["session_name"],
-                        "report_path": launch_result["report_path"],
-                        "runtime": launch_result.get("runtime", "python"),
-                    },
-                )
-                st.rerun()
-            else:
-                st.error(launch_result.get("error") or "Failed to start full LLM Wiki rebuild.")
-        if refresh_col.button("Refresh Wiki Status", key="refresh_llm_wiki_status"):
-            st.rerun()
+        wiki_job_state = str(wiki_status.get("job_status") or "").lower()
+        wiki_agent_active = wiki_job_state in {"running", "queued", "starting", "initializing"}
+        if wiki_agent_active:
+            st.info("Wiki builder is running. This page auto-refreshes while activity is in progress.")
+        _schedule_live_refresh(
+            key="wiki_agent_activity_autorefresh_tick",
+            enabled=True,
+            active=wiki_agent_active,
+            interval_seconds=1.0,
+        )
 
         w1, w2, w3, w4 = st.columns(4)
         w1.metric("Job Status", wiki_status["job_status"])
@@ -3903,18 +3982,22 @@ if active_tab == WORKFLOW_TABS[4]:
         w3.metric("Pages Updated", f"{wiki_status['pages_updated']:,}")
         w4.metric("Review Queue", f"{wiki_status['review_queue_count']:,}")
         st.caption(f"Last progress update: `{wiki_status['last_progress'] or 'not reported'}`")
+        display_wiki_runtime = str(wiki_status.get("runtime") or selected_wiki_runtime)
+        st.caption(f"Runtime: `{display_wiki_runtime}`")
         st.metric("Integrated Sources", f"{wiki_status['integrated_sources']:,}")
-        render_operator_details(
-            "Operator Details",
-            {
-                "tmux_session": wiki_status["tmux_session"],
-                "log_path": wiki_status["log_path"],
-                "index_path": wiki_status["index_path"],
-                "review_queue_path": wiki_status["review_queue_path"],
-                "latest_report_path": wiki_status.get("latest_report_path") or "",
-            },
-        )
-
+        with st.container(border=True, key="wiki_build_activity"):
+            st.markdown("### Build activity")
+            activity_cols = st.columns(4)
+            activity_cols[0].metric("Runtime", display_wiki_runtime)
+            activity_cols[1].metric("State", wiki_status["job_status"])
+            activity_cols[2].metric("Sources", f"{wiki_status['integrated_sources']:,}")
+            activity_cols[3].metric("Pages", f"{wiki_status['pages_created'] + wiki_status['pages_updated']:,}")
+            wiki_log_tail = _tail_text(Path(wiki_status["log_path"]), max_lines=8)
+            if wiki_log_tail:
+                with st.expander("Latest builder log", expanded=wiki_agent_active):
+                    st.code(wiki_log_tail[-4000:], language="markdown")
+            else:
+                st.caption("Build log output will appear after the wiki builder starts.")
         st.markdown("### Generated Markdown")
         wiki_markdown_files = _list_wiki_markdown_files(layout.wiki_dir)
         if wiki_markdown_files:
@@ -3964,7 +4047,13 @@ if active_tab == WORKFLOW_TABS[4]:
                             if citations:
                                 st.caption("Citations: " + ", ".join(f"`{item}`" for item in citations[:8]))
                         with st.container(border=True, key="wiki_markdown_preview"):
-                            st.markdown(_strip_markdown_frontmatter(selected_markdown))
+                            st.markdown(
+                                _rewrite_wiki_markdown_links(
+                                    _strip_temp_clipboard_images(_strip_markdown_frontmatter(selected_markdown)),
+                                    current_rel_path=selected_wiki_file,
+                                    site_id=site_id,
+                                )
+                            )
 
                     if is_loading_wiki_preview:
                         with st.spinner("Loading selected wiki page…"):
@@ -3978,7 +4067,6 @@ if active_tab == WORKFLOW_TABS[4]:
             st.info("Generated Markdown files will appear after the wiki build creates `wiki/*.md` artifacts.")
 
 
-# with tabs[5]:
 if active_tab == WORKFLOW_TABS[5]:
     st.subheader("Embeddings")
     site_id = st.session_state.get("site_id", "")
@@ -4039,13 +4127,10 @@ if active_tab == WORKFLOW_TABS[5]:
             {"Metric": "Last build time", "Value": embedding_status.get("last_build_time") or "n/a"},
         ]
         st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
-# with tabs[6]:
 if active_tab == WORKFLOW_TABS[6]:
     st.subheader("Metrics")
     st.caption("Request and cost metrics are estimated from recorded run/site events plus configured provider pricing.")
-    if not st.toggle("Load detailed run metrics", value=False, key="metrics_load_run_metrics"):
-        st.info("Detailed metrics are loaded on demand so the operator UI stays responsive.")
-    elif not st.session_state.get("site_id"):
+    if not st.session_state.get("site_id"):
         st.info("Select or create a site first.")
     else:
         site_root = DATA_ROOT / "sites" / st.session_state["site_id"]
@@ -4054,17 +4139,6 @@ if active_tab == WORKFLOW_TABS[6]:
         if not real_run_choices:
             st.info("No scrape runs are available yet. Start a scrape to populate metrics.")
         else:
-            latest_run = real_run_choices[-1]
-            current_selected = st.session_state.get("metrics_run", "")
-            selected_run = current_selected if current_selected in real_run_choices else latest_run
-            metrics_run = st.selectbox(
-                "Run",
-                options=real_run_choices,
-                index=real_run_choices.index(selected_run),
-                key="metrics_run",
-                format_func=lambda run_name: f"Run {_run_human_timestamp(run_name)}",
-            )
-            run_root = site_root / metrics_run
             model_map = {m.get("id"): m for m in st.session_state.get("openrouter_models", [])}
             tavily_per_call = float(st.session_state.get("tavily_cost_per_call_usd", 0.0))
             ollama_in_per_m = float(st.session_state.get("ollama_input_per_m_usd", 0.0))
@@ -4124,42 +4198,69 @@ if active_tab == WORKFLOW_TABS[6]:
                         ]
                     )
 
-                    chart_metrics_df = filtered_metrics_df.dropna(subset=["run_ts"]).sort_values("run_ts")
-                    if not chart_metrics_df.empty:
-                        daily_metrics = chart_metrics_df.copy()
-                        daily_metrics["run_date"] = daily_metrics["run_ts"].dt.floor("D")
-                        daily_metrics = (
-                            daily_metrics.groupby("run_date", as_index=False)
-                            .agg(
-                                runs=("run_id", "count"),
-                                scraped_pages=("scraped_pages", "sum"),
-                                failed_pages=("failed_pages", "sum"),
-                                cost_usd=("cost_usd", "sum"),
-                                provider_requests=("provider_requests", "sum"),
-                            )
-                            .sort_values("run_date")
+                    usage_chart_data = _metrics_usage_chart_data(filtered_metrics_df)
+                    if usage_chart_data:
+                        grouped_usage = usage_chart_data["grouped"]
+                        pages_long = usage_chart_data["pages_long"]
+                        x_title = str(usage_chart_data["x_title"])
+                        tooltip_bucket = (
+                            alt.Tooltip("bucket:N", title=x_title)
+                            if usage_chart_data["grain"] == "run"
+                            else alt.Tooltip("bucket:T", title=x_title)
                         )
+                        page_y_max = _nice_metric_axis_max(float(grouped_usage["page_total"].max()), minimum=1.0)
+                        cost_max = float(grouped_usage["cost_usd"].max())
+                        cost_y_max = _nice_metric_axis_max(cost_max, minimum=0.01 if cost_max < 1 else 1.0)
+                        cost_format = _metric_money_axis_format(cost_y_max)
+                        page_types = list(pages_long["page_type"].drop_duplicates())
+                        page_colors = ["#cc785c", "#bf5c54"][: len(page_types)]
                         td1, td2 = st.columns(2)
                         td1.altair_chart(
-                            alt.Chart(daily_metrics)
+                            alt.Chart(pages_long)
                             .mark_bar(cornerRadiusTopRight=4, cornerRadiusTopLeft=4)
                             .encode(
-                                x=alt.X("run_date:T", title="Date"),
-                                y=alt.Y("scraped_pages:Q", title="Scraped Pages"),
-                                tooltip=["run_date:T", "runs:Q", "scraped_pages:Q", "failed_pages:Q"],
+                                x=usage_chart_data["x_encoding"],
+                                y=alt.Y(
+                                    "pages:Q",
+                                    title="Pages",
+                                    stack=True,
+                                    axis=alt.Axis(format=",.0f", tickMinStep=1, tickCount=5),
+                                    scale=alt.Scale(domain=[0, page_y_max]),
+                                ),
+                                color=alt.Color(
+                                    "page_type:N",
+                                    title="Outcome",
+                                    scale=alt.Scale(domain=page_types, range=page_colors),
+                                ),
+                                tooltip=[
+                                    tooltip_bucket,
+                                    alt.Tooltip("page_type:N", title="Outcome"),
+                                    alt.Tooltip("pages:Q", title="Pages", format=",.0f"),
+                                    alt.Tooltip("runs:Q", title="Runs", format=",.0f"),
+                                ],
                             )
-                            .properties(height=260),
+                            .properties(height=260, title=f"Pages by {x_title.lower()}"),
                             use_container_width=True,
                         )
                         td2.altair_chart(
-                            alt.Chart(daily_metrics)
-                            .mark_line(point=alt.OverlayMarkDef(size=24, filled=True))
+                            alt.Chart(grouped_usage)
+                            .mark_bar(cornerRadiusTopRight=4, cornerRadiusTopLeft=4, color="#cc785c")
                             .encode(
-                                x=alt.X("run_date:T", title="Date"),
-                                y=alt.Y("cost_usd:Q", title="Estimated Cost (USD)"),
-                                tooltip=["run_date:T", "cost_usd:Q", "provider_requests:Q"],
+                                x=usage_chart_data["x_encoding"],
+                                y=alt.Y(
+                                    "cost_usd:Q",
+                                    title="Estimated Cost (USD)",
+                                    axis=alt.Axis(format=cost_format, tickCount=5),
+                                    scale=alt.Scale(domain=[0, cost_y_max]),
+                                ),
+                                tooltip=[
+                                    tooltip_bucket,
+                                    alt.Tooltip("cost_usd:Q", title="Cost", format=cost_format),
+                                    alt.Tooltip("provider_requests:Q", title="Provider Requests", format=",.0f"),
+                                    alt.Tooltip("runs:Q", title="Runs", format=",.0f"),
+                                ],
                             )
-                            .properties(height=260),
+                            .properties(height=260, title=f"Cost by {x_title.lower()}"),
                             use_container_width=True,
                         )
 
@@ -4180,173 +4281,192 @@ if active_tab == WORKFLOW_TABS[6]:
                         hide_index=True,
                     )
 
-            st.markdown("### Selected Run Detail")
-            run_events = load_events(run_root)
-            site_events = load_events(site_root / "meta")
-            trace_df = _build_trace_df(
-                run_events=run_events,
-                site_events=site_events,
-                model_map=model_map,
-                tavily_per_call=tavily_per_call,
-                ollama_in_per_m=ollama_in_per_m,
-                ollama_out_per_m=ollama_out_per_m,
+            st.markdown("### Detailed Metrics Per Run")
+            load_detailed_run_metrics = st.toggle(
+                "Load detailed metrics per run",
+                value=False,
+                key="metrics_load_run_metrics",
+                help="Keep this off for the fast to-date dashboard. Turn it on when you want charts and provider events for one selected run.",
             )
-            pages, failures, run_status, _scrape_events = _load_run_analytics_inputs(st.session_state["site_id"], metrics_run, run_root)
-            selected_urls = read_json(run_root / "selected_urls.json", [])
-            cleanup_manifest = read_json(run_root / "cleanup_manifest.json", [])
-            cleaned_pages = [r for r in cleanup_manifest if isinstance(r, dict) and r.get("status") == "cleaned"]
-            skipped_pages = [r for r in cleanup_manifest if isinstance(r, dict) and r.get("status") == "skipped"]
-            total_hint = len(selected_urls) if isinstance(selected_urls, list) else None
-            page_summary = summarize_pages(pages, run_status=run_status, total_hint=total_hint)
-            duration_summary = summarize_durations(pages)
-            completion_df = build_completion_timeseries(pages)
-            slow_pages_df = build_slowest_pages_table(pages)
-            failure_summary = summarize_failures(pages, failures)
-            output_summary = summarize_output_volume(pages)
-
-            with st.container(border=True):
-                st.caption("Run Summary")
-                ra1, ra2, ra3, ra4, ra5 = st.columns(5)
-                ra1.metric("Selected URLs", _fmt_compact_number(len(selected_urls) if isinstance(selected_urls, list) else 0))
-                ra2.metric("Scraped Pages", _fmt_compact_number(int(page_summary.get("success", 0))))
-                ra3.metric("Cleaned Pages", _fmt_compact_number(len(cleaned_pages)))
-                ra4.metric("Skipped Pages", _fmt_compact_number(len(skipped_pages)))
-                ra5.metric("Failed Pages", _fmt_compact_number(int(page_summary.get("failed", 0))))
-                rb1, rb2, rb3, rb4, rb5 = st.columns(5)
-                rb1.metric("Elapsed", f"{float(page_summary.get('elapsed_sec', 0.0)) / 60.0:.1f} min")
-                rb2.metric("Pages / min", f"{float(page_summary.get('pages_per_min', 0.0)):.2f}")
-                eta_value = page_summary.get("eta_min")
-                rb3.metric("ETA", "n/a" if eta_value is None else f"{float(eta_value):.1f} min")
-                rb4.metric("P50 Duration", f"{float(duration_summary.get('p50_sec', 0.0)):.2f} s")
-                rb5.metric("P95 Duration", f"{float(duration_summary.get('p95_sec', 0.0)):.2f} s")
-                rc1, rc2, rc3 = st.columns(3)
-                rc1.metric("Markdown Bytes", _fmt_compact_number(int(output_summary.get("markdown_total_bytes", 0))))
-                rc2.metric("Raw HTML Bytes", _fmt_compact_number(int(output_summary.get("raw_html_total_bytes", 0))))
-                rc3.metric("Avg Text Length", _fmt_compact_number(float(output_summary.get("text_avg", 0.0))))
-
-            if completion_df.empty:
-                st.info("No completed pages yet for scrape charts.")
+            if not load_detailed_run_metrics:
+                st.info("Turn this on to inspect one run's timeline, failures, provider usage, and event table.")
             else:
-                cts1, cts2 = st.columns(2)
-                cts1.altair_chart(
-                    alt.Chart(completion_df)
-                    .mark_line(point=alt.OverlayMarkDef(size=22, filled=True))
-                    .encode(x=alt.X("bucket:T", title="Time"), y=alt.Y("completed:Q", title="Pages Completed"), tooltip=["bucket:T", "completed:Q", "success:Q", "failed:Q", "cancelled:Q"])
-                    .properties(height=300),
-                    use_container_width=True,
+                latest_run = real_run_choices[-1]
+                current_selected = st.session_state.get("metrics_run", "")
+                selected_run = current_selected if current_selected in real_run_choices else latest_run
+                metrics_run = st.selectbox(
+                    "Run",
+                    options=real_run_choices,
+                    index=real_run_choices.index(selected_run),
+                    key="metrics_run",
+                    format_func=lambda run_name: f"Run {_run_human_timestamp(run_name)}",
                 )
-                cts2.altair_chart(
-                    alt.Chart(completion_df)
-                    .mark_line(point=alt.OverlayMarkDef(size=22, filled=True))
-                    .encode(x=alt.X("bucket:T", title="Time"), y=alt.Y("ppm:Q", title="Pages / Minute"), tooltip=["bucket:T", "ppm:Q"])
-                    .properties(height=300),
-                    use_container_width=True,
+                run_root = site_root / metrics_run
+                st.markdown("#### Selected Run Detail")
+                run_events = load_events(run_root)
+                site_events = load_events(site_root / "meta")
+                trace_df = _build_trace_df(
+                    run_events=run_events,
+                    site_events=site_events,
+                    model_map=model_map,
+                    tavily_per_call=tavily_per_call,
+                    ollama_in_per_m=ollama_in_per_m,
+                    ollama_out_per_m=ollama_out_per_m,
                 )
+                pages, failures, run_status, _scrape_events = _load_run_analytics_inputs(st.session_state["site_id"], metrics_run, run_root)
+                selected_urls = read_json(run_root / "selected_urls.json", [])
+                cleanup_manifest = read_json(run_root / "cleanup_manifest.json", [])
+                cleaned_pages = [r for r in cleanup_manifest if isinstance(r, dict) and r.get("status") == "cleaned"]
+                skipped_pages = [r for r in cleanup_manifest if isinstance(r, dict) and r.get("status") == "skipped"]
+                total_hint = len(selected_urls) if isinstance(selected_urls, list) else None
+                page_summary = summarize_pages(pages, run_status=run_status, total_hint=total_hint)
+                duration_summary = summarize_durations(pages)
+                completion_df = build_completion_timeseries(pages)
+                slow_pages_df = build_slowest_pages_table(pages)
+                failure_summary = summarize_failures(pages, failures)
+                output_summary = summarize_output_volume(pages)
 
-            fr1, fr2, fr3 = st.columns(3)
-            for target, df, title in [
-                (fr1, failure_summary["by_reason"], "Reason"),
-                (fr2, failure_summary["by_fetch_mode"], "Fetch Mode"),
-                (fr3, failure_summary["by_http_status"], "HTTP Status"),
-            ]:
-                if df.empty:
-                    target.info(f"No failures by {title.lower()} yet.")
+                with st.container(border=True):
+                    st.caption("Run Summary")
+                    ra1, ra2, ra3, ra4, ra5 = st.columns(5)
+                    ra1.metric("Selected URLs", _fmt_compact_number(len(selected_urls) if isinstance(selected_urls, list) else 0))
+                    ra2.metric("Scraped Pages", _fmt_compact_number(int(page_summary.get("success", 0))))
+                    ra3.metric("Cleaned Pages", _fmt_compact_number(len(cleaned_pages)))
+                    ra4.metric("Skipped Pages", _fmt_compact_number(len(skipped_pages)))
+                    ra5.metric("Failed Pages", _fmt_compact_number(int(page_summary.get("failed", 0))))
+                    rb1, rb2, rb3, rb4, rb5 = st.columns(5)
+                    rb1.metric("Elapsed", f"{float(page_summary.get('elapsed_sec', 0.0)) / 60.0:.1f} min")
+                    rb2.metric("Pages / min", f"{float(page_summary.get('pages_per_min', 0.0)):.2f}")
+                    eta_value = page_summary.get("eta_min")
+                    rb3.metric("ETA", "n/a" if eta_value is None else f"{float(eta_value):.1f} min")
+                    rb4.metric("P50 Duration", f"{float(duration_summary.get('p50_sec', 0.0)):.2f} s")
+                    rb5.metric("P95 Duration", f"{float(duration_summary.get('p95_sec', 0.0)):.2f} s")
+                    rc1, rc2, rc3 = st.columns(3)
+                    rc1.metric("Markdown Bytes", _fmt_compact_number(int(output_summary.get("markdown_total_bytes", 0))))
+                    rc2.metric("Raw HTML Bytes", _fmt_compact_number(int(output_summary.get("raw_html_total_bytes", 0))))
+                    rc3.metric("Avg Text Length", _fmt_compact_number(float(output_summary.get("text_avg", 0.0))))
+
+                if completion_df.empty:
+                    st.info("No completed pages yet for scrape charts.")
                 else:
-                    target.altair_chart(
-                        alt.Chart(df.sort_values("count", ascending=False))
+                    cts1, cts2 = st.columns(2)
+                    cts1.altair_chart(
+                        alt.Chart(completion_df)
+                        .mark_line(point=alt.OverlayMarkDef(size=22, filled=True))
+                        .encode(x=alt.X("bucket:T", title="Time"), y=alt.Y("completed:Q", title="Pages Completed"), tooltip=["bucket:T", "completed:Q", "success:Q", "failed:Q", "cancelled:Q"])
+                        .properties(height=300),
+                        use_container_width=True,
+                    )
+                    cts2.altair_chart(
+                        alt.Chart(completion_df)
+                        .mark_line(point=alt.OverlayMarkDef(size=22, filled=True))
+                        .encode(x=alt.X("bucket:T", title="Time"), y=alt.Y("ppm:Q", title="Pages / Minute"), tooltip=["bucket:T", "ppm:Q"])
+                        .properties(height=300),
+                        use_container_width=True,
+                    )
+
+                fr1, fr2, fr3 = st.columns(3)
+                for target, df, title in [
+                    (fr1, failure_summary["by_reason"], "Reason"),
+                    (fr2, failure_summary["by_fetch_mode"], "Fetch Mode"),
+                    (fr3, failure_summary["by_http_status"], "HTTP Status"),
+                ]:
+                    if df.empty:
+                        target.info(f"No failures by {title.lower()} yet.")
+                    else:
+                        target.altair_chart(
+                            alt.Chart(df.sort_values("count", ascending=False))
+                            .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+                            .encode(x=alt.X("count:Q", title="Count"), y=alt.Y("label:N", title=title, sort="-x"), tooltip=["label", "count"])
+                            .properties(height=240),
+                            use_container_width=True,
+                        )
+                if not slow_pages_df.empty:
+                    st.caption("Slowest Pages")
+                    st.dataframe(slow_pages_df, use_container_width=True, hide_index=True)
+
+                st.markdown("### Provider Requests And Cost")
+                if trace_df.empty:
+                    st.info("No OpenRouter, Tavily, or Ollama events are recorded for this run yet.")
+                else:
+                    trace_df["ts"] = pd.to_datetime(trace_df.get("ts"), errors="coerce", utc=True)
+                    trace_df["provider"] = trace_df.get("provider", "unknown").fillna("unknown").astype(str)
+                    trace_df["operation"] = trace_df.get("operation", "unknown").fillna("unknown").astype(str)
+                    trace_df["model"] = trace_df.get("model", "unknown").fillna("unknown").astype(str)
+                    trace_df["prompt_tokens"] = pd.to_numeric(trace_df.get("prompt_tokens"), errors="coerce").fillna(0.0)
+                    trace_df["completion_tokens"] = pd.to_numeric(trace_df.get("completion_tokens"), errors="coerce").fillna(0.0)
+                    trace_df["total_tokens"] = pd.to_numeric(trace_df.get("total_tokens"), errors="coerce").fillna(trace_df["prompt_tokens"] + trace_df["completion_tokens"])
+                    trace_df["cost_usd"] = pd.to_numeric(trace_df.get("cost_usd"), errors="coerce").fillna(0.0)
+                    billable_trace = trace_df[~trace_df.get("is_summary", pd.Series(False, index=trace_df.index)).fillna(False).astype(bool)].copy()
+                    provider_counts = billable_trace.groupby("provider", as_index=False).size().rename(columns={"size": "requests"}).sort_values("requests", ascending=False)
+                    model_counts = billable_trace.groupby(["provider", "model"], as_index=False).size().rename(columns={"size": "requests"}).sort_values("requests", ascending=False)
+                    operation_counts = billable_trace.groupby(["provider", "operation"], as_index=False).size().rename(columns={"size": "requests"}).sort_values("requests", ascending=False)
+                    cost_by_provider = billable_trace.groupby("provider", as_index=False)["cost_usd"].sum().sort_values("cost_usd", ascending=False)
+                    token_ts = billable_trace.dropna(subset=["ts"]).copy()
+                    if not token_ts.empty:
+                        token_ts["bucket"] = token_ts["ts"].dt.floor("min")
+                        token_ts = token_ts.groupby(["bucket", "provider"], as_index=False)[["prompt_tokens", "completion_tokens", "total_tokens", "cost_usd"]].sum()
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Provider Requests", _fmt_compact_number(float(len(billable_trace))))
+                    m2.metric("OpenRouter", _fmt_compact_number(float((billable_trace["provider"] == "openrouter").sum())))
+                    m3.metric("Tavily", _fmt_compact_number(float((billable_trace["provider"] == "tavily").sum())))
+                    m4.metric("Ollama", _fmt_compact_number(float((billable_trace["provider"] == "ollama").sum())))
+
+                    p1, p2 = st.columns(2)
+                    p1.altair_chart(
+                        alt.Chart(provider_counts)
                         .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
-                        .encode(x=alt.X("count:Q", title="Count"), y=alt.Y("label:N", title=title, sort="-x"), tooltip=["label", "count"])
-                        .properties(height=240),
+                        .encode(x=alt.X("requests:Q", title="Requests"), y=alt.Y("provider:N", title="Provider", sort="-x"), tooltip=["provider", "requests"])
+                        .properties(height=260),
                         use_container_width=True,
                     )
-            if not slow_pages_df.empty:
-                st.caption("Slowest Pages")
-                st.dataframe(slow_pages_df, use_container_width=True, hide_index=True)
-
-            st.markdown("### Provider Requests And Cost")
-            if trace_df.empty:
-                st.info("No OpenRouter, Tavily, or Ollama events are recorded for this run yet.")
-            else:
-                trace_df["ts"] = pd.to_datetime(trace_df.get("ts"), errors="coerce", utc=True)
-                trace_df["provider"] = trace_df.get("provider", "unknown").fillna("unknown").astype(str)
-                trace_df["operation"] = trace_df.get("operation", "unknown").fillna("unknown").astype(str)
-                trace_df["model"] = trace_df.get("model", "unknown").fillna("unknown").astype(str)
-                trace_df["prompt_tokens"] = pd.to_numeric(trace_df.get("prompt_tokens"), errors="coerce").fillna(0.0)
-                trace_df["completion_tokens"] = pd.to_numeric(trace_df.get("completion_tokens"), errors="coerce").fillna(0.0)
-                trace_df["total_tokens"] = pd.to_numeric(trace_df.get("total_tokens"), errors="coerce").fillna(trace_df["prompt_tokens"] + trace_df["completion_tokens"])
-                trace_df["cost_usd"] = pd.to_numeric(trace_df.get("cost_usd"), errors="coerce").fillna(0.0)
-                billable_trace = trace_df[~trace_df.get("is_summary", pd.Series(False, index=trace_df.index)).fillna(False).astype(bool)].copy()
-                provider_counts = billable_trace.groupby("provider", as_index=False).size().rename(columns={"size": "requests"}).sort_values("requests", ascending=False)
-                model_counts = billable_trace.groupby(["provider", "model"], as_index=False).size().rename(columns={"size": "requests"}).sort_values("requests", ascending=False)
-                operation_counts = billable_trace.groupby(["provider", "operation"], as_index=False).size().rename(columns={"size": "requests"}).sort_values("requests", ascending=False)
-                cost_by_provider = billable_trace.groupby("provider", as_index=False)["cost_usd"].sum().sort_values("cost_usd", ascending=False)
-                token_ts = billable_trace.dropna(subset=["ts"]).copy()
-                if not token_ts.empty:
-                    token_ts["bucket"] = token_ts["ts"].dt.floor("min")
-                    token_ts = token_ts.groupby(["bucket", "provider"], as_index=False)[["prompt_tokens", "completion_tokens", "total_tokens", "cost_usd"]].sum()
-
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Provider Requests", _fmt_compact_number(float(len(billable_trace))))
-                m2.metric("OpenRouter", _fmt_compact_number(float((billable_trace["provider"] == "openrouter").sum())))
-                m3.metric("Tavily", _fmt_compact_number(float((billable_trace["provider"] == "tavily").sum())))
-                m4.metric("Ollama", _fmt_compact_number(float((billable_trace["provider"] == "ollama").sum())))
-
-                p1, p2 = st.columns(2)
-                p1.altair_chart(
-                    alt.Chart(provider_counts)
-                    .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
-                    .encode(x=alt.X("requests:Q", title="Requests"), y=alt.Y("provider:N", title="Provider", sort="-x"), tooltip=["provider", "requests"])
-                    .properties(height=260),
-                    use_container_width=True,
-                )
-                p2.altair_chart(
-                    alt.Chart(cost_by_provider)
-                    .mark_arc(innerRadius=45)
-                    .encode(theta=alt.Theta("cost_usd:Q", title="Estimated Cost"), color=alt.Color("provider:N", title="Provider"), tooltip=["provider", "cost_usd"])
-                    .properties(height=260),
-                    use_container_width=True,
-                )
-                p3, p4 = st.columns(2)
-                p3.altair_chart(
-                    alt.Chart(model_counts.head(30))
-                    .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
-                    .encode(x=alt.X("requests:Q", title="Requests"), y=alt.Y("model:N", title="Model", sort="-x"), color=alt.Color("provider:N", title="Provider"), tooltip=["provider", "model", "requests"])
-                    .properties(height=360),
-                    use_container_width=True,
-                )
-                p4.altair_chart(
-                    alt.Chart(operation_counts.head(30))
-                    .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
-                    .encode(x=alt.X("requests:Q", title="Requests"), y=alt.Y("operation:N", title="Operation", sort="-x"), color=alt.Color("provider:N", title="Provider"), tooltip=["provider", "operation", "requests"])
-                    .properties(height=360),
-                    use_container_width=True,
-                )
-                if token_ts.empty:
-                    st.info("No token or cost time series data yet.")
-                else:
-                    t1, t2 = st.columns(2)
-                    t1.altair_chart(
-                        alt.Chart(token_ts)
-                        .mark_area(opacity=0.7)
-                        .encode(x=alt.X("bucket:T", title="Time"), y=alt.Y("total_tokens:Q", title="Tokens"), color=alt.Color("provider:N", title="Provider"), tooltip=["bucket:T", "provider", "total_tokens"])
-                        .properties(height=300),
+                    p2.altair_chart(
+                        alt.Chart(cost_by_provider)
+                        .mark_arc(innerRadius=45)
+                        .encode(theta=alt.Theta("cost_usd:Q", title="Estimated Cost"), color=alt.Color("provider:N", title="Provider"), tooltip=["provider", "cost_usd"])
+                        .properties(height=260),
                         use_container_width=True,
                     )
-                    t2.altair_chart(
-                        alt.Chart(token_ts)
-                        .mark_line(point=alt.OverlayMarkDef(size=18, filled=True))
-                        .encode(x=alt.X("bucket:T", title="Time"), y=alt.Y("cost_usd:Q", title="Estimated Cost (USD)"), color=alt.Color("provider:N", title="Provider"), tooltip=["bucket:T", "provider", "cost_usd"])
-                        .properties(height=300),
+                    p3, p4 = st.columns(2)
+                    p3.altair_chart(
+                        alt.Chart(model_counts.head(30))
+                        .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+                        .encode(x=alt.X("requests:Q", title="Requests"), y=alt.Y("model:N", title="Model", sort="-x"), color=alt.Color("provider:N", title="Provider"), tooltip=["provider", "model", "requests"])
+                        .properties(height=360),
                         use_container_width=True,
                     )
-                with st.expander("Provider event table", expanded=False):
-                    st.dataframe(
-                        billable_trace[[c for c in ["ts", "provider", "operation", "model", "status", "prompt_tokens", "completion_tokens", "total_tokens", "latency_ms", "cost_usd"] if c in billable_trace.columns]],
+                    p4.altair_chart(
+                        alt.Chart(operation_counts.head(30))
+                        .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+                        .encode(x=alt.X("requests:Q", title="Requests"), y=alt.Y("operation:N", title="Operation", sort="-x"), color=alt.Color("provider:N", title="Provider"), tooltip=["provider", "operation", "requests"])
+                        .properties(height=360),
                         use_container_width=True,
-                        hide_index=True,
                     )
-
-# with tabs[7]:
+                    if token_ts.empty:
+                        st.info("No token or cost time series data yet.")
+                    else:
+                        t1, t2 = st.columns(2)
+                        t1.altair_chart(
+                            alt.Chart(token_ts)
+                            .mark_area(opacity=0.7)
+                            .encode(x=alt.X("bucket:T", title="Time"), y=alt.Y("total_tokens:Q", title="Tokens"), color=alt.Color("provider:N", title="Provider"), tooltip=["bucket:T", "provider", "total_tokens"])
+                            .properties(height=300),
+                            use_container_width=True,
+                        )
+                        t2.altair_chart(
+                            alt.Chart(token_ts)
+                            .mark_line(point=alt.OverlayMarkDef(size=18, filled=True))
+                            .encode(x=alt.X("bucket:T", title="Time"), y=alt.Y("cost_usd:Q", title="Estimated Cost (USD)"), color=alt.Color("provider:N", title="Provider"), tooltip=["bucket:T", "provider", "cost_usd"])
+                            .properties(height=300),
+                            use_container_width=True,
+                        )
+                    with st.expander("Provider event table", expanded=False):
+                        st.dataframe(
+                            billable_trace[[c for c in ["ts", "provider", "operation", "model", "status", "prompt_tokens", "completion_tokens", "total_tokens", "latency_ms", "cost_usd"] if c in billable_trace.columns]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 if active_tab == WORKFLOW_TABS[7]:
     st.subheader("Settings")
     st.caption("Configure local providers, models, scraping, retrieval, and research.")

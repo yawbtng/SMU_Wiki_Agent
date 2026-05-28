@@ -113,6 +113,101 @@ def _fixture_site(tmp_path: Path) -> Path:
     return site_root
 
 
+def test_wiki_documents_include_nested_category_source_pages(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_index import _wiki_documents
+
+    site_root = tmp_path / "site"
+    nested = site_root / "wiki" / "pages" / "programs"
+    nested.mkdir(parents=True)
+    (nested / "computer-science.md").write_text(
+        "---\ntitle: Computer Science\nsource_ids:\n  - web_cs\ntags:\n  - programs\nupdated_at: now\n---\n# Computer Science\n\nProgram details.",
+        encoding="utf-8",
+    )
+
+    docs, invalid = _wiki_documents(site_root, chunk_chars=1000, overlap=0)
+
+    assert invalid == []
+    assert docs
+    assert docs[0].path == "wiki/pages/programs/computer-science.md"
+    assert docs[0].source_ids == ["web_cs"]
+
+
+def test_wiki_documents_preserve_school_department_and_office_routing(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_index import _wiki_documents
+
+    site_root = tmp_path / "site"
+    nested = site_root / "wiki" / "pages" / "registrar"
+    nested.mkdir(parents=True)
+    (nested / "computer-science.md").write_text(
+        "---\n"
+        "title: Computer Science Registrar Guide\n"
+        "source_ids:\n  - web_cs\n"
+        "tags:\n  - registrar\n"
+        "schools:\n  - lyle-school-of-engineering\n"
+        "departments:\n  - computer-science\n"
+        "offices:\n  - registrar\n"
+        f"updated_at: {NOW}\n"
+        "---\n"
+        "# Computer Science Registrar Guide\n\nEnrollment and transcript details.",
+        encoding="utf-8",
+    )
+
+    docs, invalid = _wiki_documents(site_root, chunk_chars=1000, overlap=0)
+
+    assert invalid == []
+    assert docs[0].metadata["routing"]["schools"] == ["lyle-school-of-engineering"]
+    assert docs[0].metadata["routing"]["departments"] == ["computer-science"]
+    assert docs[0].metadata["routing"]["offices"] == ["registrar"]
+
+
+def test_query_prefers_semantic_cox_pages_for_multi_aspect_student_question(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+
+    site_root = tmp_path / "site"
+    raw = _write_source(
+        site_root,
+        source_id="web_cox_admissions",
+        title="Cox Admissions Raw",
+        body="# Cox Admissions\n\nGraduate applicants apply by February 1. Tuition and courses are described by Cox.",
+    )
+    raw["wiki_page_paths"] = ["wiki/pages/schools/cox/graduate.md"]
+    write_registry_rows(site_root / "raw_sources" / "registry.jsonl", [raw])
+    semantic = site_root / "wiki" / "pages" / "schools" / "cox"
+    semantic.mkdir(parents=True)
+    (semantic / "graduate.md").write_text(
+        "---\n"
+        "title: Cox Graduate Student Guide\n"
+        "page_type: semantic\n"
+        "school: cox\n"
+        "programs:\n  - mba\n"
+        "degree_levels:\n  - graduate\n"
+        "intents:\n  - study\n  - apply\n  - pay\n"
+        "topics:\n  - courses\n  - costs\n  - admissions\n"
+        "source_priority: semantic-wiki\n"
+        "source_ids:\n  - web_cox_admissions\n"
+        "tags:\n  - cox\n  - graduate\n"
+        f"updated_at: {NOW}\n"
+        "---\n"
+        "# Cox Graduate Student Guide\n\n"
+        "## Courses / Curriculum\nCox graduate courses and curriculum are summarized here.\n\n"
+        "## Costs / Fees / Aid\nTuition and course fees are summarized here.\n\n"
+        "## Admissions / Requirements / Deadlines\nAdmissions process and deadlines are summarized here.\n",
+        encoding="utf-8",
+    )
+
+    build_llm_wiki_index(site_root, now=NOW)
+    response = query_llm_wiki_index(
+        site_root,
+        "I am a new graduate student likely joining Cox; tell me about courses, course fees, and the admission process",
+        max_evidence=3,
+    )
+
+    assert response["status"] == "ok"
+    assert response["evidence"]
+    assert response["evidence"][0]["path"] == "wiki/pages/schools/cox/graduate.md"
+    assert response["evidence"][0]["metadata"]["routing"]["page_type"] == "semantic"
+
+
 def test_build_query_prefers_relevant_wiki_and_includes_raw_support(tmp_path: Path) -> None:
     from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
 
@@ -162,6 +257,103 @@ def test_raw_source_fallback_when_wiki_is_weak(tmp_path: Path) -> None:
     assert response["evidence"][0]["source_kind"] == "pdf"
     assert response["evidence"][0]["source_id"] == "pdf_catalog"
     assert "raw_source_fallback" in response["evidence"][0]["ranking_reasons"]
+
+
+def test_mcp_query_uses_bm25_wiki_first_for_factual_questions(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_mcp_wiki_index
+
+    site_root = _fixture_site(tmp_path)
+    build_llm_wiki_index(site_root, now=NOW)
+
+    response = query_mcp_wiki_index(site_root, "When is the admissions application deadline?", max_evidence=2)
+
+    assert response["status"] == "ok"
+    assert response["metadata"]["retrieval"]["query_type"] == "factual"
+    assert response["metadata"]["retrieval"]["selected_strategy"] == "wiki_bm25"
+    assert response["metadata"]["retrieval"]["attempted_strategies"] == ["wiki_bm25"]
+    assert response["evidence"][0]["source_kind"] == "wiki"
+    assert response["evidence"][0]["path"] == "wiki/pages/admissions.md"
+    assert response["evidence"][0]["scores"]["bm25"] > 0
+    assert "bm25_wiki_match" in response["evidence"][0]["ranking_reasons"]
+    assert any("bm25_cited_raw_support" in row["ranking_reasons"] for row in response["evidence"])
+
+
+def test_mcp_factual_bm25_falls_back_to_hybrid_when_wiki_has_no_hit(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_mcp_wiki_index
+
+    site_root = _fixture_site(tmp_path)
+    build_llm_wiki_index(site_root, now=NOW)
+
+    response = query_mcp_wiki_index(site_root, "graduate catalog tuition credits", max_evidence=2)
+
+    assert response["status"] == "ok"
+    assert response["metadata"]["retrieval"]["query_type"] == "factual"
+    assert response["metadata"]["retrieval"]["selected_strategy"] == "hybrid_fallback"
+    assert response["metadata"]["retrieval"]["attempted_strategies"] == ["wiki_bm25", "hybrid"]
+    assert response["evidence"][0]["source_kind"] == "pdf"
+    assert response["evidence"][0]["source_id"] == "pdf_catalog"
+
+
+def test_mcp_query_wiki_tool_uses_auto_routing(tmp_path: Path, monkeypatch) -> None:
+    from mcp_servers import llm_wiki_mcp
+    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index
+
+    site_root = _fixture_site(tmp_path)
+    build_llm_wiki_index(site_root, now=NOW)
+    monkeypatch.setattr(llm_wiki_mcp, "SITE_ROOT", site_root.resolve())
+
+    response = llm_wiki_mcp.query_wiki("When is the admissions application deadline?", max_results=2)
+
+    assert response["ok"] is True
+    assert response["metadata"]["retrieval"]["selected_strategy"] == "wiki_bm25"
+    assert response["evidence"][0]["path"] == "wiki/pages/admissions.md"
+
+
+def test_mcp_query_uses_vector_search_for_reasoning_questions(tmp_path: Path) -> None:
+    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_mcp_wiki_index
+
+    site_root = tmp_path / "site"
+    pathway = _write_source(
+        site_root,
+        source_id="web_pathway",
+        title="Startup Mentorship Pathway",
+        body="# Startup Mentorship Pathway\n\nStudents choose the startup mentorship pathway for venture labs and coaching.",
+    )
+    calendar = _write_source(
+        site_root,
+        source_id="web_calendar",
+        title="Academic Calendar",
+        body="# Academic Calendar\n\nThe fall deadline is October 1 and the spring deadline is March 1.",
+    )
+    pathway["wiki_page_paths"] = ["wiki/pages/startup-pathway.md"]
+    calendar["wiki_page_paths"] = ["wiki/pages/calendar.md"]
+    write_registry_rows(site_root / "raw_sources" / "registry.jsonl", [pathway, calendar])
+    _write_wiki_page(
+        site_root,
+        name="startup-pathway",
+        title="Startup Mentorship Pathway",
+        tags=["entrepreneurship"],
+        source_ids=["web_pathway"],
+        body="# Startup Mentorship Pathway\n\nThe startup mentorship pathway helps students choose venture labs and coaching.",
+    )
+    _write_wiki_page(
+        site_root,
+        name="calendar",
+        title="Academic Calendar",
+        tags=["dates"],
+        source_ids=["web_calendar"],
+        body="# Academic Calendar\n\nFall deadline details and spring deadline details are listed here.",
+    )
+    build_llm_wiki_index(site_root, now=NOW)
+
+    response = query_mcp_wiki_index(site_root, "Why should a student choose the startup mentorship pathway?", max_evidence=2)
+
+    assert response["status"] == "ok"
+    assert response["metadata"]["retrieval"]["query_type"] == "reasoning"
+    assert response["metadata"]["retrieval"]["selected_strategy"] == "vector"
+    assert response["evidence"][0]["path"] == "wiki/pages/startup-pathway.md"
+    assert "vector_candidate" in response["evidence"][0]["ranking_reasons"]
+    assert response["evidence"][0]["scores"]["retrieval_vector"] > 0
 
 
 def test_profile_routing_prefers_undergraduate_page_over_graduate_noise(tmp_path: Path) -> None:
