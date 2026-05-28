@@ -2,11 +2,16 @@
 
 ## Goal
 
-Make the Streamlit Wiki tab launch, monitor, and verify LLM Wiki builds through the Pi SDK streaming runtime only for normal UI operation. Remove the user-facing deterministic Python runtime path from the Wiki UI.
+Make the Wiki tab launch, monitor, and verify LLM Wiki builds through the Pi SDK streaming runtime only for normal UI operation. Remove the user-facing deterministic Python runtime path from the Wiki UI.
+
+## UI Target
+
+Implement in the **FastAPI + React webapp** (`specs/006-fastapi-react-realtime-app.md`, worktree `ultra-fast-rag-webapp`). Do not add major new Streamlit UI for this spec. Streamlit (`app.py`) remains a read-only parity reference until feature parity is reached.
 
 ## Context
 
-- Main UI: `app.py`, Wiki workflow tab.
+- Primary UI: `ultra-fast-rag-webapp/frontend/` Wiki tab + `src/scrape_planner/webapp/api.py` action/status endpoints.
+- Legacy parity reference: `app.py`, Wiki workflow tab.
 - Launcher: `src/scrape_planner/llm_wiki_builder.py::launch_wiki_builder`.
 - Pi SDK runner: `scripts/pi-sdk-wiki-runner.mjs`.
 - Target workspace for smoke verification: `data/sites/www.smu.edu`.
