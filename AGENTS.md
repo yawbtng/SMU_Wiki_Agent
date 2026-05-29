@@ -39,8 +39,27 @@ Git rules:
 
 ## Skill routing
 
-- At the start of nontrivial work, or when unsure which workflow applies, read and follow `.cursor/skills/skill-router/SKILL.md` (`skill-router`).
-- That skill maps task types to installed plugin skills, Pi skills, and Ralph modes. Do not guess—route first, then load the chosen skill in full.
+Use the skill router as the source of truth. Do not choose skills from memory or invent unavailable tools/services.
+
+Protocol:
+
+1. For any nontrivial task, ambiguous request, multi-step implementation, broad investigation, verification request, or autonomous loop, read `.cursor/skills/skill-router/SKILL.md` first.
+2. Classify the user request using the router's task table and quick-decision rules.
+3. Pick one primary skill, plus only the optional chain the router explicitly recommends.
+4. Read the chosen skill's `SKILL.md` in full before acting.
+5. Follow that skill's workflow exactly, while still obeying this `AGENTS.md` file.
+6. If no skill clearly applies, say so briefly and proceed with the default git-first + verify workflow.
+
+Default routing reminders:
+
+- Broad explore/audit/investigation → use `explorer` and CodeGraph-first searches.
+- Design/API shape before coding → route through the architect/pstack guidance.
+- Bug/fix/prove-it work → route through fix-root-cause + prove-it/verification guidance.
+- Streamlit or UI behavior changes → route through UI verification guidance, but ask before implementing visual/product changes.
+- Wiki build/refresh work → use the project Pi wiki skills when the user asks to build/refresh/run the wiki.
+- Ralph/autonomous loops → use the Pi Ralph or Cursor Ralph path exactly as routed.
+
+Do not add Tavily, external search, cloud-agent, GTM/sales, PR/CI shipping, or other plugin/tool assumptions unless the router and the user's request explicitly call for them.
 
 ## Cursor Engineering Plugins
 
@@ -131,3 +150,4 @@ For stale-content questions, recommend refresh discovery/scrape, re-normalize so
 - The user expects a git-first workflow for all changes: status/diff first, small focused edits, verification, and scoped commits following GitHub hygiene.
 - Do not add explanatory UI/code artifacts, such as diagrams, unless the user explicitly asks to implement them in the product.
 - The user prefers concise, evidence-backed reports with clear “keep/remove/next action” recommendations.
+- The user expects agents to choose skills by reading the skill router first, not by guessing or adding unrelated services/tools.
