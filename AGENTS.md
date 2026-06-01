@@ -61,6 +61,28 @@ Default routing reminders:
 
 Do not add Tavily, external search, cloud-agent, GTM/sales, PR/CI shipping, or other plugin/tool assumptions unless the router and the user's request explicitly call for them.
 
+## Standard feature workflow
+
+For any nontrivial feature, behavior change, or bug fix, follow this ordered pipeline. Each stage gates the next: do not start a stage until the previous one is complete and its output reviewed.
+
+1. **Plan with OpenSpec.** Turn the idea into OpenSpec artifacts before writing code. Scaffold with `openspec new change <change-name>`, then author `proposal.md`, `design.md`, `specs/<capability>/spec.md`, and `tasks.md`. Validate with `openspec validate <change-name> --strict` and confirm `openspec status --change <change-name>` shows all artifacts complete. Plans are written, not improvised.
+2. **Interrogate the plan.** Run the pstack `interrogate` skill (`/interrogate`) to spawn the four-model adversarial review over the proposal/design/specs (or the diff once code exists). Synthesize the verdict and resolve every "Act on" finding before implementing. Do not auto-apply reviewer suggestions; fold accepted findings back into the OpenSpec artifacts.
+3. **Write the failing test first (TDD).** Use the pstack `tdd` skill (`/tdd`): for each task with a practical test path, add the narrowest regression test that encodes intended behavior and confirm it fails for the right reason before touching production code. If a failing test is impractical, say why and name the closest executable check instead.
+4. **Implement with Ralph.** Drive the implementation through the **ralph-loop** plugin against the OpenSpec change, e.g.:
+
+   ```
+   /ralph-loop:ralph-loop "Implement spec {change-name} from openspec/changes/{change-name}/.
+   Complete ALL tasks in tasks.md and satisfy every spec scenario.
+   Output <promise>DONE</promise> when complete." --completion-promise "DONE" --max-iterations 30
+   ```
+
+   Mark `tasks.md` items complete as they land; keep the loop scoped to the change's tasks and specs.
+5. **Deslop.** Run the cursor-team-kit `deslop` skill (`/deslop`) on the branch diff to strip AI-generated slop (redundant comments, abnormal defensive blocks, `any` casts, needless nesting) without changing behavior.
+6. **Adversarial branch audit.** Delegate to the `thermo-nuclear-review-subagent` (via the Task tool) for a deep bugs/breaking-changes/security/feature-gate audit scoped to the diff. Resolve blocking findings.
+7. **Verify the UI.** Use `agent-browser` to exercise the running app for any change that touches UI/behavior: navigate the affected flows, take screenshots, and confirm no new errors. For Streamlit/web specifics, pair with the UI verification guidance from the router.
+
+This pipeline does not replace the mandatory git-first workflow, the approval boundary, or verification-before-completion rules above; it runs inside them. Skip a stage only when it is genuinely inapplicable (e.g., docs-only changes), and say so explicitly.
+
 ## Cursor Engineering Plugins
 
 Installed under `~/.cursor/plugins/local/` from [cursor/plugins](https://github.com/cursor/plugins). Reload Cursor after install changes.
