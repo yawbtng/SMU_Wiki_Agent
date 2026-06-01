@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from src.scrape_planner.source_registry import build_source_row, checksum_text, write_registry_rows
+from src.scrape_planner.sources.source_registry import build_source_row, checksum_text, write_registry_rows
 
 
 NOW = "2026-05-21T12:00:00+00:00"
@@ -114,7 +114,7 @@ def _fixture_site(tmp_path: Path) -> Path:
 
 
 def test_wiki_documents_include_nested_category_source_pages(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import _wiki_documents
+    from src.scrape_planner.wiki.llm_wiki_index import _wiki_documents
 
     site_root = tmp_path / "site"
     nested = site_root / "wiki" / "pages" / "programs"
@@ -133,7 +133,7 @@ def test_wiki_documents_include_nested_category_source_pages(tmp_path: Path) -> 
 
 
 def test_wiki_documents_preserve_school_department_and_office_routing(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import _wiki_documents
+    from src.scrape_planner.wiki.llm_wiki_index import _wiki_documents
 
     site_root = tmp_path / "site"
     nested = site_root / "wiki" / "pages" / "registrar"
@@ -161,7 +161,7 @@ def test_wiki_documents_preserve_school_department_and_office_routing(tmp_path: 
 
 
 def test_query_prefers_semantic_cox_pages_for_multi_aspect_student_question(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
 
     site_root = tmp_path / "site"
     raw = _write_source(
@@ -208,8 +208,39 @@ def test_query_prefers_semantic_cox_pages_for_multi_aspect_student_question(tmp_
     assert response["evidence"][0]["metadata"]["routing"]["page_type"] == "semantic"
 
 
+def test_query_returns_next_pages_from_navigation_manifest(tmp_path: Path) -> None:
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+
+    site_root = _fixture_site(tmp_path)
+    (site_root / "wiki" / "navigation_manifest.json").write_text(
+        json.dumps(
+            {
+                "pages": [
+                    {
+                        "page_id": "graduate-application-workflow",
+                        "title": "Graduate Application Workflow",
+                        "path": "wiki/pages/workflows/graduate-application-workflow.md",
+                        "summary": "Next page for admissions requirements and application steps.",
+                        "page_type": "workflow",
+                        "tags": ["admissions", "graduate"],
+                        "entities": ["Graduate Admissions"],
+                        "priority": 95,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    build_llm_wiki_index(site_root, now=NOW)
+
+    response = query_llm_wiki_index(site_root, "What is the admissions application deadline?", max_evidence=1)
+
+    assert response["metadata"]["next_pages"]
+    assert response["metadata"]["next_pages"][0]["title"] == "Graduate Application Workflow"
+
+
 def test_build_query_prefers_relevant_wiki_and_includes_raw_support(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
 
     site_root = _fixture_site(tmp_path)
 
@@ -219,7 +250,9 @@ def test_build_query_prefers_relevant_wiki_and_includes_raw_support(tmp_path: Pa
     assert report["wiki_index_count"] == 1
     assert report["changed_raw_count"] == report["raw_index_count"]
     assert report["changed_wiki_count"] == 1
-    assert report["embedding"]["provider"] == "deterministic-hash-embedding"
+    assert report["embedding"]["provider"] == "ollama"
+    assert report["embedding"]["fallback_provider"] == "deterministic-hash-embedding"
+    assert report["embedding"]["degraded"] is True
     assert report["embedding"]["vector_dimensions"] > 0
 
     docs = [
@@ -246,7 +279,7 @@ def test_build_query_prefers_relevant_wiki_and_includes_raw_support(tmp_path: Pa
 
 
 def test_raw_source_fallback_when_wiki_is_weak(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
 
     site_root = _fixture_site(tmp_path)
     build_llm_wiki_index(site_root, now=NOW)
@@ -256,11 +289,11 @@ def test_raw_source_fallback_when_wiki_is_weak(tmp_path: Path) -> None:
     assert response["status"] == "ok"
     assert response["evidence"][0]["source_kind"] == "pdf"
     assert response["evidence"][0]["source_id"] == "pdf_catalog"
-    assert "raw_source_fallback" in response["evidence"][0]["ranking_reasons"]
+    assert response["evidence"][0]["scores"]["vector"] > 0
 
 
 def test_mcp_query_uses_bm25_wiki_first_for_factual_questions(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_mcp_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_mcp_wiki_index
 
     site_root = _fixture_site(tmp_path)
     build_llm_wiki_index(site_root, now=NOW)
@@ -269,8 +302,8 @@ def test_mcp_query_uses_bm25_wiki_first_for_factual_questions(tmp_path: Path) ->
 
     assert response["status"] == "ok"
     assert response["metadata"]["retrieval"]["query_type"] == "factual"
-    assert response["metadata"]["retrieval"]["selected_strategy"] == "wiki_bm25"
-    assert response["metadata"]["retrieval"]["attempted_strategies"] == ["wiki_bm25"]
+    assert response["metadata"]["retrieval"]["selected_strategy"] == "hybrid_fused"
+    assert response["metadata"]["retrieval"]["attempted_strategies"] == ["wiki_bm25", "vector"]
     assert response["evidence"][0]["source_kind"] == "wiki"
     assert response["evidence"][0]["path"] == "wiki/pages/admissions.md"
     assert response["evidence"][0]["scores"]["bm25"] > 0
@@ -279,7 +312,7 @@ def test_mcp_query_uses_bm25_wiki_first_for_factual_questions(tmp_path: Path) ->
 
 
 def test_mcp_factual_bm25_falls_back_to_hybrid_when_wiki_has_no_hit(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_mcp_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_mcp_wiki_index
 
     site_root = _fixture_site(tmp_path)
     build_llm_wiki_index(site_root, now=NOW)
@@ -288,15 +321,15 @@ def test_mcp_factual_bm25_falls_back_to_hybrid_when_wiki_has_no_hit(tmp_path: Pa
 
     assert response["status"] == "ok"
     assert response["metadata"]["retrieval"]["query_type"] == "factual"
-    assert response["metadata"]["retrieval"]["selected_strategy"] == "hybrid_fallback"
-    assert response["metadata"]["retrieval"]["attempted_strategies"] == ["wiki_bm25", "hybrid"]
+    assert response["metadata"]["retrieval"]["selected_strategy"] == "hybrid_fused"
+    assert response["metadata"]["retrieval"]["attempted_strategies"] == ["wiki_bm25", "vector"]
     assert response["evidence"][0]["source_kind"] == "pdf"
     assert response["evidence"][0]["source_id"] == "pdf_catalog"
 
 
 def test_mcp_query_wiki_tool_uses_auto_routing(tmp_path: Path, monkeypatch) -> None:
     from mcp_servers import llm_wiki_mcp
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index
 
     site_root = _fixture_site(tmp_path)
     build_llm_wiki_index(site_root, now=NOW)
@@ -305,12 +338,12 @@ def test_mcp_query_wiki_tool_uses_auto_routing(tmp_path: Path, monkeypatch) -> N
     response = llm_wiki_mcp.query_wiki("When is the admissions application deadline?", max_results=2)
 
     assert response["ok"] is True
-    assert response["metadata"]["retrieval"]["selected_strategy"] == "wiki_bm25"
+    assert response["metadata"]["retrieval"]["selected_strategy"] == "hybrid_fused"
     assert response["evidence"][0]["path"] == "wiki/pages/admissions.md"
 
 
 def test_mcp_query_uses_vector_search_for_reasoning_questions(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_mcp_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_mcp_wiki_index
 
     site_root = tmp_path / "site"
     pathway = _write_source(
@@ -350,14 +383,14 @@ def test_mcp_query_uses_vector_search_for_reasoning_questions(tmp_path: Path) ->
 
     assert response["status"] == "ok"
     assert response["metadata"]["retrieval"]["query_type"] == "reasoning"
-    assert response["metadata"]["retrieval"]["selected_strategy"] == "vector"
+    assert response["metadata"]["retrieval"]["selected_strategy"] == "hybrid_fused"
     assert response["evidence"][0]["path"] == "wiki/pages/startup-pathway.md"
     assert "vector_candidate" in response["evidence"][0]["ranking_reasons"]
     assert response["evidence"][0]["scores"]["retrieval_vector"] > 0
 
 
 def test_profile_routing_prefers_undergraduate_page_over_graduate_noise(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
 
     site_root = tmp_path / "site"
     undergrad = _write_source(
@@ -415,7 +448,7 @@ def test_profile_routing_prefers_undergraduate_page_over_graduate_noise(tmp_path
 
 
 def test_query_reports_insufficient_evidence_when_no_candidates_match(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
 
     site_root = _fixture_site(tmp_path)
     build_llm_wiki_index(site_root, now=NOW)
@@ -428,7 +461,7 @@ def test_query_reports_insufficient_evidence_when_no_candidates_match(tmp_path: 
 
 
 def test_canonical_department_page_outranks_broad_raw_leadership_chunk(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
 
     site_root = tmp_path / "site"
     raw = _write_source(
@@ -462,7 +495,7 @@ def test_canonical_department_page_outranks_broad_raw_leadership_chunk(tmp_path:
 
 
 def test_search_sources_retrieves_raw_candidates_before_filtering_mixed_results(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, search_source_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, search_source_index
 
     site_root = _fixture_site(tmp_path)
     build_llm_wiki_index(site_root, now=NOW)
@@ -477,8 +510,8 @@ def test_search_sources_retrieves_raw_candidates_before_filtering_mixed_results(
 
 
 def test_query_uses_openrouter_rerank_when_configured(tmp_path: Path, monkeypatch) -> None:
-    import src.scrape_planner.llm_wiki_index as llm_wiki_index
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+    import src.scrape_planner.wiki.llm_wiki_index as llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
 
     site_root = _fixture_site(tmp_path)
     build_llm_wiki_index(site_root, now=NOW)
@@ -525,8 +558,25 @@ def test_query_uses_openrouter_rerank_when_configured(tmp_path: Path, monkeypatc
     assert "openrouter_rerank" in response["evidence"][0]["ranking_reasons"]
 
 
+def test_offline_embedding_fallback_sets_degraded_and_still_queries(tmp_path: Path, monkeypatch) -> None:
+    import src.scrape_planner.wiki.llm_wiki_index as llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+
+    site_root = _fixture_site(tmp_path)
+    monkeypatch.delenv("RAG_DISABLE_DENSE_EMBEDDING", raising=False)
+    monkeypatch.setattr(llm_wiki_index, "embed_text", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
+
+    report = build_llm_wiki_index(site_root, now=NOW)
+    response = query_llm_wiki_index(site_root, "admissions application deadline", max_evidence=2)
+
+    assert report["embedding_degraded"] is True
+    assert response["status"] == "ok"
+    assert response["metadata"]["embedding_degraded"] is True
+
+
+
 def test_incremental_reuses_unchanged_documents_and_reindexes_changed_raw(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index
 
     site_root = _fixture_site(tmp_path)
     first = build_llm_wiki_index(site_root, now=NOW)
@@ -565,7 +615,7 @@ def test_incremental_reuses_unchanged_documents_and_reindexes_changed_raw(tmp_pa
 
 
 def test_incremental_reindexes_raw_when_file_changes_but_registry_checksum_is_stale(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
 
     site_root = _fixture_site(tmp_path)
     build_llm_wiki_index(site_root, now=NOW)
@@ -583,7 +633,7 @@ def test_incremental_reindexes_raw_when_file_changes_but_registry_checksum_is_st
 
 
 def test_registry_path_escape_is_skipped_and_not_indexed(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
 
     site_root = tmp_path / "site"
     outside = tmp_path / "outside.md"
@@ -608,7 +658,7 @@ def test_registry_path_escape_is_skipped_and_not_indexed(tmp_path: Path) -> None
 
 
 def test_registry_metadata_path_escape_is_reported_without_reading_metadata(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index
 
     site_root = tmp_path / "site"
     outside_metadata = tmp_path / "outside.metadata.json"
@@ -639,7 +689,7 @@ def test_registry_metadata_path_escape_is_reported_without_reading_metadata(tmp_
 
 
 def test_explainable_evidence_schema_is_stable(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
 
     site_root = _fixture_site(tmp_path)
     build_llm_wiki_index(site_root, now=NOW)

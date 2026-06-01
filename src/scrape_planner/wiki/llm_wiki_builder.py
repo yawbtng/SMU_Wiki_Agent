@@ -9,17 +9,20 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .site_layout import ensure_layout_for_site_root
-from .source_registry import checksum_file, checksum_text, read_registry_rows, utc_now_iso, write_registry_rows
-from .storage import write_json
-from .tmux_runner import TmuxRunner
-from .wiki_common import (
+from ..core.data_root import repo_root
+from ..core.site_layout import ensure_layout_for_site_root
+from ..sources.source_registry import checksum_file, checksum_text, read_registry_rows, utc_now_iso, write_registry_rows
+from ..core.storage import write_json
+from ..infra.tmux_runner import TmuxRunner
+from ..core.wiki_common import (
     INTEGRATED_STATES,
     parse_markdown_frontmatter,
     session_timestamp_slug,
     site_relative,
     timestamp_slug,
 )
+from .stepper_status import latest_json_report, tmux_session_alive
+from .wiki_graph_artifacts import write_wiki_graph_artifacts
 
 
 DEFAULT_TOPIC_PATTERNS = {
@@ -33,13 +36,23 @@ DEFAULT_TOPIC_PATTERNS = {
 }
 
 SCHOOL_ENTITY_PATTERNS = {
-    "cox-school-of-business": ("cox school of business", "cox school", "smu cox", "business school"),
-    "dedman-college": ("dedman college", "dedman college of humanities", "dedman college of humanities and sciences"),
-    "lyle-school-of-engineering": ("lyle school of engineering", "smu lyle", "engineering school"),
-    "meadows-school-of-the-arts": ("meadows school", "meadows school of the arts"),
-    "simmons-school-of-education": ("simmons school", "simmons school of education"),
-    "perkins-school-of-theology": ("perkins school", "perkins school of theology"),
-    "dedman-school-of-law": ("dedman school of law", "smu law", "law school"),
+    "cox-school-of-business": ("cox school of business", "cox school", "smu cox", "business school", "/cox/"),
+    "dedman-college": ("dedman college", "dedman college of humanities", "dedman college of humanities and sciences", "/dedman/"),
+    "lyle-school-of-engineering": ("lyle school of engineering", "smu lyle", "engineering school", "/lyle/"),
+    "meadows-school-of-the-arts": ("meadows school", "meadows school of the arts", "/meadows/"),
+    "simmons-school-of-education": ("simmons school", "simmons school of education", "/simmons/"),
+    "perkins-school-of-theology": ("perkins school", "perkins school of theology", "/perkins/"),
+    "dedman-school-of-law": ("dedman school of law", "smu law", "law school", "/law/"),
+}
+
+SCHOOL_DISPLAY_NAMES = {
+    "cox-school-of-business": "Cox School of Business",
+    "dedman-college": "Dedman College",
+    "lyle-school-of-engineering": "Lyle School of Engineering",
+    "meadows-school-of-the-arts": "Meadows School of the Arts",
+    "simmons-school-of-education": "Simmons School of Education",
+    "perkins-school-of-theology": "Perkins School of Theology",
+    "dedman-school-of-law": "Dedman School of Law",
 }
 
 DEPARTMENT_ENTITY_PATTERNS = {
@@ -228,6 +241,9 @@ def build_wiki(
         _write_optional_canonical_indexes(wiki_root, page_entries, timestamp)
         _write_source_notes(wiki_root, page_groups, timestamp, layout.site_root)
         _write_review_queue(wiki_root / "review_queue.md", review_items, timestamp)
+        graph_report = write_wiki_graph_artifacts(wiki_root, layout.site_root, updated_at=timestamp)
+    else:
+        graph_report = {}
 
     integrated_sources = 0
     if not no_op:
@@ -292,6 +308,7 @@ def build_wiki(
         "exclusion_reasons": exclusion_reasons,
         "review_queue_count": len(review_items),
         "semantic_page_count": len([entry for entry in page_entries if entry.get("page_type") == "semantic"]),
+        **graph_report,
         "pages": page_entries,
         "required_markdown_paths": [
             "wiki/index.md",
@@ -411,6 +428,33 @@ def _iter_wiki_page_paths(wiki_root: Path) -> list[Path]:
     return sorted(path for path in pages_root.rglob("*.md") if path.is_file())
 
 
+def _active_wiki_build_session_from_report(report_path: Path, runner: TmuxRunner) -> str | None:
+    report_dir = report_path.parent
+    _, report = latest_json_report(report_dir, "wiki-build-*.json")
+    if not report:
+        return None
+    reported = str(report.get("status") or report.get("job_status") or "").lower()
+    session = str(report.get("tmux_session") or "")
+    if reported not in {"running", "initializing", "starting"}:
+        return None
+    if session and tmux_session_alive(session, runner=runner):
+        return session
+    return None
+
+
+def assert_no_concurrent_wiki_build(
+    site_root: Path,
+    *,
+    runner: TmuxRunner | None = None,
+) -> None:
+    layout = ensure_layout_for_site_root(Path(site_root))
+    report_path = layout.wiki_dir / "reports" / "wiki-build-latest.json"
+    tmux = runner or TmuxRunner()
+    active = _active_wiki_build_session_from_report(report_path, tmux)
+    if active:
+        raise RuntimeError(f"Wiki build already running in tmux session `{active}`.")
+
+
 def launch_wiki_builder(
     site_root: Path,
     *,
@@ -429,10 +473,19 @@ def launch_wiki_builder(
     if normalized_runtime != "python":
         return {"ok": False, "error": f"Unsupported wiki builder runtime: {runtime}", "runtime": str(runtime)}
 
+    active_session = _active_wiki_build_session_from_report(report_path, tmux)
+    if active_session:
+        return {
+            "ok": False,
+            "error": f"Wiki build already running in tmux session `{active_session}`.",
+            "session_name": active_session,
+            "runtime": normalized_runtime,
+        }
+
     python_command_parts = [
         python_executable or sys.executable,
         "-m",
-        "src.scrape_planner.llm_wiki_builder",
+        "src.scrape_planner.wiki.llm_wiki_builder",
         "--site-root",
         str(layout.site_root),
         "--registry-path",
@@ -453,7 +506,7 @@ def launch_wiki_builder(
 
     command = python_command
 
-    result = tmux.start(name, command, str(_repo_root()))
+    result = tmux.start(name, command, str(repo_root()))
     if result.get("ok"):
         timestamp = utc_now_iso()
         launch_report = {
@@ -519,10 +572,6 @@ def _should_process(row: dict[str, Any], site_root: Path, *, rebuild: bool) -> b
         return True
     markdown_path = site_root / str(row.get("markdown_path") or "")
     return markdown_path.exists() and str(row.get("checksum") or "") != checksum_file(markdown_path)
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
 
 
 def _default_session_name(site_name: str, runner: TmuxRunner) -> str:
@@ -648,8 +697,16 @@ def _clean_source_text_for_wiki(text: str) -> str:
 
 
 def _source_exclusion_reason(row: dict[str, Any], text: str) -> str:
+    original_url = str(row.get("original_url") or "").lower()
     title = str(row.get("title") or "").lower().replace("-", " ")
     lower = str(text or "").lower()
+    source_hint = f"{original_url}\n{title}"
+    if re.search(r"/20\d{2}-\d{2}-\d{2}-", original_url) and not re.search(r"/202[56]-", original_url):
+        return "old dated article, not current student guidance"
+    if re.search(r"\bclass notes\b|\balumni notes\b|\bclass of 19\d{2}\b|\bclass of 20[0-2]\d\b", source_hint):
+        return "alumni/class notes, not student guidance"
+    if re.search(r"/(magazine|news|stories|press-releases?)/", original_url) and not re.search(r"/202[56]-", original_url):
+        return "old news or magazine page, not current student guidance"
     if "previous winners" in lower and "company name" in lower and "city" in lower:
         return "award/company listing, not student guidance"
     if "previous winners" in title:
@@ -819,68 +876,75 @@ def _write_semantic_pages(
     site_root: Path,
 ) -> tuple[list[dict[str, Any]], int, int]:
     rows = [row for group_rows in page_groups.values() for row in group_rows]
-    cox_rows = [row for row in rows if _is_cox_related(row)]
-    if not cox_rows:
-        return [], 0, 0
-
-    page_specs = [
-        {
-            "path": wiki_root / "pages" / "schools" / "cox.md",
-            "title": "Cox School of Business",
-            "topic": "overview",
-            "rows": cox_rows,
-            "summary": "Start here for Cox School of Business graduate programs, admissions, curriculum, costs, and student support.",
-            "related": [
-                "wiki/pages/schools/cox/graduate.md",
-                "wiki/pages/schools/cox/admissions.md",
-                "wiki/pages/schools/cox/courses.md",
-                "wiki/pages/schools/cox/costs-and-aid.md",
-            ],
-        },
-        {
-            "path": wiki_root / "pages" / "schools" / "cox" / "graduate.md",
-            "title": "Cox Graduate Student Guide",
-            "topic": "graduate",
-            "rows": _semantic_rows(cox_rows, ("graduate", "mba", "master", "m.s.", "ms ", "admission", "tuition", "course")),
-            "summary": "For prospective or new Cox graduate students, this page connects programs, courses, costs, admissions, and next steps.",
-            "related": [
-                "wiki/pages/schools/cox/admissions.md",
-                "wiki/pages/schools/cox/courses.md",
-                "wiki/pages/schools/cox/costs-and-aid.md",
-            ],
-        },
-        {
-            "path": wiki_root / "pages" / "schools" / "cox" / "admissions.md",
-            "title": "Cox Graduate Admissions",
-            "topic": "admissions",
-            "rows": _semantic_rows(cox_rows, ("admission", "apply", "application", "deadline", "requirement", "gmat", "gre", "transcript")),
-            "summary": "Cox admissions pages and catalog sources for application process, requirements, deadlines, and applicant next steps.",
-            "related": ["wiki/pages/schools/cox/graduate.md", "wiki/pages/schools/cox/costs-and-aid.md"],
-        },
-        {
-            "path": wiki_root / "pages" / "schools" / "cox" / "courses.md",
-            "title": "Cox Courses And Curriculum",
-            "topic": "courses",
-            "rows": _semantic_rows(cox_rows, ("course", "curriculum", "credit", "elective", "degree requirement", "class")),
-            "summary": "Cox curriculum and course evidence, including MBA, specialized master's, certificate, and catalog course details where available.",
-            "related": ["wiki/pages/schools/cox/graduate.md", "wiki/pages/schools/cox/admissions.md"],
-        },
-        {
-            "path": wiki_root / "pages" / "schools" / "cox" / "costs-and-aid.md",
-            "title": "Cox Costs, Fees, And Aid",
-            "topic": "costs",
-            "rows": _semantic_rows(cox_rows, ("tuition", "fee", "cost", "scholarship", "aid", "financial")),
-            "summary": "Cox tuition, fee, scholarship, and aid evidence for graduate applicants and students.",
-            "related": ["wiki/pages/schools/cox/graduate.md", "wiki/pages/schools/cox/admissions.md"],
-        },
-    ]
+    page_specs: list[dict[str, Any]] = []
+    for school_slug, display_name in SCHOOL_DISPLAY_NAMES.items():
+        school_rows = [row for row in rows if _school_relevance_score(row, school_slug) >= 3.0]
+        if not school_rows:
+            continue
+        short_name = _school_short_name(display_name)
+        base_path = f"wiki/pages/schools/{school_slug}"
+        page_specs.extend(
+            [
+                {
+                    "path": wiki_root / "pages" / "schools" / f"{school_slug}.md",
+                    "school_slug": school_slug,
+                    "school_display": display_name,
+                    "title": display_name,
+                    "topic": "overview",
+                    "rows": school_rows,
+                    "summary": f"Start here for {display_name} programs, admissions, curriculum, costs, and student support.",
+                    "related": [f"{base_path}/graduate.md", f"{base_path}/admissions.md", f"{base_path}/courses.md", f"{base_path}/costs-and-aid.md"],
+                },
+                {
+                    "path": wiki_root / "pages" / "schools" / school_slug / "graduate.md",
+                    "school_slug": school_slug,
+                    "school_display": display_name,
+                    "title": f"{short_name} Graduate Student Guide",
+                    "topic": "graduate",
+                    "rows": _semantic_rows(school_rows, ("graduate", "mba", "master", "m.s.", "ms ", "admission", "tuition", "course"), school_slug=school_slug),
+                    "summary": f"For prospective or new {display_name} graduate students, this page connects programs, courses, costs, admissions, and next steps.",
+                    "related": [f"{base_path}/admissions.md", f"{base_path}/courses.md", f"{base_path}/costs-and-aid.md"],
+                },
+                {
+                    "path": wiki_root / "pages" / "schools" / school_slug / "admissions.md",
+                    "school_slug": school_slug,
+                    "school_display": display_name,
+                    "title": f"{short_name} Graduate Admissions",
+                    "topic": "admissions",
+                    "rows": _semantic_rows(school_rows, ("admission", "apply", "application", "deadline", "requirement", "gmat", "gre", "transcript"), school_slug=school_slug),
+                    "summary": f"{display_name} admissions pages and catalog sources for application process, requirements, deadlines, and applicant next steps.",
+                    "related": [f"{base_path}/graduate.md", f"{base_path}/costs-and-aid.md"],
+                },
+                {
+                    "path": wiki_root / "pages" / "schools" / school_slug / "courses.md",
+                    "school_slug": school_slug,
+                    "school_display": display_name,
+                    "title": f"{short_name} Courses And Curriculum",
+                    "topic": "courses",
+                    "rows": _semantic_rows(school_rows, ("course", "curriculum", "credit", "elective", "degree requirement", "class"), school_slug=school_slug),
+                    "summary": f"{display_name} curriculum and course evidence, including degrees, certificates, and catalog details where available.",
+                    "related": [f"{base_path}/graduate.md", f"{base_path}/admissions.md"],
+                },
+                {
+                    "path": wiki_root / "pages" / "schools" / school_slug / "costs-and-aid.md",
+                    "school_slug": school_slug,
+                    "school_display": display_name,
+                    "title": f"{short_name} Costs, Fees, And Aid",
+                    "topic": "costs",
+                    "rows": _semantic_rows(school_rows, ("tuition", "fee", "cost", "scholarship", "aid", "financial"), school_slug=school_slug),
+                    "summary": f"{display_name} tuition, fee, scholarship, and aid evidence for applicants and students.",
+                    "related": [f"{base_path}/graduate.md", f"{base_path}/admissions.md"],
+                },
+            ]
+        )
 
     entries: list[dict[str, Any]] = []
     created = 0
     updated = 0
     for spec in page_specs:
-        spec_rows = list(spec["rows"] or cox_rows)
-        spec_rows = _dedupe_semantic_rows(spec_rows)[:80]
+        fallback_rows = [row for row in rows if _school_relevance_score(row, str(spec["school_slug"])) >= 3.0]
+        spec_rows = list(spec["rows"] or fallback_rows)
+        spec_rows = _dedupe_semantic_rows(spec_rows, school_slug=str(spec["school_slug"]))[:80]
         path = Path(spec["path"])
         existed = path.exists()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -893,6 +957,8 @@ def _write_semantic_pages(
             timestamp=timestamp,
             site_root=site_root,
             page_path=path,
+            school_slug=str(spec["school_slug"]),
+            school_display=str(spec["school_display"]),
         )
         path.write_text(page_text, encoding="utf-8")
         entries.append(entry)
@@ -903,63 +969,27 @@ def _write_semantic_pages(
     return entries, created, updated
 
 
-def _is_cox_related(row: dict[str, Any]) -> bool:
-    return _cox_relevance_score(row) >= 3.0
+def _school_short_name(display_name: str) -> str:
+    return str(display_name).replace(" School of Business", "").replace(" School of Engineering", "").replace(" School of the Arts", "").replace(" School of Education", "").replace(" School of Theology", "").replace(" School of Law", "").strip()
 
 
-def _cox_relevance_score(row: dict[str, Any], topic_needles: tuple[str, ...] = ()) -> float:
+def _school_relevance_score(row: dict[str, Any], school_slug: str, topic_needles: tuple[str, ...] = ()) -> float:
     title_path = f"{row.get('title', '')}\n{row.get('markdown_path', '')}".lower()
     text = _safe_semantic_text(str(row.get("_source_text") or "")).lower()
     score = 0.0
-    title_terms = (
-        "cox",
-        "mba",
-        "business-analytics",
-        "business analytics",
-        "ms-business",
-        "ms accounting",
-        "ms-finance",
-        "ms finance",
-        "executive-mba",
-        "online-mba",
-        "school-of-business",
-    )
     title = str(row.get("title") or "").lower()
-    for term in title_terms:
+    school_terms = SCHOOL_ENTITY_PATTERNS.get(school_slug, ())
+    slug_terms = tuple(part for part in school_slug.split("-") if len(part) > 2)
+    for term in (*school_terms, school_slug.replace("-", " "), *slug_terms):
+        term = str(term).lower()
+        if not term:
+            continue
         if term in title_path:
             score += 5.0
-    landing_titles = {
-        "online-mba",
-        "executive-mba",
-        "two-year-mba",
-        "one-year-mba",
-        "professional-mba",
-        "mba-programs",
-        "all-mba-programs",
-        "mba-programs-at-cox",
-        "ms-business-analytics",
-        "ms-finance",
-        "ms-accounting",
-        "ms-management",
-        "emba-admissions-process-criteria",
-        "online-mba-financial-aid-guide",
-        "cox-mba-advantage",
-        "cox-school",
-    }
-    if title in landing_titles:
-        score += 8.0
-    text_terms = (
-        "cox school of business",
-        "cox graduate",
-        "cox mba",
-        "cox online mba",
-        "cox school",
-        "business school",
-        "master of business administration",
-    )
-    for term in text_terms:
-        if term in text:
+        elif term in text:
             score += 1.5
+    if any(token in title for token in ("graduate", "admission", "program", "tuition", "course", "curriculum")):
+        score += 1.0
     for needle in topic_needles:
         if needle in title_path:
             score += 3.0
@@ -982,16 +1012,16 @@ def _cox_relevance_score(row: dict[str, Any], topic_needles: tuple[str, ...] = (
     return score
 
 
-def _semantic_rows(rows: list[dict[str, Any]], needles: tuple[str, ...]) -> list[dict[str, Any]]:
-    scored = [(_cox_relevance_score(row, needles), row) for row in rows]
+def _semantic_rows(rows: list[dict[str, Any]], needles: tuple[str, ...], *, school_slug: str) -> list[dict[str, Any]]:
+    scored = [(_school_relevance_score(row, school_slug, needles), row) for row in rows]
     selected = [row for score, row in sorted(scored, key=lambda item: (-item[0], str(item[1].get("title") or ""))) if score >= 3.0]
     return selected or rows
 
 
-def _dedupe_semantic_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _dedupe_semantic_rows(rows: list[dict[str, Any]], *, school_slug: str) -> list[dict[str, Any]]:
     seen: set[str] = set()
     unique = []
-    for row in sorted(rows, key=lambda item: (-_cox_relevance_score(item), str(item.get("title") or ""))):
+    for row in sorted(rows, key=lambda item: (-_school_relevance_score(item, school_slug), str(item.get("title") or ""))):
         source_id = str(row.get("source_id") or "")
         if source_id and source_id not in seen:
             seen.add(source_id)
@@ -1009,46 +1039,67 @@ def _render_semantic_page(
     timestamp: str,
     site_root: Path,
     page_path: Path,
+    school_slug: str,
+    school_display: str,
 ) -> tuple[str, dict[str, Any]]:
     rel_page = _site_relative(page_path, site_root)
     source_ids = [str(row.get("source_id") or "") for row in rows if str(row.get("source_id") or "")]
     source_paths = [str(row.get("markdown_path") or "") for row in rows if str(row.get("markdown_path") or "")]
-    tags = ["cox", "business", "graduate", topic]
+    school_short = _school_short_name(school_display)
+    tags = [school_slug, "graduate", topic]
     entities = _infer_institution_entities(
         "\n".join(f"{row.get('title', '')}\n{row.get('_source_text', '')}" for row in rows)
     )
+    answer_paths = _semantic_answer_paths(title, topic, related_pages, rows, school_display=school_display)
+    evidence_links = _semantic_evidence_link_lines(rows, max_items=10)
     content_lines = [
         f"# {title}",
         "",
         "## Fast Answer",
         "",
-        summary,
+        _semantic_summary_with_links(title, summary, school_display),
         "",
-        *_semantic_overview_bullets(rows),
+        *_semantic_overview_bullets(rows, school_display=school_display),
+        "",
+        "## If You Need",
+        "",
+        *answer_paths,
+        "",
+        "## Key Concepts",
+        "",
+        *[_semantic_wikilink_line(value) for value in _semantic_key_concepts(topic, school_display)],
         "",
         "## Who This Applies To",
         "",
-        "Prospective and new graduate students evaluating Cox School of Business programs, especially MBA and specialized master's pathways.",
+        f"Prospective and new graduate students evaluating {school_display} programs, requirements, costs, and next steps.",
         "",
         "## Courses / Curriculum",
         "",
-        *_semantic_evidence_lines(rows, ("course", "curriculum", "credit", "elective", "degree requirement", "class"), max_items=8),
+        *_semantic_evidence_lines(rows, ("course", "curriculum", "credit", "elective", "degree requirement", "class"), max_items=8, school_slug=school_slug),
         "",
         "## Costs / Fees / Aid",
         "",
-        *_semantic_evidence_lines(rows, ("tuition", "fee", "cost", "scholarship", "aid", "financial"), max_items=8),
+        *_semantic_evidence_lines(rows, ("tuition", "fee", "cost", "scholarship", "aid", "financial"), max_items=8, school_slug=school_slug),
         "",
         "## Admissions / Requirements / Deadlines",
         "",
-        *_semantic_evidence_lines(rows, ("admission", "apply", "application", "deadline", "requirement", "gmat", "gre", "transcript"), max_items=8),
+        *_semantic_evidence_lines(rows, ("admission", "apply", "application", "deadline", "requirement", "gmat", "gre", "transcript"), max_items=8, school_slug=school_slug),
         "",
         "## Contacts / Offices",
         "",
-        *_semantic_evidence_lines(rows, ("contact", "admission", "office", "email", "phone"), max_items=6),
+        *_semantic_evidence_lines(rows, ("contact", "admission", "office", "email", "phone"), max_items=6, school_slug=school_slug),
         "",
         "## Related Pages",
         "",
-        *[f"- [{Path(path).stem.replace('-', ' ').title()}]({ _semantic_relative_link(rel_page, path) })" for path in related_pages],
+        *[f"- [[{_semantic_page_title_for_path(path)}]] — [{Path(path).stem.replace('-', ' ').title()}]({_semantic_relative_link(rel_page, path)})" for path in related_pages],
+        "",
+        "## Relationships",
+        "",
+        *_semantic_relationship_lines(title, topic, related_pages, evidence_links, school_display=school_display),
+        "",
+        "## Evidence / References",
+        "",
+        *evidence_links,
         "",
         "## Sources",
         "",
@@ -1061,17 +1112,24 @@ def _render_semantic_page(
     content = "\n".join(content_lines).rstrip() + "\n"
     metadata = {
         "title": title,
-        "category": "Cox School of Business",
+        "category": school_display,
         "page_type": "semantic",
         "page_path": rel_page,
         "page_checksum": checksum_text(content),
-        "school": "cox",
-        "schools": sorted({"cox-school-of-business", *entities["schools"]}),
+        "school": school_slug,
+        "schools": sorted({school_slug, *entities["schools"]}),
         "departments": entities["departments"],
         "offices": entities["offices"],
         "programs": _semantic_programs(rows),
         "degree_levels": ["graduate"],
         "topics": tags,
+        "summary": summary,
+        "entities": sorted({school_display, *[value.replace('-', ' ').title() for value in entities["schools"]]}),
+        "related": [_semantic_page_title_for_path(path) for path in related_pages],
+        "confidence": "high" if len(source_ids) >= 2 else "medium",
+        "created_at": timestamp,
+        "source": source_paths[:10],
+        "answer_paths": [line.lstrip("- ") for line in answer_paths],
         "source_ids": source_ids,
         "source_paths": source_paths,
         "source_count": len(source_ids),
@@ -1079,9 +1137,9 @@ def _render_semantic_page(
         "audiences": ["prospective-graduate-student", "new-graduate-student"],
         "roles": ["student", "applicant"],
         "intents": ["study", "apply", "pay"],
-        "academic_interests": ["business"],
+        "academic_interests": [_slugify(school_short)],
         "canonical_facts": ["courses", "costs", "admissions", "contacts"],
-        "aliases": ["cox graduate", "cox admissions", "cox courses", "cox fees", "cox mba"],
+        "aliases": [f"{school_short.lower()} graduate", f"{school_short.lower()} admissions", f"{school_short.lower()} courses", f"{school_short.lower()} fees"],
         "related_pages": related_pages,
         "source_priority": "semantic-wiki",
         "canonical_owner": rel_page,
@@ -1091,7 +1149,7 @@ def _render_semantic_page(
         f"{_frontmatter(metadata)}\n{content}",
         {
             "title": title,
-            "category": "Cox School of Business",
+            "category": school_display,
             "path": rel_page,
             "summary": summary,
             "source_count": len(source_ids),
@@ -1107,7 +1165,7 @@ def _render_semantic_page(
             "source_priority": "semantic-wiki",
             "canonical_owner": rel_page,
             "page_type": "semantic",
-            "school": "cox",
+            "school": school_slug,
             "schools": metadata["schools"],
             "departments": metadata["departments"],
             "offices": metadata["offices"],
@@ -1119,29 +1177,130 @@ def _render_semantic_page(
     )
 
 
-def _semantic_overview_bullets(rows: list[dict[str, Any]]) -> list[str]:
-    source_by_title = {str(row.get("title") or "").lower(): str(row.get("source_id") or "") for row in rows}
-    online_mba = source_by_title.get("online-mba") or _first_source_id(rows)
-    msba = source_by_title.get("ms-business-analytics") or online_mba
-    admissions = source_by_title.get("emba-admissions-process-criteria") or online_mba
-    aid = source_by_title.get("online-mba-financial-aid-guide") or online_mba
+def _semantic_summary_with_links(title: str, summary: str, school_display: str) -> str:
+    return f"{summary} Start from [[{school_display}]] and use the links below to reach answer pages or source evidence in one or two hops."
+
+
+def _semantic_page_title_for_path(path: str) -> str:
+    path_value = str(path or "")
+    for school_slug, display_name in SCHOOL_DISPLAY_NAMES.items():
+        short = _school_short_name(display_name)
+        if path_value.endswith(f"schools/{school_slug}.md"):
+            return display_name
+        if path_value.endswith(f"schools/{school_slug}/graduate.md"):
+            return f"{short} Graduate Student Guide"
+        if path_value.endswith(f"schools/{school_slug}/admissions.md"):
+            return f"{short} Graduate Admissions"
+        if path_value.endswith(f"schools/{school_slug}/courses.md"):
+            return f"{short} Courses And Curriculum"
+        if path_value.endswith(f"schools/{school_slug}/costs-and-aid.md"):
+            return f"{short} Costs, Fees, And Aid"
+    return Path(path_value).stem.replace("-", " ").title()
+
+
+def _semantic_key_concepts(topic: str, school_display: str) -> list[str]:
+    short = _school_short_name(school_display)
+    concepts = [school_display, f"{short} Graduate Student Guide"]
+    if topic != "admissions":
+        concepts.append(f"{short} Graduate Admissions")
+    if topic != "courses":
+        concepts.append(f"{short} Courses And Curriculum")
+    if topic != "costs":
+        concepts.append(f"{short} Costs, Fees, And Aid")
+    concepts.extend(["Graduate Admissions", "Tuition And Fees", "Curriculum"])
+    return list(dict.fromkeys(concepts))
+
+
+def _semantic_wikilink_line(title: str) -> str:
+    return f"- [[{title}]]"
+
+
+def _semantic_answer_paths(title: str, topic: str, related_pages: list[str], rows: list[dict[str, Any]], *, school_display: str) -> list[str]:
+    short = _school_short_name(school_display)
+    page_titles = {_semantic_page_title_for_path(path) for path in related_pages}
+    if topic == "graduate":
+        page_titles.update({f"{short} Graduate Admissions", f"{short} Courses And Curriculum", f"{short} Costs, Fees, And Aid"})
+    if topic == "admissions":
+        page_titles.update({f"{short} Graduate Student Guide", f"{short} Costs, Fees, And Aid"})
+    if topic == "courses":
+        page_titles.update({f"{short} Graduate Student Guide", f"{short} Graduate Admissions"})
+    if topic == "costs":
+        page_titles.update({f"{short} Graduate Student Guide", f"{short} Graduate Admissions"})
+    paths = []
+    if f"{short} Graduate Admissions" in page_titles or topic == "admissions":
+        paths.append(f"- Admissions process and requirements → [[{short} Graduate Admissions]]")
+    if f"{short} Costs, Fees, And Aid" in page_titles or topic == "costs":
+        paths.append(f"- Costs, fees, scholarships, or aid → [[{short} Costs, Fees, And Aid]]")
+    if f"{short} Courses And Curriculum" in page_titles or topic == "courses":
+        paths.append(f"- Courses, curriculum, or credits → [[{short} Courses And Curriculum]]")
+    if title != school_display:
+        paths.append(f"- School-level context → [[{school_display}]]")
+    first_source_title = next((str(row.get("title") or "") for row in rows if row.get("title")), "source evidence")
+    if first_source_title:
+        paths.append(f"- Official evidence and raw details → [[Source: {first_source_title}]]")
+    return list(dict.fromkeys(paths))[:7] or ["- Start with related pages below, then open source evidence when verification is needed."]
+
+
+def _semantic_relationship_lines(title: str, topic: str, related_pages: list[str], evidence_links: list[str], *, school_display: str) -> list[str]:
+    short = _school_short_name(school_display)
+    lines = [f"- [[{title}]] part_of [[{school_display}]]"] if title != school_display else []
+    for path in related_pages[:6]:
+        lines.append(f"- [[{title}]] related_to [[{_semantic_page_title_for_path(path)}]]")
+    if topic in {"admissions", "courses", "costs"}:
+        lines.append(f"- [[{title}]] next_step [[{short} Graduate Student Guide]]")
+    if evidence_links:
+        match = re.search(r"\[\[([^\]]+)\]\]", evidence_links[0])
+        if match:
+            lines.append(f"- [[{title}]] cites [[{match.group(1)}]]")
+    return lines or [f"- [[{title}]] related_to [[{short} Graduate Student Guide]]"]
+
+
+def _semantic_evidence_link_lines(rows: list[dict[str, Any]], *, max_items: int) -> list[str]:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        title = str(row.get("title") or row.get("source_id") or "Source").strip()
+        source_id = str(row.get("source_id") or "").strip()
+        source_path = str(row.get("markdown_path") or "").strip()
+        if not source_id or source_id in seen:
+            continue
+        seen.add(source_id)
+        lines.append(f"- [[Source: {title}]] — `{source_id}` — `{source_path}`")
+        if len(lines) >= max_items:
+            break
+    return lines or ["- No source evidence attached."]
+
+
+def _semantic_overview_bullets(rows: list[dict[str, Any]], *, school_display: str) -> list[str]:
+    first = _first_source_id(rows)
+    admissions = _first_source_for_needles(rows, ("admission", "apply", "application")) or first
+    courses = _first_source_for_needles(rows, ("course", "curriculum", "credit")) or first
+    costs = _first_source_for_needles(rows, ("tuition", "fee", "cost", "aid")) or first
     return [
-        f"- Start with the program-specific Cox page, then verify the admissions checklist and financial-aid page for your cohort. [`{online_mba}`]",
-        f"- Online MBA evidence says the program uses live weekday evening classes, asynchronous coursework, electives, and required immersion experiences; MSBA evidence describes a 33-credit-hour analytics degree with full-time and part-time options. [`{online_mba}`, `{msba}`]",
-        f"- Cost evidence for the Online MBA gives per-credit tuition/fees and estimated program totals, while financial-aid evidence explains FAFSA/private-loan funding and payment-plan contacts. [`{aid}`]",
-        f"- Admissions evidence emphasizes transcripts, degree/GPA information, application submission, and direct contact with Cox Graduate Admissions for program-specific requirements. [`{admissions}`]",
+        f"- Start with the {school_display} overview, then follow the shortest answer path for admissions, costs, curriculum, or source evidence. [`{first}`]",
+        f"- Admissions evidence is routed to the school admissions page and source exits for official requirements or deadlines. [`{admissions}`]",
+        f"- Curriculum evidence is routed to the courses/curriculum page when source text mentions courses, credits, or degree requirements. [`{courses}`]",
+        f"- Cost evidence is routed to costs, fees, and aid pages when source text mentions tuition, fees, scholarships, or financial aid. [`{costs}`]",
     ]
+
+
+def _first_source_for_needles(rows: list[dict[str, Any]], needles: tuple[str, ...]) -> str:
+    for row in rows:
+        haystack = f"{row.get('title', '')}\n{row.get('_source_text', '')}".lower()
+        if any(needle in haystack for needle in needles):
+            return str(row.get("source_id") or "")
+    return ""
 
 
 def _first_source_id(rows: list[dict[str, Any]]) -> str:
     return next((str(row.get("source_id") or "") for row in rows if str(row.get("source_id") or "")), "source")
 
 
-def _semantic_evidence_lines(rows: list[dict[str, Any]], needles: tuple[str, ...], *, max_items: int) -> list[str]:
+def _semantic_evidence_lines(rows: list[dict[str, Any]], needles: tuple[str, ...], *, max_items: int, school_slug: str) -> list[str]:
     candidates: list[tuple[float, str, str]] = []
     for row in rows:
         source_id = str(row.get("source_id") or "")
-        row_score = _cox_relevance_score(row, needles)
+        row_score = _school_relevance_score(row, school_slug, needles)
         title = str(row.get("title") or "")
         for sentence in _sentences(_safe_semantic_text(str(row.get("_source_text") or ""))):
             lower = sentence.lower()
@@ -1244,7 +1403,8 @@ def _render_source_page(
 ) -> tuple[str, dict[str, Any]]:
     source_id = str(row.get("source_id") or "")
     source_path = str(row.get("markdown_path") or "")
-    title = str(row.get("title") or "Untitled source")
+    source_title = str(row.get("title") or "Untitled source")
+    title = f"Source: {source_title}"
     text = str(row.get("_source_text") or "")
     rel_page = _site_relative(page_path, site_root)
     route = _routing_metadata_for(category, [row])
@@ -1259,7 +1419,7 @@ def _render_source_page(
         "",
         "## Category",
         "",
-        f"- [{category}](../{Path(category_page_path).name})",
+        f"- [[{category}]] — [{category}](../{Path(category_page_path).name})",
         "",
         "## Main Content",
         "",
@@ -1281,6 +1441,10 @@ def _render_source_page(
         "",
         *_caveat_lines([row]),
         "",
+        "## Relationships",
+        "",
+        f"- [[{title}]] evidence_for [[{category}]]",
+        "",
         "## Sources",
         "",
         f"- `{source_id}` - {source_path}",
@@ -1300,6 +1464,12 @@ def _render_source_page(
             "source_ids": [source_id],
             "source_paths": [source_path],
             "source_count": 1,
+            "summary": summary,
+            "entities": route["schools"] + route["departments"] + route["offices"],
+            "related": [category],
+            "confidence": "high",
+            "created_at": timestamp,
+            "source": [source_path],
             "tags": tags,
             "audiences": route["audiences"],
             "roles": route["roles"],

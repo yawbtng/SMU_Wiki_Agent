@@ -21,7 +21,7 @@ def _read_json_line(proc: subprocess.Popen[str]) -> dict:
 
 def test_mcp_tool_handlers_query_index_and_block_path_traversal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import mcp_servers.llm_wiki_mcp as server
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index
 
     site_root = _fixture_site(tmp_path)
     build_llm_wiki_index(site_root, now=NOW)
@@ -47,6 +47,14 @@ def test_mcp_tool_handlers_query_index_and_block_path_traversal(tmp_path: Path, 
     assert page["ok"] is True
     assert page["path"] == "wiki/pages/admissions.md"
     assert "February 1" in page["markdown"]
+
+    (site_root / "wiki" / "navigation_manifest.json").write_text(
+        json.dumps({"pages": [{"page_id": "admissions", "title": "Admissions", "path": "wiki/pages/admissions.md"}]}),
+        encoding="utf-8",
+    )
+    page_by_title = server.get_wiki_page("Admissions")
+    assert page_by_title["ok"] is True
+    assert page_by_title["path"] == "wiki/pages/admissions.md"
 
     nested_dir = site_root / "wiki" / "pages" / "schools" / "cox"
     nested_dir.mkdir(parents=True, exist_ok=True)
@@ -82,7 +90,7 @@ def test_stdio_fallback_reports_malformed_json_without_crashing(monkeypatch: pyt
 
 
 def test_mcp_stdio_startup_index_info_query_and_missing_index(tmp_path: Path) -> None:
-    from src.scrape_planner.llm_wiki_index import build_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index
 
     site_root = _fixture_site(tmp_path)
     build_llm_wiki_index(site_root, now=NOW)
@@ -107,7 +115,7 @@ def test_mcp_stdio_startup_index_info_query_and_missing_index(tmp_path: Path) ->
         proc.stdin.flush()
         tools_response = _read_json_line(proc)
         tool_names = {tool["name"] for tool in tools_response["result"]["tools"]}
-        assert {"query_wiki", "search_sources", "get_wiki_page", "index_info"} <= tool_names
+        assert {"query_wiki", "answer_question", "ingest_url", "search_sources", "get_wiki_page", "index_info"} <= tool_names
 
         proc.stdin.write(
             json.dumps(

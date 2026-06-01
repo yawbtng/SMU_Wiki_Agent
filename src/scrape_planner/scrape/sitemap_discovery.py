@@ -9,7 +9,7 @@ from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 
-from .models import DiscoveredURL
+from ..core.models import DiscoveredURL
 
 COMMON_SITEMAP_PATHS = (
     "/sitemap.xml",

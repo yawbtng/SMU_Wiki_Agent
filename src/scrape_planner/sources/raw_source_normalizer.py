@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .site_layout import ensure_layout_for_site_root
+from ..core.site_layout import ensure_layout_for_site_root
 from .source_quality import SourceQualityRecord, assess_source_quality, write_quality_report
 from .source_registry import (
     RegistryMergeResult,
@@ -21,7 +21,7 @@ from .source_registry import (
     utc_now_iso,
     write_registry_rows,
 )
-from .storage import read_json, write_json
+from ..core.storage import read_json, write_json
 
 
 MAX_PDF_RAW_MARKDOWN_CHARS = 20_000

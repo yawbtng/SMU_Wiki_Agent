@@ -4,6 +4,7 @@ import argparse
 import inspect
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,11 +32,15 @@ except Exception:  # pragma: no cover - optional dependency fallback
             _run_stdio_mcp_server(self.name, self._tools)
 
 
-from src.scrape_planner.llm_wiki_index import (  # noqa: E402
+from src.scrape_planner.wiki.llm_wiki_index import (  # noqa: E402
     generate_mcp_config_snippet,
     index_info as _index_info,
     query_mcp_wiki_index,
     search_source_index,
+)
+from src.scrape_planner.wiki.self_improving import (  # noqa: E402
+    answer_question as _answer_question,
+    ingest_url as _ingest_url,
 )
 
 
@@ -157,14 +162,45 @@ def _safe_site_path(rel_path: str, *, must_be_under: Path | None = None) -> tupl
     return resolved, ""
 
 
+def _resolve_wiki_page_reference(value: str) -> str:
+    if not value:
+        return ""
+    if value.endswith(".md") or value.startswith("wiki/"):
+        return value
+    manifest_path = SITE_ROOT / "wiki" / "navigation_manifest.json"
+    if not manifest_path.exists():
+        return value
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return value
+    pages = manifest.get("pages") if isinstance(manifest, dict) else []
+    if not isinstance(pages, list):
+        return value
+    normalized = _page_ref_token(value)
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        candidates = [page.get("page_id"), page.get("title"), page.get("path")]
+        if normalized in {_page_ref_token(candidate) for candidate in candidates if candidate}:
+            return str(page.get("path") or value)
+    return value
+
+
+def _page_ref_token(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+
+
 def _response_from_query(payload: dict[str, Any]) -> dict[str, Any]:
     ok = payload.get("status") == "ok"
+    metadata = payload.get("metadata", {}) if isinstance(payload.get("metadata"), dict) else {}
     return {
         "ok": ok,
         "error": "" if ok else str(payload.get("status") or "query_failed"),
         "query": payload.get("query"),
         "evidence": payload.get("evidence", []),
-        "metadata": payload.get("metadata", {}),
+        "next_pages": metadata.get("next_pages", []),
+        "metadata": metadata,
     }
 
 
@@ -175,6 +211,18 @@ def query_wiki(question: str, max_results: int = 5) -> dict[str, Any]:
 
 
 @mcp.tool()
+def answer_question(question: str, max_results: int = 5) -> dict[str, Any]:
+    """Answer with local wiki evidence when confident; otherwise use web fallback and queue quality-gated ingest."""
+    return _answer_question(SITE_ROOT, question, max_evidence=max_results)
+
+
+@mcp.tool()
+def ingest_url(url: str, question: str = "") -> dict[str, Any]:
+    """Queue quality-gated ingestion for one URL through the manual URL pipeline."""
+    return _ingest_url(SITE_ROOT, url, question=question)
+
+
+@mcp.tool()
 def search_sources(query: str, max_results: int = 5) -> dict[str, Any]:
     """Search raw source evidence only from existing local indexes."""
     return _response_from_query(search_source_index(SITE_ROOT, query, max_evidence=max_results))
@@ -182,8 +230,10 @@ def search_sources(query: str, max_results: int = 5) -> dict[str, Any]:
 
 @mcp.tool()
 def get_wiki_page(path: str) -> dict[str, Any]:
-    """Return exact generated wiki page markdown when the path stays inside the configured site root."""
-    target, error = _safe_site_path(path, must_be_under=SITE_ROOT / "wiki")
+    """Return exact generated wiki page markdown by safe relative path, page id, or title."""
+    requested = str(path or "").strip()
+    resolved_path = _resolve_wiki_page_reference(requested)
+    target, error = _safe_site_path(resolved_path or requested, must_be_under=SITE_ROOT / "wiki")
     if error:
         return {"ok": False, "error": error, "path": path}
     assert target is not None

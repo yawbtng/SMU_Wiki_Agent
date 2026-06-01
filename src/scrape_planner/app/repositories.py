@@ -15,16 +15,17 @@ from .artifact_contracts import (
     WikiStatusContract,
     WorkspaceContract,
 )
-from ..run_persistence import read_run_status
-from ..site_layout import SiteLayout, site_layout
-from ..source_registry import read_registry_rows
-from ..stepper_status import (
+from ..runtime.run_persistence import read_run_status
+from ..core.site_layout import SiteLayout, site_layout
+from ..sources.source_registry import read_registry_rows
+from ..wiki.stepper_status import (
     load_embedding_status,
     load_mcp_status,
+    load_wiki_agent_status,
     load_wiki_status,
     raw_source_status,
 )
-from ..storage import read_json, write_json
+from ..core.storage import read_json, write_json
 
 
 def _site_root(data_root: Path, site_id: str) -> Path:
@@ -231,3 +232,7 @@ class SiteStatusReadModel:
 
     def load_mcp_status(self, site_id: str) -> MCPStatusContract:
         return load_mcp_status(self.layout(site_id))
+
+    def load_wiki_agent_status(self, site_id: str) -> dict[str, Any]:
+        layout = self.layout(site_id)
+        return load_wiki_agent_status(layout.wiki_dir / "reports")

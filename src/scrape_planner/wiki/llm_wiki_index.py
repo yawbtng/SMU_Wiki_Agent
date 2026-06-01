@@ -7,26 +7,37 @@ import math
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import requests
 
-from .run_persistence import _append_jsonl, _write_json_atomic
-from .site_layout import ensure_layout_for_site_root, site_layout
-from .source_registry import checksum_file, read_registry_rows, utc_now_iso
-from .wiki_common import parse_markdown_frontmatter, site_relative, strip_markdown_frontmatter, timestamp_slug
+from ..runtime.run_persistence import _append_jsonl, _write_json_atomic
+from ..runtime.agent_run_metrics import AgentRunMetricsRepository, build_embedding_metric_event
+from ..core.site_layout import ensure_layout_for_site_root, site_layout
+from ..sources.source_registry import checksum_file, read_registry_rows, utc_now_iso
+from ..core.wiki_common import parse_markdown_frontmatter, site_relative, strip_markdown_frontmatter, timestamp_slug
+from ..index.embedding_client import embed_text, embedding_config_from_env
+from .confidence import assess_confidence
+from .index_lock import site_index_write_lock
 
 
-INDEX_VERSION = "llm-wiki-hybrid-v1"
-EMBEDDING_PROVIDER = "deterministic-hash-embedding"
-EMBEDDING_MODEL = "hashed-token-vector-v1"
-EMBEDDING_DIMENSIONS = 64
+INDEX_VERSION = "llm-wiki-hybrid-v2"
+EMBEDDING_PROVIDER = "ollama"
+EMBEDDING_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text:latest").strip() or "nomic-embed-text:latest"
+EMBEDDING_DIMENSIONS = 768
+EMBEDDING_SPACE_DENSE = "dense-ollama"
+EMBEDDING_SPACE_HASH = "hash-fallback"
+FALLBACK_EMBEDDING_PROVIDER = "deterministic-hash-embedding"
+FALLBACK_EMBEDDING_MODEL = "hashed-token-vector-v1"
 RERANK_PROVIDER = "openrouter"
 RERANK_API_URL = "https://openrouter.ai/api/v1/rerank"
 RERANK_MODEL = "cohere/rerank-4-pro"
 TOKEN_RE = re.compile(r"[a-z0-9]+")
+_DENSE_EMBEDDING_UNAVAILABLE = False
+_EMBEDDING_DEGRADED = False
 BM25_STOPWORDS = {
     "a",
     "an",
@@ -94,6 +105,7 @@ def build_llm_wiki_index(
     now: str | None = None,
 ) -> dict[str, Any]:
     """Build a deterministic dual-corpus index for raw sources and wiki pages."""
+    started = time.monotonic()
     timestamp = now or utc_now_iso()
     layout = ensure_layout_for_site_root(Path(site_root))
     index_dir = layout.indexes_dir
@@ -101,7 +113,33 @@ def build_llm_wiki_index(
     postings_path = index_dir / "llm_wiki_postings.json"
     manifest_path = index_dir / "llm_wiki_manifest.json"
 
+    with site_index_write_lock(layout.site_root):
+        return _build_llm_wiki_index_locked(
+            layout,
+            docs_path=docs_path,
+            postings_path=postings_path,
+            manifest_path=manifest_path,
+            chunk_chars=chunk_chars,
+            overlap=overlap,
+            timestamp=timestamp,
+            started=started,
+        )
+
+
+def _build_llm_wiki_index_locked(
+    layout: Any,
+    *,
+    docs_path: Path,
+    postings_path: Path,
+    manifest_path: Path,
+    chunk_chars: int,
+    overlap: int,
+    timestamp: str,
+    started: float,
+) -> dict[str, Any]:
+    _reset_embedding_backend_state()
     previous_docs = _read_documents(docs_path)
+    previous_manifest = _read_manifest(manifest_path)
     previous_by_id = {str(row.get("id") or ""): row for row in previous_docs}
     current_docs: list[dict[str, Any]] = []
     invalid_sources: list[dict[str, Any]] = []
@@ -116,7 +154,7 @@ def build_llm_wiki_index(
     skipped = 0
     for doc in raw_docs + wiki_docs:
         old = previous_by_id.get(doc.id)
-        if old and _document_row_current(old, doc):
+        if old and _document_row_current(old, doc, previous_manifest=previous_manifest):
             current_docs.append(old)
             skipped += 1
             continue
@@ -128,14 +166,13 @@ def build_llm_wiki_index(
             changed_wiki += 1
 
     postings = _build_postings(current_docs)
-    if docs_path.exists():
-        docs_path.unlink()
-    for row in sorted(current_docs, key=lambda item: str(item.get("id") or "")):
-        _append_jsonl(docs_path, row)
+    _write_documents_jsonl_atomic(docs_path, current_docs)
     _write_json_atomic(postings_path, postings)
 
     raw_count = sum(1 for doc in current_docs if doc.get("corpus") == "raw")
     wiki_count = sum(1 for doc in current_docs if doc.get("corpus") == "wiki")
+    index_embedding_space = _index_embedding_space(current_docs)
+    degraded = _embedding_degraded() or index_embedding_space == EMBEDDING_SPACE_HASH
     manifest = {
         "version": INDEX_VERSION,
         "status": "ready" if current_docs else "empty",
@@ -156,11 +193,18 @@ def build_llm_wiki_index(
         "term_count": len(postings),
         "reranker_ready": _openrouter_rerank_ready(),
         "index_health": "ready" if current_docs else "empty",
+        "embedding_space": index_embedding_space,
+        "vector_leg_enabled": not degraded,
         "embedding": {
             "provider": EMBEDDING_PROVIDER,
             "model": EMBEDDING_MODEL,
             "vector_dimensions": EMBEDDING_DIMENSIONS,
+            "fallback_provider": FALLBACK_EMBEDDING_PROVIDER,
+            "fallback_model": FALLBACK_EMBEDDING_MODEL,
+            "degraded": degraded,
+            "space": index_embedding_space,
         },
+        "embedding_degraded": degraded,
         "reranker": {
             "provider": RERANK_PROVIDER if _openrouter_rerank_ready() else "",
             "model": _openrouter_rerank_model() if _openrouter_rerank_ready() else "",
@@ -169,12 +213,71 @@ def build_llm_wiki_index(
         "invalid_sources": invalid_sources,
     }
     _write_json_atomic(manifest_path, manifest)
-    reports_dir = index_dir / "reports"
+    reports_dir = layout.indexes_dir / "reports"
     report_path = reports_dir / f"embedding-{_timestamp_slug(timestamp)}.json"
     report = {**manifest, "report_path": str(report_path), "last_build_time": timestamp}
     _write_json_atomic(report_path, report)
-    _write_json_atomic(index_dir / "embedding_status.json", {**report, "report_path": str(index_dir / "embedding_status.json")})
+    _write_json_atomic(layout.indexes_dir / "embedding_status.json", {**report, "report_path": str(layout.indexes_dir / "embedding_status.json")})
+    _record_embedding_metrics(
+        layout.site_root,
+        timestamp=timestamp,
+        raw_count=raw_count,
+        wiki_count=wiki_count,
+        changed_count=changed_raw + changed_wiki,
+        skipped_count=skipped,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
     return report
+
+
+def _record_embedding_metrics(
+    site_root: Path,
+    *,
+    timestamp: str,
+    raw_count: int,
+    wiki_count: int,
+    changed_count: int,
+    skipped_count: int,
+    duration_ms: int,
+) -> None:
+    run_id = os.environ.get("WIKI_AGENT_RUN_ID") or os.environ.get("RALPH_AGENT_RUN_ID")
+    site_id = os.environ.get("WIKI_AGENT_SITE_ID") or site_root.name
+    if not run_id:
+        return
+    try:
+        data_root = Path(site_root).parents[1]
+    except IndexError:
+        return
+    try:
+        AgentRunMetricsRepository(data_root).append_event(
+            build_embedding_metric_event(
+                run_id=run_id,
+                site_id=site_id,
+                timestamp=timestamp,
+                stage="embed",
+                operation="build_llm_wiki_index",
+                provider=EMBEDDING_PROVIDER,
+                model=EMBEDDING_MODEL,
+                input_tokens=None,
+                document_count=raw_count + wiki_count,
+                chunk_count=raw_count + wiki_count,
+                vector_count=raw_count + wiki_count,
+                reused_vector_count=skipped_count,
+                skipped_chunk_count=skipped_count,
+                failed_chunk_count=0,
+                duration_ms=duration_ms,
+                cost_usd=None,
+                cost_source="unknown",
+                raw_provider_usage={
+                    "changed_document_count": changed_count,
+                    "raw_index_count": raw_count,
+                    "wiki_index_count": wiki_count,
+                    "vector_dimensions": EMBEDDING_DIMENSIONS,
+                },
+            )
+        )
+    except Exception:
+        return
 
 
 def query_llm_wiki_index(
@@ -184,7 +287,7 @@ def query_llm_wiki_index(
     max_evidence: int = 5,
     max_candidates: int = 50,
     profile: QueryProfile | dict[str, Any] | None = None,
-    retrieval_strategy: str = "hybrid",
+    retrieval_strategy: str = "auto",
 ) -> dict[str, Any]:
     layout = site_layout(Path(site_root))
     docs_path = layout.indexes_dir / "llm_wiki_documents.jsonl"
@@ -226,13 +329,17 @@ def query_llm_wiki_index(
         tokens,
         max_candidates=max_candidates,
         retrieval_strategy=retrieval_strategy,
+        manifest=manifest,
     )
     candidates = retrieval["candidates"]
     lexical_scores = retrieval["lexical_scores"]
-    evidence = _dedupe_evidence_by_path(rerank_candidates(query, candidates, lexical_scores, profile=query_profile))[:max_evidence]
+    evidence = _dedupe_evidence_by_path(
+        rerank_candidates(query, candidates, lexical_scores, profile=query_profile, manifest=manifest)
+    )[:max_evidence]
     _apply_retrieval_annotations(evidence, retrieval)
+    next_pages = _next_pages_from_navigation_manifest(layout.site_root, query, evidence)
     if not evidence:
-        return {
+        result = {
             "status": "insufficient_evidence",
             "query": query,
             "evidence": [],
@@ -242,9 +349,15 @@ def query_llm_wiki_index(
                 "routing": _profile_metadata(query_profile, candidate_count=len(candidates)),
                 "retrieval": _retrieval_metadata(retrieval),
                 "site_root": str(layout.site_root.resolve()),
+                "next_pages": next_pages,
+                "embedding_degraded": bool(manifest.get("embedding_degraded")),
+                "vector_leg_enabled": bool(manifest.get("vector_leg_enabled", not manifest.get("embedding_degraded"))),
+                "embedding_space": str(manifest.get("embedding_space") or ""),
             },
         }
-    return {
+        result["metadata"]["confidence"] = assess_confidence(result)
+        return result
+    result = {
         "status": "ok",
         "query": query,
         "evidence": evidence,
@@ -257,8 +370,75 @@ def query_llm_wiki_index(
             "site_root": str(layout.site_root.resolve()),
             "routing": _profile_metadata(query_profile, evidence=evidence, candidate_count=len(candidates)),
             "retrieval": _retrieval_metadata(retrieval),
+            "next_pages": next_pages,
+            "embedding_degraded": bool(manifest.get("embedding_degraded")),
+            "vector_leg_enabled": bool(manifest.get("vector_leg_enabled", not manifest.get("embedding_degraded"))),
+            "embedding_space": str(manifest.get("embedding_space") or ""),
         },
     }
+    result["metadata"]["confidence"] = assess_confidence(result)
+    return result
+
+
+def _next_pages_from_navigation_manifest(site_root: Path, query: str, evidence: list[dict[str, Any]], *, limit: int = 5) -> list[dict[str, str]]:
+    manifest_path = Path(site_root) / "wiki" / "navigation_manifest.json"
+    if not manifest_path.exists():
+        return []
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    pages = manifest.get("pages") if isinstance(manifest, dict) else []
+    if not isinstance(pages, list):
+        return []
+    evidence_paths = {str(item.get("path") or "") for item in evidence if isinstance(item, dict)}
+    query_tokens = set(_content_tokens(query))
+    school_terms = {
+        "cox-school-of-business": ("cox", "business", "mba"),
+        "lyle-school-of-engineering": ("lyle", "engineering"),
+        "meadows-school-of-the-arts": ("meadows", "arts", "music", "theatre", "dance"),
+        "simmons-school-of-education": ("simmons", "education"),
+        "perkins-school-of-theology": ("perkins", "theology"),
+        "dedman-school-of-law": ("law", "dedman law"),
+        "dedman-college": ("dedman college", "humanities", "sciences"),
+    }
+    query_lower = str(query or "").lower()
+    wanted_schools = {slug for slug, terms in school_terms.items() if any(term in query_lower for term in terms)}
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        path = str(page.get("path") or "")
+        if path in evidence_paths:
+            continue
+        haystack = " ".join(
+            [
+                str(page.get("title") or ""),
+                str(page.get("summary") or ""),
+                " ".join(str(value) for value in page.get("tags", []) if value),
+                " ".join(str(value) for value in page.get("entities", []) if value),
+            ]
+        ).lower()
+        token_hits = sum(1 for token in query_tokens if token in haystack)
+        priority = float(page.get("priority") or 0) / 100.0
+        page_type = str(page.get("page_type") or "")
+        type_bonus = 5.0 if page_type in {"semantic", "navigation", "concept", "entity", "workflow", "process"} else 0.0
+        school_bonus = 8.0 if any(slug in str(page.get("path") or "") for slug in wanted_schools) else 0.0
+        score = token_hits + priority + type_bonus + school_bonus
+        if score <= 0:
+            continue
+        scored.append((score, page))
+    next_pages = []
+    for _score, page in sorted(scored, key=lambda item: (-item[0], str(item[1].get("title") or "")))[:limit]:
+        next_pages.append(
+            {
+                "title": str(page.get("title") or ""),
+                "path": str(page.get("path") or ""),
+                "page_type": str(page.get("page_type") or ""),
+                "why": str(page.get("summary") or "Relevant linked/navigation page")[:240],
+            }
+        )
+    return next_pages
 
 
 def query_mcp_wiki_index(
@@ -353,9 +533,12 @@ def rerank_candidates(
     lexical_scores: dict[str, float],
     *,
     profile: QueryProfile | None = None,
+    manifest: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     tokens = _tokenize(query)
-    query_vector = _embedding_vector(query)
+    query_vector, query_space = _embedding_vector_and_space(query)
+    vector_leg_enabled = _vector_leg_enabled(manifest)
+    query_type, _classifier_reason = _classify_query_type(query)
     raw_candidate_ids = {str(row.get("source_id") or "") for row in candidates if row.get("corpus") == "raw"}
     wiki_cited_ids = {
         str(source_id)
@@ -371,10 +554,14 @@ def rerank_candidates(
     for row in candidates:
         doc_id = str(row.get("id") or "")
         lexical = float(lexical_scores.get(doc_id, 0.0))
-        vector = _cosine_similarity(query_vector, row.get("embedding_vector"))
+        doc_space = str(row.get("embedding_space") or "")
+        vector = 0.0
+        if vector_leg_enabled and _spaces_compatible(query_space, doc_space, manifest):
+            vector = _cosine_similarity(query_vector, row.get("embedding_vector"), left_space=query_space, right_space=doc_space)
         keyword = _keyword_score(tokens, str(row.get("title") or ""), str(row.get("text") or ""))
         is_wiki = row.get("corpus") == "wiki"
         source_priority = 1.2 if is_wiki else 0.0
+        reasoning_wiki_boost = 0.8 if (is_wiki and query_type == "reasoning") else 0.0
         route_score, route_reasons = _route_score(row, profile)
         freshness = 0.05 if str(row.get("updated_at") or "") else 0.0
         citation = 0.0
@@ -391,6 +578,8 @@ def rerank_candidates(
             reasons.append("cited_by_wiki_candidate")
         if keyword:
             reasons.append("keyword_match")
+        if reasoning_wiki_boost:
+            reasons.append("reasoning_wiki_priority")
         if vector > 0:
             reasons.append("vector_match")
         reasons.extend(route_reasons)
@@ -398,7 +587,7 @@ def rerank_candidates(
             reasons.append("raw_source_fallback")
         if not reasons:
             reasons.append("lexical_match")
-        combined = lexical + (1.5 * vector) + keyword + source_priority + route_score + freshness + citation
+        combined = lexical + (1.5 * vector) + keyword + source_priority + reasoning_wiki_boost + route_score + freshness + citation
         scored.append(
             {
                 "id": doc_id,
@@ -413,6 +602,7 @@ def rerank_candidates(
                     "vector": round(vector, 6),
                     "keyword": round(keyword, 6),
                     "source_priority": round(source_priority, 6),
+                    "reasoning_wiki_priority": round(reasoning_wiki_boost, 6),
                     "route": round(route_score, 6),
                     "freshness": round(freshness, 6),
                     "citation": round(citation, 6),
@@ -699,7 +889,9 @@ def _wiki_documents(site_root: Path, *, chunk_chars: int, overlap: int) -> tuple
 
 
 def _document_row(doc: IndexedDocument) -> dict[str, Any]:
-    vector = _embedding_vector(f"{doc.title}\n{doc.text}")
+    vector, space = _embedding_vector_and_space(f"{doc.title}\n{doc.text}")
+    provider = EMBEDDING_PROVIDER if space == EMBEDDING_SPACE_DENSE else FALLBACK_EMBEDDING_PROVIDER
+    model = EMBEDDING_MODEL if space == EMBEDDING_SPACE_DENSE else FALLBACK_EMBEDDING_MODEL
     return {
         "id": doc.id,
         "corpus": doc.corpus,
@@ -716,17 +908,32 @@ def _document_row(doc: IndexedDocument) -> dict[str, Any]:
         "chunk_index": doc.chunk_index,
         "metadata": doc.metadata,
         "tokens": _token_counts(doc.text),
-        "embedding_provider": EMBEDDING_PROVIDER,
-        "embedding_model": EMBEDDING_MODEL,
+        "embedding_provider": provider,
+        "embedding_model": model,
+        "embedding_space": space,
+        "index_version": INDEX_VERSION,
         "embedding_dimensions": EMBEDDING_DIMENSIONS,
         "embedding_vector": vector,
     }
 
 
-def _document_row_current(row: dict[str, Any], doc: IndexedDocument) -> bool:
+def _document_row_current(
+    row: dict[str, Any],
+    doc: IndexedDocument,
+    *,
+    previous_manifest: dict[str, Any] | None = None,
+) -> bool:
     if str(row.get("checksum") or "") != doc.checksum:
         return False
-    if str(row.get("embedding_provider") or "") != EMBEDDING_PROVIDER:
+    if str(row.get("index_version") or "") != INDEX_VERSION:
+        return False
+    row_space = str(row.get("embedding_space") or "")
+    if not row_space:
+        row_space = EMBEDDING_SPACE_DENSE if str(row.get("embedding_provider") or "") == EMBEDDING_PROVIDER else EMBEDDING_SPACE_HASH
+    expected_space = EMBEDDING_SPACE_HASH if _embedding_degraded() else EMBEDDING_SPACE_DENSE
+    if row_space != expected_space:
+        return False
+    if previous_manifest and str(previous_manifest.get("version") or "") not in {"", INDEX_VERSION}:
         return False
     vector = row.get("embedding_vector")
     if not isinstance(vector, list) or len(vector) != EMBEDDING_DIMENSIONS:
@@ -746,46 +953,29 @@ def _select_retrieval_candidates(
     *,
     max_candidates: int,
     retrieval_strategy: str,
+    manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     requested = _normalize_retrieval_strategy(retrieval_strategy)
     query_type, classifier_reason = _classify_query_type(query)
     if requested in {"auto", "mcp_auto"}:
+        bm25 = _wiki_bm25_retrieval(docs, query, tokens, max_candidates=max_candidates)
+        vector = _vector_retrieval(docs, query, max_candidates=max_candidates, manifest=manifest)
         if query_type == "factual":
-            bm25 = _wiki_bm25_retrieval(docs, query, tokens, max_candidates=max_candidates)
-            bm25.update(
-                {
-                    "requested_strategy": requested,
-                    "query_type": query_type,
-                    "classifier_reason": classifier_reason,
-                    "attempted_strategies": ["wiki_bm25"],
-                }
-            )
-            if bm25["candidates"]:
-                return bm25
-            hybrid = _hybrid_retrieval(docs, postings, tokens, max_candidates=max_candidates)
-            hybrid.update(
-                {
-                    "strategy": "hybrid_fallback",
-                    "requested_strategy": requested,
-                    "query_type": query_type,
-                    "classifier_reason": classifier_reason,
-                    "attempted_strategies": ["wiki_bm25", "hybrid"],
-                    "fallback_reason": "wiki_bm25_no_hits",
-                    "bm25_backend": bm25.get("bm25_backend", ""),
-                }
-            )
-            return hybrid
-        vector = _vector_retrieval(docs, query, max_candidates=max_candidates)
-        vector.update(
+            fused = _fuse_retrievals(bm25, vector, leading_strategy="wiki_bm25", max_candidates=max_candidates)
+        else:
+            fused = _fuse_retrievals(vector, bm25, leading_strategy="vector", max_candidates=max_candidates)
+        fused.update(
             {
+                "strategy": "hybrid_fused",
                 "requested_strategy": requested,
                 "query_type": query_type,
                 "classifier_reason": classifier_reason,
-                "attempted_strategies": ["vector"],
+                "attempted_strategies": ["wiki_bm25", "vector"],
+                "bm25_backend": bm25.get("bm25_backend", ""),
             }
         )
-        if vector["candidates"]:
-            return vector
+        if fused["candidates"]:
+            return fused
         hybrid = _hybrid_retrieval(docs, postings, tokens, max_candidates=max_candidates)
         hybrid.update(
             {
@@ -793,8 +983,9 @@ def _select_retrieval_candidates(
                 "requested_strategy": requested,
                 "query_type": query_type,
                 "classifier_reason": classifier_reason,
-                "attempted_strategies": ["vector", "hybrid"],
-                "fallback_reason": "vector_no_hits",
+                "attempted_strategies": ["wiki_bm25", "vector", "hybrid"],
+                "fallback_reason": "fused_no_hits",
+                "bm25_backend": bm25.get("bm25_backend", ""),
             }
         )
         return hybrid
@@ -810,7 +1001,7 @@ def _select_retrieval_candidates(
         )
         return retrieval
     if requested in {"vector", "reasoning"}:
-        retrieval = _vector_retrieval(docs, query, max_candidates=max_candidates)
+        retrieval = _vector_retrieval(docs, query, max_candidates=max_candidates, manifest=manifest)
         retrieval.update(
             {
                 "requested_strategy": requested,
@@ -874,8 +1065,12 @@ def _classify_query_type(query: str) -> tuple[str, str]:
         r"\baddress\b",
         r"\bhours?\b",
     )
+    school_or_program_terms = (
+        "cox", "business", "mba", "lyle", "engineering", "meadows", "arts", "simmons", "education",
+        "perkins", "theology", "law", "dedman", "graduate", "student",
+    )
     multi_aspect_student_fact = (
-        any(token in normalized for token in ("cox", "business", "mba"))
+        any(token in normalized for token in school_or_program_terms)
         and any(token in normalized for token in ("course", "curriculum", "class"))
         and any(token in normalized for token in ("fee", "tuition", "cost", "aid"))
         and any(token in normalized for token in ("admission", "apply", "application", "process"))
@@ -905,6 +1100,45 @@ def _hybrid_retrieval(
         "lexical_scores": lexical_scores,
         "reasons_by_id": {},
         "scores_by_id": {},
+    }
+
+
+def _fuse_retrievals(
+    primary: dict[str, Any],
+    secondary: dict[str, Any],
+    *,
+    leading_strategy: str,
+    max_candidates: int,
+) -> dict[str, Any]:
+    candidates = _dedupe_candidates(list(primary.get("candidates") or []) + list(secondary.get("candidates") or []))[:max_candidates]
+    lexical_scores = {
+        **(secondary.get("lexical_scores") if isinstance(secondary.get("lexical_scores"), dict) else {}),
+        **(primary.get("lexical_scores") if isinstance(primary.get("lexical_scores"), dict) else {}),
+    }
+    reasons_by_id: dict[str, str] = {}
+    for source in (primary, secondary):
+        values = source.get("reasons_by_id") if isinstance(source.get("reasons_by_id"), dict) else {}
+        for key, value in values.items():
+            reasons_by_id.setdefault(str(key), str(value))
+    scores_by_id: dict[str, dict[str, float]] = {}
+    for source in (secondary, primary):
+        values = source.get("scores_by_id") if isinstance(source.get("scores_by_id"), dict) else {}
+        for key, score_map in values.items():
+            if not isinstance(score_map, dict):
+                continue
+            target = scores_by_id.setdefault(str(key), {})
+            for score_key, score in score_map.items():
+                try:
+                    target[str(score_key)] = float(score)
+                except (TypeError, ValueError):
+                    continue
+    return {
+        "strategy": "hybrid_fused",
+        "leading_strategy": leading_strategy,
+        "candidates": candidates,
+        "lexical_scores": lexical_scores,
+        "reasons_by_id": reasons_by_id,
+        "scores_by_id": scores_by_id,
     }
 
 
@@ -947,7 +1181,16 @@ def _wiki_bm25_retrieval(
 
 def _boost_semantic_wiki_scores(bm25_scores: dict[str, float], doc_map: dict[str, dict[str, Any]], query: str) -> None:
     query_lower = str(query or "").lower()
-    wants_cox = any(token in query_lower for token in ("cox", "business", "mba"))
+    school_terms = {
+        "cox-school-of-business": ("cox", "business", "mba"),
+        "lyle-school-of-engineering": ("lyle", "engineering"),
+        "meadows-school-of-the-arts": ("meadows", "arts", "music", "theatre", "dance"),
+        "simmons-school-of-education": ("simmons", "education"),
+        "perkins-school-of-theology": ("perkins", "theology"),
+        "dedman-school-of-law": ("law", "dedman law"),
+        "dedman-college": ("dedman college", "humanities", "sciences"),
+    }
+    wanted_schools = {slug for slug, terms in school_terms.items() if any(term in query_lower for term in terms)}
     wants_grad = any(token in query_lower for token in ("grad", "graduate", "master", "mba"))
     wants_multi_aspect = sum(
         1
@@ -967,18 +1210,33 @@ def _boost_semantic_wiki_scores(bm25_scores: dict[str, float], doc_map: dict[str
         path = str(row.get("path") or "")
         if page_type == "semantic" or source_priority == "semantic-wiki":
             bm25_scores[doc_id] = bm25_scores.get(doc_id, 0.0) * 4.0 + 25.0
-            if wants_cox and "wiki/pages/schools/cox" in path:
-                bm25_scores[doc_id] += 40.0
+            if any(f"wiki/pages/schools/{slug}" in path for slug in wanted_schools):
+                bm25_scores[doc_id] += 60.0
             if wants_grad and path.endswith("/graduate.md"):
                 bm25_scores[doc_id] += 20.0
-            if wants_multi_aspect and "wiki/pages/schools/cox" in path:
-                bm25_scores[doc_id] += 20.0
+            if wants_multi_aspect and any(f"wiki/pages/schools/{slug}" in path for slug in wanted_schools):
+                bm25_scores[doc_id] += 30.0
         elif page_type == "source" and doc_id in bm25_scores:
             bm25_scores[doc_id] = bm25_scores.get(doc_id, 0.0) * 0.85
 
 
-def _vector_retrieval(docs: list[dict[str, Any]], query: str, *, max_candidates: int) -> dict[str, Any]:
-    candidates, vector_scores = _retrieve_vector_candidates_by_corpus(docs, query, max_candidates=max_candidates)
+def _vector_retrieval(
+    docs: list[dict[str, Any]],
+    query: str,
+    *,
+    max_candidates: int,
+    manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not _vector_leg_enabled(manifest):
+        return {
+            "strategy": "vector",
+            "candidates": [],
+            "lexical_scores": {},
+            "reasons_by_id": {},
+            "scores_by_id": {},
+            "vector_leg_skipped": True,
+        }
+    candidates, vector_scores = _retrieve_vector_candidates_by_corpus(docs, query, max_candidates=max_candidates, manifest=manifest)
     return {
         "strategy": "vector",
         "candidates": candidates,
@@ -1072,22 +1330,30 @@ def _retrieve_vector_candidates_by_corpus(
     query: str,
     *,
     max_candidates: int,
+    manifest: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    if not _vector_leg_enabled(manifest):
+        return [], {}
     query_text = " ".join(_content_tokens(query)) or query
-    query_vector = _embedding_vector(query_text)
+    query_vector, query_space = _embedding_vector_and_space(query_text, manifest=manifest)
+    if not _spaces_compatible(query_space, str(manifest.get("embedding_space") or query_space) if manifest else query_space, manifest):
+        return [], {}
     raw_candidates, raw_scores = _retrieve_vector_candidates_for_corpus(
         docs,
         query_vector,
         corpus="raw",
         max_candidates=max_candidates,
+        query_space=query_space,
     )
     wiki_candidates, wiki_scores = _retrieve_vector_candidates_for_corpus(
         docs,
         query_vector,
         corpus="wiki",
         max_candidates=max_candidates,
+        query_space=query_space,
     )
-    return _dedupe_candidates(raw_candidates + wiki_candidates), {**raw_scores, **wiki_scores}
+    # Prefer wiki synthesis pages for reasoning traversal, then fall back to raw evidence.
+    return _dedupe_candidates(wiki_candidates + raw_candidates), {**raw_scores, **wiki_scores}
 
 
 def _retrieve_vector_candidates_for_corpus(
@@ -1097,6 +1363,7 @@ def _retrieve_vector_candidates_for_corpus(
     corpus: str,
     max_candidates: int,
     min_score: float = 0.05,
+    query_space: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     scored: list[tuple[str, float]] = []
     doc_map: dict[str, dict[str, Any]] = {}
@@ -1106,7 +1373,13 @@ def _retrieve_vector_candidates_for_corpus(
         doc_id = str(row.get("id") or "")
         if not doc_id:
             continue
-        score = _cosine_similarity(query_vector, row.get("embedding_vector"))
+        doc_space = str(row.get("embedding_space") or "")
+        score = _cosine_similarity(
+            query_vector,
+            row.get("embedding_vector"),
+            left_space=query_space,
+            right_space=doc_space,
+        )
         if score < min_score:
             continue
         doc_map[doc_id] = row
@@ -1519,6 +1792,56 @@ def _build_postings(rows: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
     return postings
 
 
+def _write_documents_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    ordered = sorted(rows, key=lambda item: str(item.get("id") or ""))
+    payload = "\n".join(json.dumps(row, ensure_ascii=True) for row in ordered)
+    if payload:
+        payload += "\n"
+    tmp_path.write_text(payload, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _read_manifest(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _index_embedding_space(rows: list[dict[str, Any]]) -> str:
+    spaces = {str(row.get("embedding_space") or "") for row in rows if row.get("embedding_space")}
+    if EMBEDDING_SPACE_HASH in spaces:
+        return EMBEDDING_SPACE_HASH
+    if spaces:
+        return next(iter(spaces))
+    return EMBEDDING_SPACE_DENSE if not _embedding_degraded() else EMBEDDING_SPACE_HASH
+
+
+def _vector_leg_enabled(manifest: dict[str, Any] | None) -> bool:
+    if not manifest:
+        return not _embedding_degraded()
+    if manifest.get("vector_leg_enabled") is False:
+        return False
+    if bool(manifest.get("embedding_degraded")):
+        return False
+    return True
+
+
+def _spaces_compatible(left_space: str, right_space: str, manifest: dict[str, Any] | None) -> bool:
+    if not left_space or not right_space:
+        return True
+    if left_space != right_space:
+        return False
+    if manifest and str(manifest.get("embedding_space") or "") not in {"", left_space}:
+        return False
+    return True
+
+
 def _read_documents(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -1564,6 +1887,36 @@ def _token_counts(text: str) -> dict[str, int]:
 
 
 def _embedding_vector(text: str, *, dimensions: int = EMBEDDING_DIMENSIONS) -> list[float]:
+    vector, _space = _embedding_vector_and_space(text, dimensions=dimensions)
+    return vector
+
+
+def _embedding_vector_and_space(
+    text: str,
+    *,
+    dimensions: int = EMBEDDING_DIMENSIONS,
+    manifest: dict[str, Any] | None = None,
+) -> tuple[list[float], str]:
+    global _DENSE_EMBEDDING_UNAVAILABLE, _EMBEDDING_DEGRADED
+    manifest_space = str(manifest.get("embedding_space") or "") if manifest else ""
+    if manifest and not _vector_leg_enabled(manifest):
+        return [0.0] * dimensions, manifest_space or EMBEDDING_SPACE_HASH
+    if manifest_space == EMBEDDING_SPACE_HASH:
+        return _hash_embedding_vector(text, dimensions=dimensions), EMBEDDING_SPACE_HASH
+    if not _DENSE_EMBEDDING_UNAVAILABLE and not _dense_embeddings_disabled():
+        try:
+            vector = embed_text(text[:8000], embedding_config_from_env())
+            if vector:
+                return _normalize_embedding_dimensions(vector, dimensions), EMBEDDING_SPACE_DENSE
+        except Exception:
+            _DENSE_EMBEDDING_UNAVAILABLE = True
+            _EMBEDDING_DEGRADED = True
+    else:
+        _EMBEDDING_DEGRADED = True
+    return _hash_embedding_vector(text, dimensions=dimensions), EMBEDDING_SPACE_HASH
+
+
+def _hash_embedding_vector(text: str, *, dimensions: int = EMBEDDING_DIMENSIONS) -> list[float]:
     vector = [0.0] * dimensions
     for token, count in _token_counts(text).items():
         digest = hashlib.sha256(token.encode("utf-8")).digest()
@@ -1576,7 +1929,39 @@ def _embedding_vector(text: str, *, dimensions: int = EMBEDDING_DIMENSIONS) -> l
     return [round(value / norm, 6) for value in vector]
 
 
-def _cosine_similarity(left: list[float], right: Any) -> float:
+def _normalize_embedding_dimensions(vector: list[float], dimensions: int) -> list[float]:
+    values = [float(value) for value in vector[:dimensions]]
+    if len(values) < dimensions:
+        values.extend([0.0] * (dimensions - len(values)))
+    norm = math.sqrt(sum(value * value for value in values))
+    if not norm:
+        return values
+    return [round(value / norm, 6) for value in values]
+
+
+def _dense_embeddings_disabled() -> bool:
+    return os.getenv("RAG_DISABLE_DENSE_EMBEDDING", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _reset_embedding_backend_state() -> None:
+    global _DENSE_EMBEDDING_UNAVAILABLE, _EMBEDDING_DEGRADED
+    _DENSE_EMBEDDING_UNAVAILABLE = False
+    _EMBEDDING_DEGRADED = _dense_embeddings_disabled()
+
+
+def _embedding_degraded() -> bool:
+    return _EMBEDDING_DEGRADED
+
+
+def _cosine_similarity(
+    left: list[float],
+    right: Any,
+    *,
+    left_space: str = "",
+    right_space: str = "",
+) -> float:
+    if left_space and right_space and left_space != right_space:
+        return 0.0
     if not isinstance(right, list) or len(right) != len(left):
         return 0.0
     total = 0.0

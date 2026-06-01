@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from src.scrape_planner.site_layout import ensure_site_layout
+from src.scrape_planner.core.site_layout import ensure_site_layout
 
 
 NOW = "2026-05-22T12:00:00+00:00"
@@ -24,7 +24,7 @@ class FakeResponse:
 
 
 def test_manual_url_pipeline_scrapes_normalizes_builds_wiki_and_index(tmp_path: Path) -> None:
-    from src.scrape_planner.manual_url_pipeline import run_manual_url_pipeline
+    from src.scrape_planner.scrape.manual_url_pipeline import run_manual_url_pipeline
 
     layout = ensure_site_layout(tmp_path, "example.edu")
 
@@ -54,7 +54,7 @@ def test_manual_url_pipeline_scrapes_normalizes_builds_wiki_and_index(tmp_path: 
 
 
 def test_manual_url_pipeline_rejects_off_domain_url(tmp_path: Path) -> None:
-    from src.scrape_planner.manual_url_pipeline import run_manual_url_pipeline
+    from src.scrape_planner.scrape.manual_url_pipeline import run_manual_url_pipeline
 
     layout = ensure_site_layout(tmp_path, "example.edu")
 

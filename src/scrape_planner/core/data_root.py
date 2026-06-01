@@ -8,6 +8,15 @@ from typing import Mapping
 DATA_ROOT_ENV_VARS = ("ULTRA_FAST_RAG_DATA_ROOT", "SCRAPE_PLANNER_DATA_ROOT")
 
 
+def repo_root() -> Path:
+    """Return the repository root (directory containing app.py and src/)."""
+    path = Path(__file__).resolve()
+    for parent in path.parents:
+        if (parent / "app.py").is_file() and (parent / "src").is_dir():
+            return parent
+    return path.parents[3]
+
+
 def resolve_data_root(project_root: Path, env: Mapping[str, str] | None = None) -> Path:
     """Return the artifact data directory for this checkout.
 

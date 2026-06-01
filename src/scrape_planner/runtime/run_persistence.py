@@ -5,7 +5,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from .tracer_dependencies import (
+from ..tracer.tracer_dependencies import (
     StaleEvaluationResult,
     TracerMaintenanceJobPacket,
     serialize_job_packet,
