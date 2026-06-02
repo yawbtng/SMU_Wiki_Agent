@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.scrape_planner.state import RunStateStore
+from src.scrape_planner.runtime.state import RunStateStore
 from src.scrape_planner.tracer_maintenance import run_tracer_maintenance_packet
 
 

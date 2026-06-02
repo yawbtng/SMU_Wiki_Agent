@@ -10,6 +10,14 @@
 !.pi/skills/llm-wiki-noninteractive/SKILL.md
 !.pi/skills/llm-wiki-noninteractive/scripts/
 !.pi/skills/llm-wiki-noninteractive/scripts/build_wiki.sh
+!.pi/skills/site-discovery/
+!.pi/skills/site-discovery/SKILL.md
+!.pi/skills/site-discovery/scripts/
+!.pi/skills/site-discovery/scripts/discover_site.sh
+!.pi/skills/site-url-curation/
+!.pi/skills/site-url-curation/SKILL.md
+!.pi/skills/site-url-curation/scripts/
+!.pi/skills/site-url-curation/scripts/curate_urls.sh
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -50,4 +58,7 @@ coverage/
 tmp/
 $TMPDIR/
 .logs/
+logs/
 .codegraph/
+.cursor/ralph/
+.cursor/hooks/state/

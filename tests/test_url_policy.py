@@ -1,4 +1,4 @@
-from src.scrape_planner.url_policy import classify_url_for_student_wiki
+from src.scrape_planner.scrape.url_policy import classify_url_for_student_wiki
 
 
 def test_class_notes_are_hard_rejected_even_with_recent_lastmod():

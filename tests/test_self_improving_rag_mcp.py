@@ -5,6 +5,8 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from src.scrape_planner.core.site_layout import ensure_site_layout
 from src.scrape_planner.wiki.web_search import MockWebSearchProvider, WebSearchResult, provider_from_env, web_search
 
@@ -87,6 +89,135 @@ def test_answer_question_low_confidence_uses_web_and_queues_ingest(tmp_path: Pat
     assert result["provenance"] == "web_provisional"
     assert result["ingestion_job"]["status"] == "queued"
     assert provider.calls == ["unknown admission rule"]
+
+
+def test_answer_question_leadership_partial_when_web_unavailable(tmp_path: Path, monkeypatch) -> None:
+    import src.scrape_planner.wiki.self_improving as self_improving
+
+    site_root = tmp_path / "example.edu"
+    _ready_index(site_root)
+    low = {
+        "status": "ok",
+        "evidence": [
+            {
+                "title": "M.S. Network Engineering",
+                "snippet": "M. Scott Kingsley, Eng.D. — Director of Graduate Network Engineering Program",
+                "source_kind": "wiki",
+                "source_id": "wiki/pages/ms-network-engineering.md",
+                "path": "wiki/pages/ms-network-engineering.md",
+                "scores": {"combined": 2.0},
+            },
+            {"scores": {"combined": 1.9}},
+        ],
+        "metadata": {},
+    }
+    monkeypatch.setattr(self_improving, "query_mcp_wiki_index", lambda *args, **kwargs: low)
+
+    result = self_improving.answer_question(site_root, "Who is the director of SMU networking?")
+
+    assert result["status"] == "ok"
+    assert "Kingsley" in result["answer"]
+    assert result["metadata"].get("leadership")
+
+
+def test_answer_question_uses_raw_source_fallback_for_person_lookup(tmp_path: Path, monkeypatch) -> None:
+    import src.scrape_planner.wiki.self_improving as self_improving
+
+    site_root = tmp_path / "example.edu"
+    _ready_index(site_root)
+    wiki_result = {
+        "status": "ok",
+        "evidence": [
+            {
+                "title": "Admissions Guide",
+                "snippet": "General school overview content.",
+                "source_kind": "wiki",
+                "source_id": "wiki/pages/admissions.md",
+                "path": "wiki/pages/admissions.md",
+                "scores": {"combined": 27.0},
+            },
+            {
+                "title": "Cox School of Business",
+                "snippet": "Computer systems and admissions content.",
+                "source_kind": "wiki",
+                "source_id": "wiki/pages/cox.md",
+                "path": "wiki/pages/cox.md",
+                "scores": {"combined": 26.95},
+            },
+        ],
+        "metadata": {},
+    }
+    raw_result = {
+        "status": "ok",
+        "evidence": [
+            {
+                "title": "Department Faculty",
+                "snippet": (
+                    "Avery Morgan, Ph.D. Distinguished University Chairperson of the "
+                    "Department of Data Science"
+                ),
+                "source_kind": "web",
+                "source_id": "faculty",
+                "path": "raw_sources/web/faculty.md",
+                "scores": {"combined": 8.0},
+            }
+        ],
+        "metadata": {"source_only": True},
+    }
+    monkeypatch.setattr(self_improving, "query_mcp_wiki_index", lambda *args, **kwargs: wiki_result)
+    monkeypatch.setattr(self_improving, "search_source_index", lambda *args, **kwargs: raw_result)
+
+    result = self_improving.answer_question(site_root, "Who leads the Department of Data Science?")
+
+    assert result["status"] == "ok"
+    assert result["answer"].startswith("Avery Morgan")
+    assert "Chairperson of the Department of Data Science" in result["answer"]
+    assert result["citations"][0]["source_id"] == "faculty"
+
+
+def test_answer_question_ignores_raw_person_lookup_fallback_without_leadership_match(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import src.scrape_planner.wiki.self_improving as self_improving
+
+    site_root = tmp_path / "example.edu"
+    _ready_index(site_root)
+    wiki_result = {
+        "status": "ok",
+        "evidence": [
+            {
+                "title": "Department Overview",
+                "snippet": "General department overview.",
+                "source_kind": "wiki",
+                "source_id": "wiki/pages/department.md",
+                "path": "wiki/pages/department.md",
+                "scores": {"combined": 2.0},
+            }
+        ],
+        "metadata": {},
+    }
+    raw_result = {
+        "status": "ok",
+        "evidence": [
+            {
+                "title": "Faculty Events",
+                "snippet": "Students can attend a faculty networking lunch.",
+                "source_kind": "web",
+                "source_id": "events",
+                "path": "raw_sources/web/events.md",
+                "scores": {"combined": 8.0},
+            }
+        ],
+        "metadata": {"source_only": True},
+    }
+    monkeypatch.setattr(self_improving, "query_mcp_wiki_index", lambda *args, **kwargs: wiki_result)
+    monkeypatch.setattr(self_improving, "search_source_index", lambda *args, **kwargs: raw_result)
+
+    result = self_improving.answer_question(site_root, "Who leads the Department of Data Science?")
+
+    assert result["status"] == "web_search_unavailable"
+    assert result["evidence"] == wiki_result["evidence"]
+    assert "raw_source_fallback" not in result["metadata"]
 
 
 def test_answer_question_missing_provider_returns_unavailable(tmp_path: Path, monkeypatch) -> None:
@@ -353,7 +484,7 @@ def test_student_policy_rejections(tmp_path: Path) -> None:
         assert decision.accepted is False, (title, decision.reasons)
 
 
-def test_degraded_build_disables_vector_leg(tmp_path: Path, monkeypatch) -> None:
+def test_dense_embedding_failure_stops_index_build(tmp_path: Path, monkeypatch) -> None:
     import src.scrape_planner.wiki.llm_wiki_index as llm_wiki_index
     from src.scrape_planner.wiki.llm_wiki_index import EMBEDDING_SPACE_DENSE, EMBEDDING_SPACE_HASH, _cosine_similarity, build_llm_wiki_index, query_llm_wiki_index
 
@@ -379,11 +510,10 @@ def test_degraded_build_disables_vector_leg(tmp_path: Path, monkeypatch) -> None
         encoding="utf-8",
     )
     monkeypatch.setattr(llm_wiki_index, "embed_text", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
-    report = build_llm_wiki_index(site_root, now="2026-06-01T12:00:00+00:00")
-    assert report["embedding_degraded"] is True
-    assert report["vector_leg_enabled"] is False
+    with pytest.raises(llm_wiki_index.EmbeddingUnavailableError, match="Ollama dense embeddings unavailable"):
+        build_llm_wiki_index(site_root, now="2026-06-01T12:00:00+00:00")
     response = query_llm_wiki_index(site_root, "admissions deadline")
-    assert response["metadata"]["vector_leg_enabled"] is False
+    assert response["status"] == "missing_index"
     assert _cosine_similarity([1.0, 0.0], [1.0, 0.0], left_space=EMBEDDING_SPACE_DENSE, right_space=EMBEDDING_SPACE_HASH) == 0.0
 
 

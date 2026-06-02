@@ -26,7 +26,7 @@ This command launches the Ralph Wiggum implementation loop to process specificat
 3. **Context files**:
    - `.specify/memory/constitution.md` — Project principles
    - `AGENTS.md` — Development guidelines
-   - `RALPH_PROMPT.md` — Master prompt (optional, can use inline)
+   - `docs/ralph/master-prompt.md` — Master prompt (optional, can use inline)
 
 ## Execution
 
@@ -80,7 +80,7 @@ Output <promise>ALL_DONE</promise> when all specs complete." --completion-promis
 
 If the Ralph Wiggum plugin is not available:
 
-1. Read `RALPH_PROMPT.md` for the master prompt
+1. Read `docs/ralph/master-prompt.md` for the master prompt
 2. Manually iterate through specs in order
 3. For each spec, implement until Completion Signal requirements are met
 4. Commit and push after each major milestone

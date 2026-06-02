@@ -4,6 +4,9 @@ import os
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .leadership import extract_leadership_from_evidence
+from .query_intent import is_person_lookup_query
+
 DEFAULT_MIN_SCORE_FUSED = 0.4
 DEFAULT_MIN_GAP_FUSED = 0.05
 DEFAULT_MIN_SCORE_RERANKED = 0.5
@@ -39,8 +42,29 @@ def confidence_thresholds_for_mode(mode: str) -> tuple[float, float]:
     )
 
 
-def assess_confidence(result: dict[str, Any], *, min_score: float | None = None, min_gap: float | None = None) -> dict[str, Any]:
+def assess_confidence(
+    result: dict[str, Any],
+    *,
+    question: str | None = None,
+    min_score: float | None = None,
+    min_gap: float | None = None,
+) -> dict[str, Any]:
     evidence = result.get("evidence") if isinstance(result.get("evidence"), list) else []
+    if question and is_person_lookup_query(question):
+        leadership = extract_leadership_from_evidence(question, evidence)
+        if leadership and leadership.confidence >= 0.8:
+            return ConfidenceDecision(
+                confident=True,
+                decision="confident",
+                reasons=["leadership_entity_match", "status_ok", "citation_present"],
+                min_score=0.0,
+                min_gap=0.0,
+                top_score=1.0,
+                top_two_gap=1.0,
+                citation_present=any(_has_citation(item) for item in evidence if isinstance(item, dict)),
+                scoring_mode=_detect_scoring_mode(evidence, result),
+                gated_score=1.0,
+            ).to_dict()
     scoring_mode = _detect_scoring_mode(evidence, result)
     score_threshold, gap_threshold = confidence_thresholds_for_mode(scoring_mode)
     if min_score is not None:

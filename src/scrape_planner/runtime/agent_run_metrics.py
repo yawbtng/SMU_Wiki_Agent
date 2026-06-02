@@ -8,6 +8,10 @@ from threading import Lock
 from typing import Any, Literal
 from uuid import uuid4
 
+from ..core.storage import append_jsonl as _append_jsonl_impl
+from ..core.storage import read_jsonl
+from ..core.storage import write_json_atomic as _write_json_atomic_impl
+
 CostSource = Literal["reported", "estimated", "unknown", "partial", "mixed"]
 TerminalStatus = Literal["completed", "failed", "canceled", "cancelled"]
 
@@ -48,6 +52,18 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
+def _as_cost_source(raw: str) -> CostSource:
+    if raw == "reported":
+        return "reported"
+    if raw == "estimated":
+        return "estimated"
+    if raw == "partial":
+        return "partial"
+    if raw == "mixed":
+        return "mixed"
+    return "unknown"
+
+
 def _to_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
@@ -65,18 +81,13 @@ def _sum_known(values: list[int | None]) -> int | None:
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
     with _LOCK:
-        tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
-        tmp_path.replace(path)
+        _write_json_atomic_impl(path, payload)
 
 
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     with _LOCK:
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        _append_jsonl_impl(path, payload)
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -87,23 +98,6 @@ def _read_json(path: Path, default: Any) -> Any:
     except (OSError, json.JSONDecodeError):
         return default
     return payload
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            rows.append(payload)
-    return rows
 
 
 @dataclass(frozen=True)
@@ -275,7 +269,7 @@ class AgentRunMetricsRepository:
         _append_jsonl(self.raw_events_path(site_id), payload)
 
     def read_events(self, site_id: str, run_id: str | None = None) -> list[dict[str, Any]]:
-        rows = _read_jsonl(self.raw_events_path(site_id))
+        rows = read_jsonl(self.raw_events_path(site_id))
         if run_id is None:
             return rows
         return [row for row in rows if str(row.get("run_id") or "") == run_id]
@@ -462,8 +456,10 @@ def _cost_from_events(events: list[dict[str, Any]], warnings: set[str]) -> Metri
         return MetricCost(None, "unknown")
     if unknown:
         return MetricCost(round(sum(costs), 8), "partial")
-    if len(sources) == 1 and next(iter(sources)) in {"reported", "estimated"}:
-        return MetricCost(round(sum(costs), 8), next(iter(sources)))  # type: ignore[arg-type]
+    if len(sources) == 1:
+        only_source = next(iter(sources))
+        if only_source in {"reported", "estimated"}:
+            return MetricCost(round(sum(costs), 8), _as_cost_source(only_source))
     return MetricCost(round(sum(costs), 8), "mixed")
 
 
@@ -477,8 +473,10 @@ def _combine_costs(costs: list[MetricCost], warnings: set[str]) -> MetricCost:
     sources = {cost.source for cost in known}
     if len(known) != len(costs):
         return MetricCost(amount, "partial")
-    if len(sources) == 1 and next(iter(sources)) in {"reported", "estimated"}:
-        return MetricCost(amount, next(iter(sources)))  # type: ignore[arg-type]
+    if len(sources) == 1:
+        only_source = next(iter(sources))
+        if only_source in {"reported", "estimated"}:
+            return MetricCost(amount, only_source)
     return MetricCost(amount, "mixed")
 
 
@@ -564,7 +562,7 @@ def _aggregate_summaries(label: str, summaries: list[dict[str, Any]]) -> dict[st
 def _dict_cost(value: Any) -> MetricCost:
     if not isinstance(value, dict):
         return MetricCost(None, "unknown")
-    source = str(value.get("source") or "unknown")
-    if source not in {"reported", "estimated", "unknown", "partial", "mixed"}:
-        source = "unknown"
-    return MetricCost(_to_float(value.get("amount_usd")), source)  # type: ignore[arg-type]
+    return MetricCost(
+        _to_float(value.get("amount_usd")),
+        _as_cost_source(str(value.get("source") or "unknown")),
+    )

@@ -9,18 +9,15 @@ import pandas as pd
 def _parse_ts(value: Any) -> pd.Timestamp | pd.NaT:
     if value is None:
         return pd.NaT
-    try:
-        return pd.to_datetime(value, utc=True, errors="coerce")
-    except Exception:
-        return pd.NaT
+    return pd.to_datetime(value, utc=True, errors="coerce")
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
     try:
-        if value is None:
-            return default
         return int(value)
-    except Exception:
+    except (TypeError, ValueError):
         return default
 
 
@@ -39,7 +36,7 @@ def _read_size(path_value: Any) -> int:
         return 0
     try:
         return Path(str(path_value)).stat().st_size
-    except Exception:
+    except OSError:
         return 0
 
 

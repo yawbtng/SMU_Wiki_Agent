@@ -58,6 +58,25 @@ def _normalize_optional_string(value: Any) -> str | None:
     return _normalize_string(value, "")
 
 
+def _normalize_int(value: Any, default: int = 0, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, float):
+        result = int(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            result = int(value.strip())
+        except ValueError:
+            return default
+    else:
+        return default
+    if minimum is not None:
+        result = max(minimum, result)
+    return result
+
+
 def _normalize_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -129,6 +148,27 @@ def _normalize_app_state_payload(payload: Any, defaults: AppStateContract) -> Ap
     normalized["llm_provider"] = _normalize_string(payload.get("llm_provider"), defaults.get("llm_provider", "openrouter"))
     normalized["ollama_base_url"] = _normalize_string(payload.get("ollama_base_url"), defaults.get("ollama_base_url", ""))
     normalized["site_history"] = _normalize_string_list(payload.get("site_history"))
+    normalized["tmux_session_grace_seconds"] = _normalize_int(
+        payload.get("tmux_session_grace_seconds"),
+        int(defaults.get("tmux_session_grace_seconds") or 1800),
+        minimum=0,
+    )
+    runtime = _normalize_string(payload.get("wiki_builder_runtime"), defaults.get("wiki_builder_runtime", "pi")).lower()
+    normalized["wiki_builder_runtime"] = "python" if runtime in {"python", "deterministic"} else "pi"
+    normalized["wiki_skip_pi"] = _normalize_bool(payload.get("wiki_skip_pi"), bool(defaults.get("wiki_skip_pi")))
+    normalized["tmux_archive_sessions"] = _normalize_bool(
+        payload.get("tmux_archive_sessions"),
+        bool(defaults.get("tmux_archive_sessions", True)),
+    )
+    normalized["tmux_reconcile_expired_sessions"] = _normalize_bool(
+        payload.get("tmux_reconcile_expired_sessions"),
+        bool(defaults.get("tmux_reconcile_expired_sessions", True)),
+    )
+    normalized["pi_cmd"] = _normalize_string(payload.get("pi_cmd"), defaults.get("pi_cmd", "pi")).strip() or "pi"
+    normalized["tmux_archive_subdir"] = _normalize_string(
+        payload.get("tmux_archive_subdir"),
+        defaults.get("tmux_archive_subdir", "wiki/reports/tmux-archives"),
+    )
     merged.update(normalized)
     return merged
 
@@ -176,6 +216,12 @@ class AppStateRepository:
 
     def save(self, payload: dict[str, Any]) -> None:
         write_json(self.path, payload)
+        try:
+            from .tmux_settings import refresh_app_state_cache
+
+            refresh_app_state_cache()
+        except ImportError:
+            pass
 
 
 class SiteArtifactRepository:

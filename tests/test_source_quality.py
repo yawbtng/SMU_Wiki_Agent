@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from src.scrape_planner.source_quality import assess_source_quality, strip_repeated_chrome, write_quality_report
+from src.scrape_planner.sources.source_quality import assess_source_quality, strip_repeated_chrome, write_quality_report
 
 
 def test_pdf_signature_is_quarantined_with_pdf_parser_route() -> None:

@@ -1,21 +1,36 @@
 services:
   app:
     build: .
-    container_name: ultra-fast-rag-app
+    image: ultra-fast-rag:local
+    container_name: ultra-fast-rag-webapp
     ports:
-      - "8501:8501"
+      - "${WEBAPP_HOST_PORT:-8000}:8000"
     environment:
+      SCRAPE_PLANNER_DATA_ROOT: /app/data
       REDIS_URL: redis://redis:6379/0
-      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      SCRAPE_PLANNER_CORS_ORIGINS: http://localhost:8000,http://127.0.0.1:8000
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
     volumes:
       - ./data:/app/data
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
 
   redis:
     image: redis:7-alpine
     container_name: ultra-fast-rag-redis
     ports:
-      - "6379:6379"
+      - "${REDIS_HOST_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

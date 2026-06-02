@@ -1,3 +1,0 @@
-# Minimal dependency set for mcp_servers/markdown_graph_mcp.py.
-# requirements-mcp.txt also includes zvec for the older Zvec MCP server.
-mcp>=1.9.0

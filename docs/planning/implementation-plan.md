@@ -4,7 +4,7 @@ Planning-mode artifact only. Do **not** treat any item below as implemented. Spe
 
 ## Current State
 
-All tracked specs are incomplete. **UI target:** FastAPI + React in `ultra-fast-rag-webapp` (spec 006); Streamlit is parity reference only.
+All tracked specs are incomplete. **UI target:** FastAPI + React in this repo (spec 006); Streamlit removed.
 
 | Priority | Spec | Status | Primary Theme |
 | --- | --- | --- | --- |
@@ -16,27 +16,20 @@ All tracked specs are incomplete. **UI target:** FastAPI + React in `ultra-fast-
 | 004 | `specs/004-agent-navigable-wiki-map.md` | TODO | Agent-traversable markdown graph, links, backlinks, manifest, MCP hints |
 | 005 | `specs/005-wiki-ralph-orchestrator-ui.md` | TODO | Tmux/Ralph wiki agent launch/status UI (webapp) |
 
-Migration worktree:
+## Priority 0 — Operator UI baseline (in-repo)
 
-```text
-/Users/abhsheno/Desktop/Projects/ultra-fast-rag-webapp
-branch: migrate-fastapi-react
-```
+### Task 0.1 — FastAPI/React as primary surface
 
-## Priority 0 — Reconcile Target UI Architecture
+- Spec 006; specs 002/005 target `frontend/` + `src/scrape_planner/webapp/`.
+- Run `./start.sh` (Vite **5173**, API **8000**); gate with `./scripts/verify-webapp.sh`.
 
-### Task 0.1 — Add/update specs for FastAPI/React replacement
-
-- Spec 006 added; specs 002/005 amended to target webapp.
-- Work index states FastAPI/React is the primary UI stack.
-
-### Task 0.2 — Stabilize new webapp baseline (webapp worktree)
+### Task 0.2 — Stabilize webapp baseline
 
 Files:
 
-- `ultra-fast-rag-webapp/src/scrape_planner/webapp/api.py`
-- `ultra-fast-rag-webapp/frontend/`
-- `ultra-fast-rag-webapp/docs/migration/streamlit-to-fastapi-react-audit.md`
+- `src/scrape_planner/webapp/api.py`, `routes.py`, `jobs.py`
+- `frontend/`
+- `docs/migration/streamlit-to-fastapi-react-audit.md`
 
 Actions:
 

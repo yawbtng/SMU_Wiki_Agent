@@ -22,11 +22,42 @@ def ensure_run_dirs(base: Path) -> dict[str, Path]:
     return paths
 
 
-def write_json(path: Path, data: Any) -> None:
+def write_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
-    tmp_path.write_text(json.dumps(data, indent=2, ensure_ascii=True), encoding="utf-8")
+    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
     tmp_path.replace(path)
+
+
+def write_json(path: Path, data: Any) -> None:
+    write_json_atomic(path, data)
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        line = json.dumps(row, ensure_ascii=True) + "\n"
+    except TypeError as exc:
+        raise ValueError(f"jsonl payload is not serializable for {path}: {exc}") from exc
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line)
 
 
 def read_json(path: Path, default: Any) -> Any:

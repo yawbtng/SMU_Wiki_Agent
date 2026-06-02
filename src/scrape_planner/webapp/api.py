@@ -3,118 +3,74 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import threading
 import uuid
-from collections import Counter
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import requests
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 
-from ..app import APP_STATE_DEFAULTS
-from ..app.repositories import AppStateRepository, SiteArtifactRepository, SiteStatusReadModel
-from ..agent_run_metrics import AgentRunMetricsRepository, STANDARD_WINDOWS, build_embedding_metric_event
-from ..run_persistence import read_page_states, read_run_events, read_run_status
+from ..runtime.agent_run_metrics import STANDARD_WINDOWS
+from ..app.navigation import WORKFLOW_TABS
+from ..runtime.run_persistence import read_page_states, read_run_events, read_run_status
 from ..scrape.scrape_url_selection import urls_for_site_scrape
 from ..scrape.scrape_worker import ScrapeRunner
-from ..sitemap_discovery import discover_site_urls, normalize_site_url
-from ..state import RunStateStore
-from ..storage import read_json, write_json
-from ..stepper_status import raw_sources_ready, read_jsonl_rows, wiki_ready
-from ..tmux_runner import TmuxRunner
-from ..ui_navigation import WORKFLOW_TABS
-from ..url_policy import classify_url_for_student_wiki
-from ..data_root import resolve_data_root
-
+from ..scrape.sitemap_discovery import discover_site_urls, normalize_site_url
+from ..runtime.state import RunStateStore
+from ..core.storage import read_json, write_json
+from ..infra.tmux_runner import TmuxRunner
 from ..wiki.self_improving import read_confidence_gaps
+from .approved_urls import (
+    approval_chat_payload,
+    approved_urls_payload,
+    commit_approved_urls_payload,
+    write_approved_urls_payload,
+)
+from .deps import (
+    PROJECT_ROOT,
+    app_state_path,
+    artifact_repo,
+    data_root,
+    mcp_runner,
+    metrics_repo,
+    read_json_file,
+    read_jsonl_tail,
+    reports_dir,
+    run_root,
+    site_root,
+    state_repo,
+    status_model,
+    to_jsonable,
+    utc_now,
+)
+from .embeddings import (
+    embedding_enabled,
+    embedding_prerequisites_ready,
+    load_embedding_job_state,
+    maybe_auto_queue_embedding_job,
+    run_embedding_job,
+    trigger_embedding_rebuild,
+)
+from .schemas import ApprovedUrlsChatRequest
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-ACTIVE_EMBEDDING_JOB_STATUSES = {"queued", "running", "starting", "initializing"}
-
-
-def data_root() -> Path:
-    return resolve_data_root(PROJECT_ROOT)
-
-
-def app_state_path() -> Path:
-    return data_root() / "app_state.json"
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def to_jsonable(value: Any) -> Any:
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(key): to_jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [to_jsonable(item) for item in value]
-    if hasattr(value, "items"):
-        return {str(key): to_jsonable(item) for key, item in value.items()}
-    return value
-
-
-def read_json_file(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default
-
-
-def read_jsonl_tail(path: Path, limit: int = 200) -> list[dict[str, Any]]:
-    rows = read_jsonl_rows(path)
-    return rows[-limit:] if limit > 0 else rows
-
-
-def site_root(site_id: str) -> Path:
-    safe = site_id.strip().strip("/")
-    if not safe or ".." in safe or "/" in safe:
-        raise HTTPException(status_code=400, detail="invalid site_id")
-    return data_root() / "sites" / safe
-
-
-def run_root(site_id: str, run_id: str) -> Path:
-    safe = run_id.strip().strip("/")
-    if not safe or ".." in safe or "/" in safe:
-        raise HTTPException(status_code=400, detail="invalid run_id")
-    return site_root(site_id) / safe
-
-
-def reports_dir(site_id: str) -> Path:
-    return site_root(site_id) / "wiki" / "reports"
-
-
-def artifact_repo() -> SiteArtifactRepository:
-    return SiteArtifactRepository(data_root())
-
-
-def status_model() -> SiteStatusReadModel:
-    return SiteStatusReadModel(data_root())
-
-
-def state_repo() -> AppStateRepository:
-    return AppStateRepository(app_state_path(), defaults={**APP_STATE_DEFAULTS})
-
-
-def metrics_repo() -> AgentRunMetricsRepository:
-    return AgentRunMetricsRepository(data_root())
-
-
-def mcp_runner() -> TmuxRunner:
-    return TmuxRunner()
+__all__ = [
+    "ApprovedUrlsChatRequest",
+    "approval_chat_payload",
+    "create_app",
+    "discover_site_urls",
+    "run_embedding_job",
+    "scrape_runner",
+    "site_event_stream",
+    "sse_event",
+    "start_mcp_server_for_site",
+    "stop_mcp_server_for_site",
+    "tmux_session_exists",
+]
 
 
 def list_sites_payload() -> dict[str, Any]:
@@ -206,8 +162,11 @@ def site_overview_payload(site_id: str, *, compact: bool = True) -> dict[str, An
     if not root.exists():
         raise HTTPException(status_code=404, detail="site not found")
     statuses = status_model()
-    raw_status = statuses.load_raw_source_status(site_id)
-    wiki_status = statuses.load_wiki_status(site_id)
+    layout = statuses.layout(site_id)
+    from ..wiki.stepper_status import load_wiki_status, raw_source_status
+
+    raw_status = raw_source_status(layout)
+    wiki_status = load_wiki_status(layout, raw_status)
     index_status = statuses.load_index_status(site_id)
     index_status.update(
         maybe_auto_queue_embedding_job(
@@ -358,328 +317,55 @@ def start_mcp_server_for_site(root: Path, site_id: str, mcp_status: dict[str, An
     return {"status": "started", "mcp": state}
 
 
-def embedding_job_state_path(root: Path) -> Path:
-    return root / "indexes" / "embedding-job-latest.json"
-
-
-def embedding_reports_dir(root: Path) -> Path:
-    return root / "indexes" / "reports"
-
-
-def embedding_lock_path(root: Path) -> Path:
-    return root / "indexes" / ".embedding-job.lock"
-
-
-def timestamp_slug() -> str:
-    return utc_now().replace("+00:00", "Z").replace(":", "").replace("-", "").replace(".", "")
-
-
-def empty_embedding_job_state(site_id: str) -> dict[str, Any]:
-    return {
-        "site_id": site_id,
-        "status": "idle",
-        "trigger": "",
-        "started_at": "",
-        "updated_at": "",
-        "completed_at": "",
-        "changed_document_count": 0,
-        "report_path": "",
-        "log_path": "",
-        "last_error": "",
-    }
-
-
-def load_embedding_job_state(root: Path, site_id: str) -> dict[str, Any]:
-    payload = read_json(embedding_job_state_path(root), {})
-    if not isinstance(payload, dict) or not payload:
-        return empty_embedding_job_state(site_id)
-    state = empty_embedding_job_state(site_id)
-    state.update(payload)
-    state["site_id"] = site_id
-    return state
-
-
-def write_embedding_job_state(root: Path, state: dict[str, Any]) -> dict[str, Any]:
-    state = {**state, "updated_at": utc_now()}
-    write_json(embedding_job_state_path(root), state)
-    return state
-
-
-def report_path_for_embedding_job(root: Path, trigger: str, status: str) -> Path:
-    return embedding_reports_dir(root) / f"embedding-{trigger}-{status}-{timestamp_slug()}.json"
-
-
-def embedding_enabled() -> bool:
-    state = state_repo().load()
-    return bool(state.get("embedding_enabled", True))
-
-
-def embedding_prerequisites_ready(raw_status: dict[str, Any], wiki_status: dict[str, Any]) -> bool:
-    return raw_sources_ready(raw_status) and wiki_ready(wiki_status)
-
-
-def start_embedding_job_state(
-    root: Path,
-    site_id: str,
-    *,
-    trigger: str,
-    changed_document_count: int,
-    status: str = "queued",
-) -> dict[str, Any]:
-    now = utc_now()
-    run_id = os.getenv("WIKI_AGENT_RUN_ID") or os.getenv("RALPH_AGENT_RUN_ID") or f"embedding-{trigger}-{timestamp_slug()}"
-    report_path = report_path_for_embedding_job(root, trigger, status)
-    log_path = embedding_reports_dir(root) / f"embedding-{trigger}-{timestamp_slug()}.log"
-    state = {
-        "site_id": site_id,
-        "run_id": run_id,
-        "status": status,
-        "trigger": trigger,
-        "started_at": now if status != "queued" else "",
-        "updated_at": now,
-        "completed_at": "",
-        "changed_document_count": int(changed_document_count),
-        "report_path": str(report_path),
-        "log_path": str(log_path),
-        "last_error": "",
-    }
-    return write_embedding_job_state(root, state)
-
-
-def coalesce_embedding_job(root: Path, state: dict[str, Any], *, trigger: str) -> dict[str, Any]:
-    if trigger == "manual":
-        state = {**state, "trigger": "manual", "operator_requested": True}
-        return write_embedding_job_state(root, state)
-    return state
-
-
-def skip_embedding_job(root: Path, site_id: str, *, trigger: str, changed_document_count: int) -> dict[str, Any]:
-    state = start_embedding_job_state(root, site_id, trigger=trigger, changed_document_count=changed_document_count, status="skipped")
-    report = {
-        "site_id": site_id,
-        "status": "skipped",
-        "trigger": trigger,
-        "changed_document_count": int(changed_document_count),
-        "message": "Embedding rebuild skipped: no changed documents required indexing.",
-        "generated_at": utc_now(),
-    }
-    report_path = Path(state["report_path"])
-    write_json(report_path, report)
-    state = {**state, "completed_at": utc_now(), "report_path": str(report_path)}
-    return write_embedding_job_state(root, state)
-
-
-def try_acquire_embedding_lock(root: Path) -> int | None:
-    lock = embedding_lock_path(root)
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        return None
-    os.write(fd, str(os.getpid()).encode("ascii"))
-    return fd
-
-
-def release_embedding_lock(root: Path, fd: int | None) -> None:
-    if fd is not None:
-        os.close(fd)
-    try:
-        embedding_lock_path(root).unlink()
-    except FileNotFoundError:
-        pass
-
-
-def run_embedding_job(
-    root: Path,
-    site_id: str,
-    *,
-    trigger: str,
-    build_index=None,
-) -> dict[str, Any]:
-    fd = try_acquire_embedding_lock(root)
-    if fd is None:
-        state = load_embedding_job_state(root, site_id)
-        return coalesce_embedding_job(root, state, trigger=trigger)
-    state = load_embedding_job_state(root, site_id)
-    if state.get("status") not in ACTIVE_EMBEDDING_JOB_STATUSES:
-        state = start_embedding_job_state(
-            root,
-            site_id,
-            trigger=trigger,
-            changed_document_count=int(state.get("changed_document_count") or 0),
-            status="running",
-        )
-    else:
-        state = write_embedding_job_state(root, {**state, "status": "running", "started_at": state.get("started_at") or utc_now()})
-    log_path = Path(state["log_path"])
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(f"Embedding rebuild started for {site_id} via {trigger} at {utc_now()}\n", encoding="utf-8")
-        if build_index is None:
-            from ..llm_wiki_index import build_llm_wiki_index
-
-            build_index = build_llm_wiki_index
-        report = build_index(root)
-    except Exception as exc:
-        error = str(exc)
-        report_path = Path(state["report_path"])
-        write_json(
-            report_path,
-            {
-                "site_id": site_id,
-                "status": "failed",
-                "trigger": trigger,
-                "changed_document_count": int(state.get("changed_document_count") or 0),
-                "last_error": error,
-                "generated_at": utc_now(),
-            },
-        )
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"Embedding rebuild failed: {error}\n")
-        return write_embedding_job_state(
+def stop_mcp_server_for_site(root: Path, site_id: str, *, runner: TmuxRunner | None = None) -> dict[str, Any]:
+    state = load_mcp_server_state(root, site_id)
+    tmux = runner or mcp_runner()
+    session = str(state.get("session_name") or mcp_session_name(site_id))
+    if not tmux.available():
+        state = write_mcp_server_state(
             root,
             {
                 **state,
                 "status": "failed",
-                "completed_at": utc_now(),
-                "report_path": str(report_path),
-                "log_path": str(log_path),
-                "last_error": error,
+                "running": False,
+                "last_error": "tmux_not_available",
             },
         )
-    else:
-        _record_embedding_metric_event(root, site_id, state=state, report=report)
-        report_path = Path(str(report.get("report_path") or state["report_path"]))
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"Embedding rebuild completed at {utc_now()}\n")
-        return write_embedding_job_state(
+        return {"status": "failed", "mcp": state}
+    if not tmux.session_exists(session):
+        state = write_mcp_server_state(
             root,
             {
                 **state,
-                "status": "complete",
-                "completed_at": utc_now(),
-                "changed_document_count": int(report.get("changed_document_count") or state.get("changed_document_count") or 0),
-                "report_path": str(report_path),
-                "log_path": str(log_path),
+                "status": "stopped",
+                "running": False,
                 "last_error": "",
             },
         )
-    finally:
-        release_embedding_lock(root, fd)
-
-
-def _record_embedding_metric_event(root: Path, site_id: str, *, state: dict[str, Any], report: dict[str, Any]) -> None:
-    run_id = str(state.get("run_id") or os.getenv("WIKI_AGENT_RUN_ID") or os.getenv("RALPH_AGENT_RUN_ID") or "").strip()
-    if not run_id:
-        return
-    raw_count = int(report.get("raw_index_count") or report.get("raw_count") or report.get("raw_documents") or 0)
-    wiki_count = int(report.get("wiki_index_count") or report.get("wiki_count") or report.get("wiki_documents") or 0)
-    skipped_count = int(report.get("skipped_document_count") or 0)
-    changed_count = int(report.get("changed_document_count") or state.get("changed_document_count") or 0)
-    embedding = report.get("embedding") if isinstance(report.get("embedding"), dict) else {}
-    metrics = metrics_repo()
-    try:
-        metrics.append_event(
-            build_embedding_metric_event(
-                run_id=run_id,
-                site_id=site_id,
-                timestamp=str(report.get("built_at") or report.get("last_build_time") or utc_now()),
-                stage="embed",
-                operation="build_llm_wiki_index",
-                provider=str(embedding.get("provider") or "unknown"),
-                model=str(embedding.get("model") or "unknown"),
-                input_tokens=None,
-                document_count=raw_count + wiki_count,
-                chunk_count=raw_count + wiki_count,
-                vector_count=raw_count + wiki_count,
-                reused_vector_count=skipped_count,
-                skipped_chunk_count=skipped_count,
-                failed_chunk_count=0,
-                duration_ms=None,
-                cost_usd=None,
-                cost_source="unknown",
-                raw_provider_usage={
-                    "changed_document_count": changed_count,
-                    "raw_index_count": raw_count,
-                    "wiki_index_count": wiki_count,
-                    "vector_dimensions": embedding.get("vector_dimensions"),
-                },
-            )
-        )
-        metrics.rebuild_run_summary(site_id, run_id, status="complete", trigger=str(state.get("trigger") or "embedding"), agent_mode="webapp")
-    except Exception:
-        return
-
-
-def schedule_embedding_job(root: Path, site_id: str, *, trigger: str) -> None:
-    timer = threading.Timer(0.1, run_embedding_job, args=(root, site_id), kwargs={"trigger": trigger})
-    timer.daemon = True
-    timer.start()
-
-
-def trigger_embedding_rebuild(
-    site_id: str,
-    root: Path,
-    *,
-    trigger: str,
-    changed_document_count: int,
-    force: bool,
-    launch: bool,
-    background_tasks: BackgroundTasks | None = None,
-) -> dict[str, Any]:
-    state = load_embedding_job_state(root, site_id)
-    if str(state.get("status") or "").lower() in ACTIVE_EMBEDDING_JOB_STATUSES:
-        state = coalesce_embedding_job(root, state, trigger=trigger)
-        return {"status": "already_running", "job_state": state}
-    if not force and int(changed_document_count) <= 0:
-        state = skip_embedding_job(root, site_id, trigger=trigger, changed_document_count=0)
-        return {"status": "skipped", "job_state": state}
-    state = start_embedding_job_state(root, site_id, trigger=trigger, changed_document_count=changed_document_count)
-    if launch:
-        if background_tasks is not None:
-            background_tasks.add_task(run_embedding_job, root, site_id, trigger=trigger)
-        else:
-            schedule_embedding_job(root, site_id, trigger=trigger)
-    return {"status": "queued", "job_state": state}
-
-
-def maybe_auto_queue_embedding_job(
-    site_id: str,
-    root: Path,
-    *,
-    raw_status: dict[str, Any],
-    wiki_status: dict[str, Any],
-    index_status: dict[str, Any],
-) -> dict[str, Any]:
-    enabled = embedding_enabled()
-    state = load_embedding_job_state(root, site_id)
-    changed = int(index_status.get("changed_document_count") or 0)
-    prerequisites_ready = embedding_prerequisites_ready(raw_status, wiki_status)
-    freshness = "stale" if changed > 0 else "current"
-    reason = "ready"
-    if not enabled:
-        reason = "embedding_disabled"
-    elif not prerequisites_ready:
-        reason = "prerequisites_unhealthy"
-    elif str(state.get("status") or "").lower() in ACTIVE_EMBEDDING_JOB_STATUSES:
-        reason = "already_running"
-    elif changed > 0:
-        result = trigger_embedding_rebuild(
-            site_id,
+        return {"status": "not_running", "mcp": state}
+    kill = tmux.kill(session)
+    if not kill.get("ok"):
+        state = write_mcp_server_state(
             root,
-            trigger="auto",
-            changed_document_count=changed,
-            force=False,
-            launch=True,
+            {
+                **state,
+                "status": "failed",
+                "running": False,
+                "last_error": str(kill.get("error") or "failed_to_stop_mcp_server"),
+            },
         )
-        state = result["job_state"]
-        reason = result["status"]
-    return {
-        "freshness": freshness,
-        "auto_rebuild_enabled": enabled and prerequisites_ready,
-        "auto_rebuild_reason": reason,
-        "job_state": state,
-    }
+        return {"status": "failed", "mcp": state}
+    state = write_mcp_server_state(
+        root,
+        {
+            **state,
+            "status": "stopped",
+            "running": False,
+            "stopped_at": utc_now(),
+            "last_error": "",
+        },
+    )
+    return {"status": "stopped", "mcp": state}
 
 
 def list_runs_payload(site_id: str) -> dict[str, Any]:
@@ -883,543 +569,6 @@ def sources_payload(site_id: str, limit: int = 500, offset: int = 0) -> dict[str
     }
 
 
-APPROVED_URLS_HEADER = "# Approved URLs\n\n<!-- scrape-planner:approved-urls:v1 -->\n"
-URL_RE = re.compile(r"https?://[^\s)\]}>\"']+")
-
-
-def approved_urls_path(site_id: str) -> Path:
-    return site_root(site_id) / "approved_urls.md"
-
-
-def parse_approved_urls_markdown(markdown: str) -> list[str]:
-    urls: list[str] = []
-    seen: set[str] = set()
-    for match in URL_RE.finditer(markdown or ""):
-        url = match.group(0).rstrip(".,;")
-        if url not in seen:
-            seen.add(url)
-            urls.append(url)
-    return urls
-
-
-SCHOOL_PATH_ROOTS = {"cox", "dedman", "dedmanlaw", "lyle", "meadows", "simmons", "perkins"}
-
-
-def _url_group_key(url: str) -> str:
-    parsed = urlparse(url)
-    parts = [part for part in parsed.path.split("/") if part]
-    if not parts:
-        return "/"
-    if parts[0].lower() in SCHOOL_PATH_ROOTS:
-        return f"/{parts[0]}"
-    if len(parts) == 1:
-        return f"/{parts[0]}"
-    return f"/{parts[0]}/{parts[1]}"
-
-
-def _url_groups(urls: list[str]) -> list[dict[str, Any]]:
-    grouped: dict[str, list[str]] = {}
-    for url in urls:
-        grouped.setdefault(_url_group_key(url), []).append(url)
-    return [
-        {"subpath": subpath, "count": len(items), "examples": items[:3]}
-        for subpath, items in sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0]))
-    ]
-
-
-def _term_matches_url_or_group(url: str, terms: list[str]) -> bool:
-    haystack = f"{url}\n{_url_group_key(url)}".lower().replace("-", " ")
-    compact = haystack.replace(" ", "-")
-    for term in terms:
-        needle = str(term or "").strip().lower().replace("/", " ").replace("-", " ")
-        if not needle:
-            continue
-        if needle in haystack or needle.replace(" ", "-") in compact:
-            return True
-    return False
-
-
-def _discovery_url_pool(site_id: str, *, extra_exclude_terms: list[str] | None = None) -> dict[str, Any]:
-    rows = read_json(site_root(site_id) / "discovered_urls.json", [])
-    exclude_terms = extra_exclude_terms or []
-    eligible_urls: list[str] = []
-    rejected = 0
-    total = 0
-    for row in rows if isinstance(rows, list) else []:
-        if not isinstance(row, dict):
-            continue
-        total += 1
-        url = str(row.get("url") or "")
-        title = str(row.get("title") or "")
-        if row.get("excluded_reason") == "operator_rejected_area" or _term_matches_url_or_group(url, exclude_terms):
-            rejected += 1
-            continue
-        decision = classify_url_for_student_wiki(url, title=title, lastmod=row.get("lastmod"))
-        if decision.selected:
-            eligible_urls.append(url)
-        else:
-            rejected += 1
-    return {
-        "discovered_total": total,
-        "eligible_total": len(eligible_urls),
-        "rejected_total": rejected,
-        "groups": _url_groups(eligible_urls),
-    }
-
-
-def approved_urls_payload(site_id: str) -> dict[str, Any]:
-    path = approved_urls_path(site_id)
-    markdown = path.read_text(encoding="utf-8") if path.exists() else APPROVED_URLS_HEADER + "\n"
-    urls = parse_approved_urls_markdown(markdown)
-    pool = _discovery_url_pool(site_id)
-    return {"site_id": site_id, "path": str(path), "markdown": markdown, "urls": urls, "groups": _url_groups(urls), "available_groups": pool["groups"], "discovery": {"discovered_total": pool["discovered_total"], "eligible_total": pool["eligible_total"], "rejected_total": pool["rejected_total"]}, "count": len(urls), "generated_at": utc_now()}
-
-
-def write_approved_urls_payload(site_id: str, markdown: str) -> dict[str, Any]:
-    path = approved_urls_path(site_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    content = markdown if markdown.strip() else APPROVED_URLS_HEADER + "\n"
-    if "scrape-planner:approved-urls:v1" not in content:
-        content = APPROVED_URLS_HEADER + "\n" + content.strip() + "\n"
-    path.write_text(content, encoding="utf-8")
-    return approved_urls_payload(site_id)
-
-
-def apply_operator_discovery_exclusions(site_id: str, terms: list[str]) -> int:
-    clean_terms = [str(term or "").strip() for term in terms if str(term or "").strip()]
-    if not clean_terms:
-        return 0
-    path = site_root(site_id) / "discovered_urls.json"
-    rows = read_json(path, [])
-    if not isinstance(rows, list):
-        return 0
-    changed = 0
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        url = str(row.get("url") or "")
-        if not url or not _term_matches_url_or_group(url, clean_terms):
-            continue
-        if row.get("excluded_reason") != "operator_rejected_area" or row.get("selected") is not False:
-            row["selected"] = False
-            row["excluded_reason"] = "operator_rejected_area"
-            changed += 1
-    if changed:
-        write_json(path, rows)
-    return changed
-
-
-def commit_approved_urls_payload(site_id: str, request: ApprovedUrlsCommitRequest) -> dict[str, Any]:
-    excluded_count = apply_operator_discovery_exclusions(site_id, request.remove_terms)
-    payload = write_approved_urls_payload(site_id, request.markdown)
-    return {**payload, "operator_excluded_count": excluded_count}
-
-
-def approval_chat_log_path(site_id: str) -> Path:
-    return site_root(site_id) / "approved_urls_chat.jsonl"
-
-
-def _append_approval_chat_event(site_id: str, event: dict[str, Any]) -> None:
-    path = approval_chat_log_path(site_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    row = {**event, "site_id": site_id, "created_at": utc_now()}
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(to_jsonable(row), sort_keys=True) + "\n")
-
-
-def _approved_url_lines(markdown: str) -> dict[str, str]:
-    lines: dict[str, str] = {}
-    for line in (markdown or "").splitlines():
-        match = URL_RE.search(line)
-        if not match:
-            continue
-        url = match.group(0).rstrip(".,;")
-        lines.setdefault(url, line.strip() or f"- [x] {url}")
-    return lines
-
-
-def _render_approved_urls_markdown(lines_by_url: dict[str, str], *, note: str = "") -> str:
-    lines = [APPROVED_URLS_HEADER.rstrip(), ""]
-    if note:
-        lines.extend([f"> {note}", ""])
-    lines.extend(["## Approved for next scrape", ""])
-    for url, line in sorted(lines_by_url.items()):
-        rendered = line if url in line else f"- [x] {url}"
-        if not rendered.lstrip().startswith("-"):
-            rendered = f"- [x] {rendered}"
-        lines.append(rendered)
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def _message_urls(message: str) -> list[str]:
-    urls: list[str] = []
-    seen: set[str] = set()
-    for match in URL_RE.finditer(message or ""):
-        url = match.group(0).rstrip(".,;")
-        if url not in seen:
-            seen.add(url)
-            urls.append(url)
-    return urls
-
-
-def _removal_terms(message: str) -> list[str]:
-    stop = {"remove", "delete", "exclude", "filter", "demove", "noise", "noisy", "bad", "reject", "rejected", "approved", "approve", "source", "sources", "url", "urls", "page", "pages", "anything", "with", "from", "file", "scrape", "please"}
-    terms: list[str] = []
-    for token in re.findall(r"[a-z0-9][a-z0-9-]{2,}", message.lower()):
-        if token not in stop and token not in terms:
-            terms.append(token)
-    return terms
-
-
-def _candidate_rows_for_instruction(site_id: str, instruction: str, *, limit: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    root = site_root(site_id)
-    raw_rows = read_json(root / "discovered_urls.json", [])
-    row_list = [row for row in raw_rows if isinstance(row, dict)] if isinstance(raw_rows, list) else []
-    terms = _message_terms(instruction)
-    explicit_urls = _message_urls(instruction)
-    matched_groups: set[str] = {_url_group_key(url) for url in explicit_urls}
-    rejected: list[dict[str, Any]] = []
-
-    for row in row_list:
-        url = str(row.get("url") or "")
-        title = str(row.get("title") or "")
-        haystack = f"{url}\n{title}".lower()
-        if url and (not terms or any(term in haystack for term in terms)):
-            matched_groups.add(_url_group_key(url))
-
-    candidates: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    discovered_urls = {str(row.get("url") or "") for row in row_list}
-
-    for url in explicit_urls:
-        if url in discovered_urls:
-            continue
-        decision = classify_url_for_student_wiki(url)
-        if decision.selected:
-            candidates.append({"url": url, "title": "", "reason": "explicit_url"})
-            seen.add(url)
-        else:
-            rejected.append({"url": url, "reason": decision.reason})
-
-    for row in row_list:
-        if len(candidates) >= limit:
-            break
-        url = str(row.get("url") or "")
-        if not url or url in seen:
-            continue
-        if row.get("excluded_reason") == "operator_rejected_area":
-            continue
-        if matched_groups and _url_group_key(url) not in matched_groups:
-            continue
-        title = str(row.get("title") or "")
-        decision = classify_url_for_student_wiki(url, title=title, lastmod=row.get("lastmod"))
-        if decision.selected:
-            candidates.append({"url": url, "title": title, "reason": f"subpath:{_url_group_key(url)}"})
-            seen.add(url)
-        else:
-            rejected.append({"url": url, "reason": decision.reason})
-    return candidates, rejected, terms
-
-
-def _positive_instruction_text(message: str) -> str:
-    return re.split(r"\b(?:exclude|reject|do not include|avoid|remove)\b", message, maxsplit=1, flags=re.IGNORECASE)[0]
-
-
-def _message_terms(message: str) -> list[str]:
-    message = _positive_instruction_text(message)
-    aliases = {
-        "registrar": ["registrar", "enrollment-services", "transcript", "records"],
-        "calendar": ["academic-calendar", "final-exam", "calendar"],
-        "catalog": ["course-catalog", "catalog", "course", "degree", "program"],
-        "tuition": ["tuition", "bursar", "billing", "payment", "cost"],
-        "aid": ["financial-aid", "financialaid", "scholarship"],
-        "housing": ["housing", "dining", "student-life", "health", "counseling", "parking", "orientation", "accessibility"],
-        "admission": ["admission", "apply", "application", "transfer", "visit"],
-        "cox": ["cox"],
-        "dedman": ["dedman", "deadman"],
-        "deadman": ["dedman", "deadman"],
-        "meadows": ["meadows"],
-        "lyle": ["lyle"],
-        "simmons": ["simmons"],
-        "perkins": ["perkins"],
-        "schools": ["cox", "dedman", "dedmanlaw", "meadows", "lyle", "simmons", "perkins"],
-    }
-    lowered = message.lower()
-    terms: list[str] = []
-    for key, values in aliases.items():
-        if key in lowered or any(value in lowered for value in values):
-            terms.extend(values)
-    for token in re.findall(r"[a-z0-9][a-z0-9-]{3,}", lowered):
-        if token not in {"approve", "approved", "source", "sources", "scrape", "pages", "urls", "student", "students"}:
-            terms.append(token)
-    deduped: list[str] = []
-    for term in terms:
-        if term not in deduped:
-            deduped.append(term)
-    return deduped
-
-
-def _analysis_terms(message: str) -> list[str]:
-    stop = {"how", "many", "count", "counts", "summary", "summarize", "show", "list", "top", "breakdown", "why", "explain", "could", "eligible", "available", "selected", "urls", "url", "select", "selected", "have", "we", "the", "for", "from", "and", "group", "groups"}
-    terms: list[str] = []
-    for token in re.findall(r"[a-z0-9][a-z0-9-]{2,}", message.lower()):
-        if token not in stop and token not in terms:
-            terms.append(token)
-    return terms
-
-
-def _approval_analysis(site_id: str, markdown: str, message: str) -> dict[str, Any]:
-    rows = read_json(site_root(site_id) / "discovered_urls.json", [])
-    selected_urls = set(parse_approved_urls_markdown(markdown))
-    terms = _analysis_terms(message)
-    eligible_urls: list[str] = []
-    matched_eligible_urls: list[str] = []
-    reject_reasons: Counter[str] = Counter()
-    root_counts: Counter[str] = Counter()
-    school_roots = {"cox", "dedman", "dedmanlaw", "law", "lyle", "meadows", "simmons", "perkins"}
-    student_roots = {"admission", "enrollment-services", "studentaffairs", "student-life", "libraries", "bursar", "financialaid", "student-financial-services", "housing", "dining"}
-    school_or_student = 0
-
-    for row in rows if isinstance(rows, list) else []:
-        if not isinstance(row, dict):
-            continue
-        url = str(row.get("url") or "")
-        title = str(row.get("title") or "")
-        haystack = f"{url}\n{title}".lower()
-        if row.get("excluded_reason") == "operator_rejected_area":
-            reject_reasons["operator_rejected_area"] += 1
-            continue
-        decision = classify_url_for_student_wiki(url, title=title, lastmod=row.get("lastmod"))
-        if decision.selected:
-            eligible_urls.append(url)
-            if not terms or any(term in haystack for term in terms):
-                matched_eligible_urls.append(url)
-            parts = [part.lower() for part in urlparse(url).path.split("/") if part]
-            root = parts[0] if parts else "/"
-            root_counts[root] += 1
-            if root in school_roots or root in student_roots or any(marker in haystack for marker in ("/registrar", "/academic-calendar", "/tuition", "/financial-aid", "/scholarship", "/housing", "/dining", "/health", "/accessibility", "/orientation")):
-                school_or_student += 1
-        else:
-            reject_reasons[decision.reason] += 1
-
-    selected_groups = _url_groups(sorted(selected_urls))
-    available_groups = _url_groups(eligible_urls)
-    matched_groups = _url_groups(matched_eligible_urls) if terms else available_groups
-    return {
-        "discovered_total": len(rows) if isinstance(rows, list) else 0,
-        "eligible_total": len(eligible_urls),
-        "rejected_total": sum(reject_reasons.values()),
-        "selected_total": len(selected_urls),
-        "school_or_student_total": school_or_student,
-        "top_roots": [{"root": root, "count": count} for root, count in root_counts.most_common(15)],
-        "top_available_groups": available_groups[:15],
-        "matched_terms": terms,
-        "matched_eligible_total": len(matched_eligible_urls),
-        "matched_groups": matched_groups[:15],
-        "selected_groups": selected_groups[:15],
-        "reject_reasons": [{"reason": reason, "count": count} for reason, count in reject_reasons.most_common()],
-    }
-
-
-def _analysis_message(analysis: dict[str, Any]) -> str:
-    lines = [
-        f"Discovered {analysis['discovered_total']} URLs.",
-        f"Could select {analysis['eligible_total']} policy-eligible URLs.",
-        f"Filtered {analysis['rejected_total']} noisy or stale URLs.",
-        f"Currently approved {analysis['selected_total']} URLs.",
-        f"School or student-service candidate count is {analysis['school_or_student_total']} URLs.",
-    ]
-    if analysis.get("matched_terms"):
-        lines.append(f"For {', '.join(analysis['matched_terms'])}, matched {analysis['matched_eligible_total']} eligible URLs.")
-    top = analysis.get("matched_groups") or analysis.get("top_available_groups") or []
-    if top:
-        lines.append("Top selectable subpaths:")
-        lines.extend(f"{item['subpath']}: {item['count']}" for item in top[:8])
-    reasons = analysis.get("reject_reasons") or []
-    if reasons:
-        lines.append("Top rejection reasons:")
-        lines.extend(f"{item['reason']}: {item['count']}" for item in reasons[:5])
-    return "\n".join(lines)
-
-
-def _read_dotenv_key(path: Path, key: str) -> str:
-    if not path.exists():
-        return ""
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if not line.startswith(f"{key}="):
-            continue
-        return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return ""
-
-
-def _openrouter_api_key() -> str:
-    state = state_repo().load()
-    return (
-        os.getenv("OPENROUTER_API_KEY", "").strip()
-        or str(state.get("openrouter_api_key") or "").strip()
-        or _read_dotenv_key(PROJECT_ROOT / ".env", "OPENROUTER_API_KEY")
-        or _read_dotenv_key(PROJECT_ROOT.parent / "ultra-fast-rag" / ".env", "OPENROUTER_API_KEY")
-    )
-
-
-def _url_chat_model() -> str:
-    state = state_repo().load()
-    return str(state.get("url_reasoning_openrouter_model") or os.getenv("URL_REASONING_OPENROUTER_MODEL") or "deepseek/deepseek-v4-flash").strip()
-
-
-def _extract_json_object(text: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.S)
-        payload = json.loads(match.group(0)) if match else {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _llm_decide_url_chat(message: str, base_prompt: str, analysis: dict[str, Any]) -> dict[str, Any]:
-    api_key = _openrouter_api_key()
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is required for URL approval chat")
-    compact = {
-        "discovered_total": analysis.get("discovered_total"),
-        "eligible_total": analysis.get("eligible_total"),
-        "selected_total": analysis.get("selected_total"),
-        "top_available_groups": analysis.get("top_available_groups", [])[:20],
-        "selected_groups": analysis.get("selected_groups", [])[:20],
-        "reject_reasons": analysis.get("reject_reasons", [])[:8],
-    }
-    guidance = base_prompt.strip() or _url_selection_guidance()
-    prompt = (
-        "You are a URL selection agent for a university scraping workflow. Return strict JSON only. "
-        "Classify the operator message into one intent: analyze, approve, remove. "
-        "Use approve only when the user asks to add/select/include/scrape URLs. "
-        "Use remove when the user asks to remove/delete/exclude/filter noise. "
-        "Otherwise analyze. Return keys intent, terms, response. Terms are path words or school names to match. "
-        "Never invent counts. Use the supplied analysis facts.\n"
-        f"Student URL policy guidance:\n{guidance}\n"
-        f"Operator message: {message}\n"
-        f"Facts: {json.dumps(compact, ensure_ascii=False)}"
-    )
-    resp = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": _url_chat_model(), "messages": [{"role": "user", "content": prompt}], "temperature": 0.0, "max_tokens": 1200},
-        timeout=90,
-    )
-    resp.raise_for_status()
-    content = str(resp.json()["choices"][0]["message"]["content"] or "")
-    decision = _extract_json_object(content)
-    intent = str(decision.get("intent") or "analyze").lower()
-    if intent not in {"analyze", "approve", "remove"}:
-        intent = "analyze"
-    terms = decision.get("terms") if isinstance(decision.get("terms"), list) else []
-    return {
-        "provider": "openrouter",
-        "model": _url_chat_model(),
-        "status": "success",
-        "intent": intent,
-        "terms": [str(term).strip() for term in terms if str(term).strip()][:20],
-        "response": str(decision.get("response") or "").strip(),
-    }
-
-
-def approval_chat_payload(site_id: str, request: ApprovedUrlsChatRequest) -> dict[str, Any]:
-    message = request.message.strip()
-    current = request.markdown if request.markdown is not None else approved_urls_payload(site_id)["markdown"]
-    lines_by_url = _approved_url_lines(current)
-    removed: list[dict[str, str]] = []
-    added: list[dict[str, str]] = []
-    rejected: list[dict[str, str]] = []
-    terms: list[str] = []
-    analysis: dict[str, Any] | None = _approval_analysis(site_id, current, message)
-    try:
-        llm = _llm_decide_url_chat(message, request.base_prompt, analysis)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"LLM URL agent failed: {str(exc)[:300]}") from exc
-    intent = str(llm.get("intent") or "").lower()
-    if intent not in {"analyze", "approve", "remove"}:
-        raise HTTPException(status_code=502, detail=f"LLM URL agent returned invalid intent: {intent or 'missing'}")
-    llm_terms = [str(term) for term in llm.get("terms", []) if str(term).strip()]
-    effective_message = " ".join(llm_terms) if llm_terms else message
-
-    if intent == "remove":
-        urls = _message_urls(message)
-        terms = llm_terms or ([] if urls else _removal_terms(message))
-        for url, line in list(lines_by_url.items()):
-            lowered = line.lower()
-            matched_url = next((item for item in urls if item == url or item in line), "")
-            matched_term = next((term for term in terms if term in lowered), "")
-            if matched_url or matched_term:
-                removed.append({"url": url, "reason": matched_url or matched_term})
-                lines_by_url.pop(url, None)
-        if removed:
-            assistant_message = f"{'Removed' if request.autosave else 'Proposed removing'} {len(removed)} approved URL(s)."
-        else:
-            assistant_message = "I did not find matching approved URLs. Paste an exact URL or a distinctive path term."
-    elif intent == "approve":
-        instruction = "\n".join(part for part in [request.base_prompt.strip(), effective_message] if part)
-        candidates, rejected_rows, terms = _candidate_rows_for_instruction(site_id, instruction, limit=request.limit)
-        rejected = [{"url": str(item.get("url") or ""), "reason": str(item.get("reason") or "") } for item in rejected_rows]
-        for item in candidates:
-            url = item["url"]
-            if url in lines_by_url:
-                continue
-            label = f" — {item['title']}" if item.get("title") else ""
-            lines_by_url[url] = f"- [x] {url}{label}"
-            added.append({"url": url, "reason": str(item.get("reason") or "selected")})
-        verb = "Added" if request.autosave else "Proposed adding"
-        assistant_message = f"{verb} {len(added)} approved URL(s). Rejected {len(rejected)} noisy URL(s)."
-    else:
-        assistant_message = str(llm.get("response") or "").strip() or _analysis_message(analysis)
-
-    markdown = _render_approved_urls_markdown(lines_by_url, note="Managed by Approval chat. Edit by chatting or changing this file directly.")
-    should_save = request.autosave and intent in {"remove", "approve"}
-    saved = False
-    if should_save:
-        write_approved_urls_payload(site_id, markdown)
-        saved = True
-    event = {
-        "message": message,
-        "base_prompt": request.base_prompt,
-        "autosave": request.autosave,
-        "added": added,
-        "removed": removed,
-        "rejected": rejected[:100],
-        "approved_count": len(lines_by_url),
-        "analysis": analysis,
-        "llm": llm,
-        "intent": intent,
-    }
-    _append_approval_chat_event(site_id, event)
-    pool = _discovery_url_pool(site_id, extra_exclude_terms=terms if intent == "remove" else [])
-    added_urls = [item["url"] for item in added]
-    removed_urls = [item["url"] for item in removed]
-    rejected_urls = [item["url"] for item in rejected]
-    return {
-        "site_id": site_id,
-        "assistant_message": assistant_message + (" Saved approved_urls.md." if saved else (" Review the proposed URL groups, then click Update approved_urls.md." if intent in {"remove", "approve"} else "")),
-        "markdown": markdown,
-        "urls": list(lines_by_url),
-        "groups": _url_groups(list(lines_by_url)),
-        "added_groups": _url_groups(added_urls),
-        "removed_groups": _url_groups(removed_urls),
-        "rejected_groups": _url_groups(rejected_urls),
-        "available_groups": pool["groups"],
-        "discovery": {"discovered_total": pool["discovered_total"], "eligible_total": pool["eligible_total"], "rejected_total": pool["rejected_total"]},
-        "count": len(lines_by_url),
-        "added": added,
-        "removed": removed,
-        "rejected": rejected,
-        "terms": terms,
-        "saved": saved,
-        "analysis": analysis,
-        "llm": llm,
-        "intent": intent,
-        "path": str(approved_urls_path(site_id)),
-        "generated_at": utc_now(),
-    }
-
-
 _TMUX_CACHE: dict[str, tuple[float, bool]] = {}
 _TMUX_CACHE_TTL_SECONDS = 3.0
 
@@ -1437,6 +586,14 @@ def wiki_agent_payload(site_id: str, *, compact: bool = False) -> dict[str, Any]
             summary = ""
     event_limit = 5 if compact else 200
     events = read_jsonl_tail(directory / "wiki-agent-events-latest.jsonl", event_limit)
+    wiki_build_report = read_json_file(directory / "wiki-build-latest.json", {})
+    pi_events_path = wiki_build_report.get("pi_events_path")
+    if pi_events_path:
+        from ..app.pi_agent import read_pi_events_after
+
+        pi_events, _ = read_pi_events_after(Path(pi_events_path), 0, limit=event_limit)
+        if pi_events:
+            events = pi_events
     pane_log_path = directory / "wiki-agent-pane-latest.log"
     pane_tail = ""
     if pane_log_path.exists() and not compact:
@@ -1466,6 +623,9 @@ def wiki_agent_payload(site_id: str, *, compact: bool = False) -> dict[str, Any]
 
 
 def tmux_session_exists(session: str) -> bool:
+    from ..infra.tmux_session_shell import sanitize_tmux_session_name
+
+    session = sanitize_tmux_session_name(session)
     if not session:
         return False
     import subprocess
@@ -1492,19 +652,190 @@ def tmux_session_exists(session: str) -> bool:
     return alive
 
 
-def wiki_pages_payload(site_id: str, query: str = "", limit: int = 200) -> dict[str, Any]:
+_GUIDE_PAGE_TYPES = frozenset({"semantic", "category", "navigation", "concept", "entity", "workflow", "process"})
+_PDF_SHARD_MARKERS = ("catalog-pdf", "/pdf-p-", "-pdf-")
+_EVIDENCE_PAGE_DIRS = frozenset({"admissions", "general", "finance", "departments", "registrar", "scholarships"})
+_GUIDE_PAGE_PREFIXES = ("schools", "answers")
+
+
+def _iter_wiki_page_paths(pages_root: Path, *, view: str):
+    normalized_view = str(view or "guides").strip().lower()
+    if normalized_view == "all":
+        yield from pages_root.rglob("*.md")
+        return
+    if normalized_view == "sources":
+        for directory in sorted(_EVIDENCE_PAGE_DIRS):
+            root = pages_root / directory
+            if root.is_dir():
+                yield from root.rglob("*.md")
+        return
+    yield from pages_root.glob("*.md")
+    for prefix in _GUIDE_PAGE_PREFIXES:
+        root = pages_root / prefix
+        if root.is_dir():
+            yield from root.rglob("*.md")
+
+
+def _wiki_page_frontmatter(path: Path) -> tuple[dict[str, str], str]:
+    try:
+        head = path.read_text(encoding="utf-8", errors="replace")[:8192]
+    except OSError:
+        return {}, ""
+    if not head.startswith("---"):
+        return {}, head
+    end = head.find("\n---", 3)
+    if end < 0:
+        return {}, head
+    meta: dict[str, str] = {}
+    for line in head[3:end].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        meta[key.strip()] = value.strip().strip('"').strip("'")
+    body = head[end + 4 :]
+    return meta, body
+
+
+def _wiki_display_title(meta: dict[str, str], path: Path, body: str) -> str:
+    title = str(meta.get("title") or "").strip()
+    if title and not title.startswith("Source:"):
+        return title
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            return stripped[2:].strip()
+    if title:
+        return title
+    return path.stem.replace("-", " ").strip() or "Untitled"
+
+
+def _wiki_page_type(meta: dict[str, str], rel_str: str) -> str:
+    explicit = str(meta.get("page_type") or "").strip().lower()
+    if explicit:
+        return explicit
+    if any(marker in rel_str for marker in _PDF_SHARD_MARKERS):
+        return "source"
+    if rel_str.startswith("pages/schools/") or rel_str.endswith("-guide.md"):
+        return "semantic"
+    if rel_str.count("/") <= 1:
+        return "category"
+    return "unknown"
+
+
+def _wiki_page_in_view(page_type: str, rel_str: str, *, view: str) -> bool:
+    normalized_view = str(view or "guides").strip().lower()
+    if normalized_view == "all":
+        return True
+    is_pdf_shard = any(marker in rel_str for marker in _PDF_SHARD_MARKERS)
+    if normalized_view == "sources":
+        return page_type == "source" or is_pdf_shard
+    # Default: student-facing guides and hubs, not per-PDF evidence shards.
+    if page_type == "source" or is_pdf_shard:
+        return False
+    if page_type in _GUIDE_PAGE_TYPES:
+        return True
+    if rel_str.startswith("pages/schools/") or rel_str.endswith("-guide.md"):
+        return True
+    if page_type == "unknown" and rel_str.count("/") <= 1:
+        return True
+    return False
+
+
+def wiki_generation_payload(site_id: str) -> dict[str, Any]:
+    root = site_root(site_id)
+    wiki_dir = root / "wiki"
+    reports_dir = wiki_dir / "reports"
+    build_report = read_json_file(reports_dir / "wiki-build-latest.json", {})
+    index_path = wiki_dir / "index.md"
+    index_updated = ""
+    if index_path.exists():
+        try:
+            index_updated = datetime.fromtimestamp(index_path.stat().st_mtime, tz=timezone.utc).isoformat()
+        except OSError:
+            index_updated = ""
+
+    counts = {"semantic": 0, "category": 0, "source": 0, "other": 0, "total": 0, "guides": 0}
+    pages_root = wiki_dir / "pages"
+    if pages_root.exists():
+        for path in _iter_wiki_page_paths(pages_root, view="guides"):
+            meta, _ = _wiki_page_frontmatter(path)
+            rel_str = str(path.relative_to(wiki_dir))
+            page_type = _wiki_page_type(meta, rel_str)
+            counts["guides"] += 1
+            if page_type in counts:
+                counts[page_type] += 1
+            else:
+                counts["other"] += 1
+        for path in _iter_wiki_page_paths(pages_root, view="sources"):
+            counts["source"] += 1
+        counts["total"] = counts["guides"] + counts["source"]
+
+    session = str(build_report.get("tmux_session") or "")
+    job_status = str(build_report.get("job_status") or build_report.get("status") or "unknown")
+    return {
+        "site_id": site_id,
+        "job_status": job_status,
+        "runtime": build_report.get("runtime"),
+        "tmux_session": session,
+        "tmux_session_alive": tmux_session_exists(session) if session else False,
+        "pages_created": build_report.get("pages_created"),
+        "pages_updated": build_report.get("pages_updated"),
+        "integrated_sources": build_report.get("integrated_sources"),
+        "semantic_page_count": counts["semantic"],
+        "category_page_count": counts["category"],
+        "guide_page_count": counts["guides"],
+        "source_page_count": counts["source"],
+        "total_page_count": counts["total"],
+        "index_updated_at": index_updated,
+        "pi_events_path": build_report.get("pi_events_path"),
+        "report_path": str(reports_dir / "wiki-build-latest.json"),
+        "generated_at": utc_now(),
+    }
+
+
+def wiki_pages_payload(site_id: str, query: str = "", limit: int = 200, *, view: str = "guides") -> dict[str, Any]:
     pages_root = site_root(site_id) / "wiki" / "pages"
     rows: list[dict[str, Any]] = []
     needle = query.strip().lower()
     if pages_root.exists():
-        for path in sorted(pages_root.rglob("*.md")):
+        for path in _iter_wiki_page_paths(pages_root, view=view):
             rel = path.relative_to(site_root(site_id) / "wiki")
-            if needle and needle not in str(rel).lower():
+            rel_str = str(rel)
+            meta, body = _wiki_page_frontmatter(path)
+            page_type = _wiki_page_type(meta, rel_str)
+            if not _wiki_page_in_view(page_type, rel_str, view=view):
                 continue
-            rows.append({"path": str(rel), "size": path.stat().st_size, "mtime": path.stat().st_mtime})
-            if len(rows) >= limit:
-                break
-    return {"site_id": site_id, "query": query, "pages": rows, "generated_at": utc_now()}
+            title = _wiki_display_title(meta, path, body)
+            category = meta.get("category") or (rel.parts[1] if len(rel.parts) > 2 else rel.parts[0] if rel.parts else "")
+            haystack = " ".join([rel_str, title, category, page_type]).lower()
+            if needle and needle not in haystack:
+                continue
+            rows.append(
+                {
+                    "path": rel_str,
+                    "title": title,
+                    "category": category,
+                    "page_type": page_type,
+                    "size": path.stat().st_size,
+                    "mtime": path.stat().st_mtime,
+                }
+            )
+        rows.sort(
+            key=lambda row: (
+                0 if str(row.get("page_type")) == "semantic" else 1,
+                str(row.get("category") or "").lower(),
+                str(row.get("title") or "").lower(),
+            )
+        )
+        rows = rows[:limit]
+    return {
+        "site_id": site_id,
+        "query": query,
+        "view": view,
+        "pages": rows,
+        "total_matching": len(rows),
+        "generated_at": utc_now(),
+    }
 
 
 def site_relative_text_payload(site_id: str, relative_path: str, limit_chars: int = 80_000) -> dict[str, Any]:
@@ -1536,53 +867,49 @@ def sse_event(event: str, payload: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(to_jsonable(payload), ensure_ascii=True)}\n\n"
 
 
-async def site_event_stream(site_id: str, interval: float) -> AsyncIterator[str]:
+async def site_event_stream(
+    site_id: str,
+    interval: float,
+    *,
+    is_disconnected: Any | None = None,
+) -> AsyncIterator[str]:
+    from ..app.pi_agent import active_pi_events_for_site, read_pi_events_after
+
     previous_digest = ""
+    pi_offset = 0
     while True:
+        if is_disconnected is not None and await is_disconnected():
+            break
         try:
             payload = await asyncio.to_thread(site_overview_payload, site_id, compact=True)
             digest = json.dumps(to_jsonable(payload), sort_keys=True, default=str)
             if digest != previous_digest:
                 previous_digest = digest
                 yield sse_event("site", payload)
+
+            root = site_root(site_id)
+            events_path, skill = await asyncio.to_thread(active_pi_events_for_site, root)
+            if events_path:
+                batch, pi_offset = await asyncio.to_thread(read_pi_events_after, events_path, pi_offset, limit=80)
+                if batch:
+                    yield sse_event(
+                        "pi",
+                        {
+                            "site_id": site_id,
+                            "skill": skill,
+                            "events_path": str(events_path),
+                            "events": batch,
+                            "generated_at": utc_now(),
+                        },
+                    )
         except Exception as exc:  # keep stream alive for transient file writes
             yield sse_event("error", {"message": str(exc), "generated_at": utc_now()})
         await asyncio.sleep(interval)
 
 
-class AppStateUpdate(BaseModel):
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
-class DiscoverSiteRequest(BaseModel):
-    site_url: str
-    timeout: int = Field(default=15, ge=3, le=60)
-
-
-class ApprovedUrlsUpdate(BaseModel):
-    markdown: str = ""
-
-
-class ApprovedUrlsCommitRequest(BaseModel):
-    markdown: str = ""
-    remove_terms: list[str] = Field(default_factory=list)
-
-
-class ApprovedUrlsChatRequest(BaseModel):
-    message: str = ""
-    base_prompt: str = ""
-    markdown: str | None = None
-    limit: int = Field(default=5000, ge=1, le=30000)
-    autosave: bool = True
-
-
-class StartScrapeRequest(BaseModel):
-    concurrency: int = Field(default=4, ge=1, le=16)
-    prefer_approved: bool = True
-    browser_mode: str = "none"
-
-
 def create_app() -> FastAPI:
+    from .routes import register_routes
+
     app = FastAPI(title="Ultra Fast RAG Web API", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
@@ -1591,163 +918,10 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    @app.get("/api/health")
-    def health() -> dict[str, Any]:
-        return {"status": "ok", "data_root": str(data_root()), "generated_at": utc_now()}
-
-    @app.get("/api/navigation")
-    def navigation() -> dict[str, Any]:
-        return {"tabs": WORKFLOW_TABS}
-
-    @app.get("/api/app-state")
-    def get_app_state() -> dict[str, Any]:
-        return {"state": state_repo().load(), "path": str(app_state_path())}
-
-    @app.put("/api/app-state")
-    def put_app_state(update: AppStateUpdate) -> dict[str, Any]:
-        repo = state_repo()
-        current = dict(repo.load())
-        current.update(update.payload)
-        repo.save(current)
-        return {"state": repo.load(), "path": str(app_state_path())}
-
-    @app.post("/api/discover")
-    def discover_site(request: DiscoverSiteRequest) -> dict[str, Any]:
-        return to_jsonable(discover_site_payload(request.site_url, timeout=request.timeout))
-
-    @app.get("/api/sites")
-    def list_sites() -> dict[str, Any]:
-        return to_jsonable(list_sites_payload())
-
-    @app.get("/api/sites/{site_id}/overview")
-    def site_overview(site_id: str) -> dict[str, Any]:
-        return to_jsonable(site_overview_payload(site_id))
-
-    @app.post("/api/sites/{site_id}/mcp/start")
-    def start_mcp_server(site_id: str) -> dict[str, Any]:
-        root = site_root(site_id)
-        if not root.exists():
-            raise HTTPException(status_code=404, detail="site not found")
-        mcp_status = status_model().load_mcp_status(site_id)
-        return to_jsonable(start_mcp_server_for_site(root, site_id, mcp_status))
-
-    @app.post("/api/sites/{site_id}/embeddings/rebuild")
-    def rebuild_embeddings(
-        site_id: str,
-        background_tasks: BackgroundTasks,
-        force: bool = Query(True),
-    ) -> dict[str, Any]:
-        root = site_root(site_id)
-        if not root.exists():
-            raise HTTPException(status_code=404, detail="site not found")
-        statuses = status_model()
-        raw_status = statuses.load_raw_source_status(site_id)
-        wiki_status = statuses.load_wiki_status(site_id)
-        index_status = statuses.load_index_status(site_id)
-        if not embedding_enabled():
-            return {
-                "status": "disabled",
-                "reason": "embedding_disabled",
-                "job_state": load_embedding_job_state(root, site_id),
-            }
-        if not embedding_prerequisites_ready(raw_status, wiki_status):
-            return {
-                "status": "blocked",
-                "reason": "prerequisites_unhealthy",
-                "job_state": load_embedding_job_state(root, site_id),
-            }
-        result = trigger_embedding_rebuild(
-            site_id,
-            root,
-            trigger="manual",
-            changed_document_count=int(index_status.get("changed_document_count") or 0),
-            force=force,
-            launch=True,
-            background_tasks=background_tasks,
-        )
-        return to_jsonable(result)
-
-    @app.get("/api/sites/{site_id}/sources")
-    def site_sources(site_id: str, limit: int = Query(500, ge=1, le=5000), offset: int = Query(0, ge=0)) -> dict[str, Any]:
-        return to_jsonable(sources_payload(site_id, limit=limit, offset=offset))
-
-    @app.get("/api/sites/{site_id}/approved-urls")
-    def get_approved_urls(site_id: str) -> dict[str, Any]:
-        return to_jsonable(approved_urls_payload(site_id))
-
-    @app.put("/api/sites/{site_id}/approved-urls")
-    def put_approved_urls(site_id: str, update: ApprovedUrlsUpdate) -> dict[str, Any]:
-        return to_jsonable(write_approved_urls_payload(site_id, update.markdown))
-
-    @app.post("/api/sites/{site_id}/approved-urls/commit")
-    def commit_approved_urls(site_id: str, request: ApprovedUrlsCommitRequest) -> dict[str, Any]:
-        return to_jsonable(commit_approved_urls_payload(site_id, request))
-
-    @app.post("/api/sites/{site_id}/approved-urls/chat")
-    def chat_approved_urls(site_id: str, request: ApprovedUrlsChatRequest) -> dict[str, Any]:
-        return to_jsonable(approval_chat_payload(site_id, request))
-
-    @app.post("/api/sites/{site_id}/scrape")
-    def start_site_scrape(site_id: str, request: StartScrapeRequest) -> dict[str, Any]:
-        return to_jsonable(
-            start_scrape_payload(
-                site_id,
-                concurrency=request.concurrency,
-                prefer_approved=request.prefer_approved,
-                browser_mode=request.browser_mode,
-            )
-        )
-
-    @app.get("/api/sites/{site_id}/self-improving/gaps")
-    def site_confidence_gaps(site_id: str, limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
-        return to_jsonable(confidence_gaps_payload(site_id, limit=limit))
-
-    @app.get("/api/sites/{site_id}/runs")
-    def site_runs(site_id: str) -> dict[str, Any]:
-        return to_jsonable(list_runs_payload(site_id))
-
-    @app.get("/api/sites/{site_id}/runs/{run_id}")
-    def site_run(site_id: str, run_id: str, event_limit: int = Query(200, ge=1, le=5000)) -> dict[str, Any]:
-        return to_jsonable(run_payload(site_id, run_id, event_limit=event_limit))
-
-    @app.get("/api/sites/{site_id}/metrics/runs")
-    def site_metrics_runs(site_id: str, limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
-        return to_jsonable(metrics_runs_payload(site_id, limit=limit))
-
-    @app.get("/api/sites/{site_id}/metrics/runs/{run_id}")
-    def site_metrics_run(site_id: str, run_id: str) -> dict[str, Any]:
-        return to_jsonable(metrics_run_payload(site_id, run_id))
-
-    @app.get("/api/sites/{site_id}/metrics/rollups")
-    def site_metrics_rollups(
-        site_id: str,
-        windows: str = Query(",".join(STANDARD_WINDOWS)),
-        as_of: str = "",
-        include_all_time: bool = True,
-    ) -> dict[str, Any]:
-        return to_jsonable(metrics_rollups_payload(site_id, windows=windows, as_of=as_of or None, include_all_time=include_all_time))
-
-    @app.get("/api/sites/{site_id}/wiki/agent")
-    def wiki_agent(site_id: str) -> dict[str, Any]:
-        return to_jsonable(wiki_agent_payload(site_id))
-
-    @app.get("/api/sites/{site_id}/wiki/pages")
-    def wiki_pages(site_id: str, q: str = "", limit: int = Query(200, ge=1, le=2000)) -> dict[str, Any]:
-        return to_jsonable(wiki_pages_payload(site_id, query=q, limit=limit))
-
-    @app.get("/api/sites/{site_id}/document-preview")
-    def document_preview(site_id: str, path: str, limit_chars: int = Query(80_000, ge=1, le=500_000)) -> dict[str, Any]:
-        return to_jsonable(site_relative_text_payload(site_id, path, limit_chars=limit_chars))
-
-    @app.get("/api/stream/sites/{site_id}")
-    def stream_site(site_id: str, interval: float = Query(2.5, ge=0.5, le=10.0)) -> StreamingResponse:
-        return StreamingResponse(site_event_stream(site_id, interval), media_type="text/event-stream")
-
+    register_routes(app)
     static_dir = PROJECT_ROOT / "frontend" / "dist"
     if static_dir.exists():
         app.mount("/", StaticFiles(directory=static_dir, html=True), name="frontend")
-
     return app
 
 

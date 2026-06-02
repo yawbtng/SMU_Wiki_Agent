@@ -2,7 +2,7 @@ import unittest
 
 import pandas as pd
 
-from src.scrape_planner.run_analytics import (
+from src.scrape_planner.runtime.run_analytics import (
     build_llm_calls_timeseries,
     build_llm_cost_breakdown,
     build_llm_latency_table,

@@ -5,8 +5,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .models import utc_now_iso
-from .run_persistence import _append_jsonl, _write_json_atomic
+from .core.models import utc_now_iso
+from .runtime.run_persistence import _append_jsonl, _write_json_atomic
 
 
 ALLOWED_STALE_REASONS = {"source_hash_changed", "missing_source", "manual_revalidate"}

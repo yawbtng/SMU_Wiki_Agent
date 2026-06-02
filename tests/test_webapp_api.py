@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from src.scrape_planner.storage import write_json
-from src.scrape_planner.agent_run_metrics import AgentRunMetricsRepository, build_embedding_metric_event, build_llm_metric_event
-from src.scrape_planner.webapp.api import create_app, run_embedding_job, start_mcp_server_for_site, sse_event, tmux_session_exists
+from src.scrape_planner.core.storage import write_json
+from src.scrape_planner.runtime.agent_run_metrics import AgentRunMetricsRepository, build_embedding_metric_event, build_llm_metric_event
+from src.scrape_planner.webapp.api import create_app, run_embedding_job, start_mcp_server_for_site, stop_mcp_server_for_site, sse_event, tmux_session_exists
 
 
 @pytest.fixture()
@@ -93,7 +93,7 @@ def test_wiki_agent_stale_running(client: TestClient, monkeypatch: pytest.Monkey
 def test_sse_framing(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     import src.scrape_planner.webapp.api as api_module
 
-    async def one_shot_stream(site_id: str, interval: float):
+    async def one_shot_stream(site_id: str, interval: float, is_disconnected=None):
         yield sse_event("site", {"site_id": site_id, "ok": True})
 
     monkeypatch.setattr(api_module, "site_event_stream", one_shot_stream)
@@ -113,8 +113,8 @@ def test_site_overview_missing_site(client: TestClient) -> None:
 
 
 def test_discover_endpoint_persists_any_university_from_robots_sitemap(client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.scrape_planner.models import DiscoveredURL
-    from src.scrape_planner.sitemap_discovery import DiscoveryResult
+    from src.scrape_planner.core.models import DiscoveredURL
+    from src.scrape_planner.scrape.sitemap_discovery import DiscoveryResult
 
     def fake_discover(site_url: str, timeout: int = 15) -> DiscoveryResult:
         return DiscoveryResult(
@@ -144,18 +144,6 @@ def test_discover_endpoint_persists_any_university_from_robots_sitemap(client: T
 
 
 def test_approved_urls_markdown_round_trip_draft_and_chat(client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_llm(message: str, base_prompt: str, analysis: dict) -> dict:
-        if "remove" in message:
-            return {"provider": "test", "status": "success", "intent": "remove", "terms": ["academic-calendar"], "response": ""}
-        if "registrar" in message:
-            return {"provider": "test", "status": "success", "intent": "approve", "terms": ["registrar", "calendar"], "response": ""}
-        if "approve" in message or "housing" in message:
-            terms = ["schools"] if "schools" in message else ["housing"]
-            return {"provider": "test", "status": "success", "intent": "approve", "terms": terms, "response": ""}
-        return {"provider": "test", "status": "success", "intent": "analyze", "terms": [], "response": ""}
-
-    monkeypatch.setattr("src.scrape_planner.webapp.api._llm_decide_url_chat", fake_llm)
-
     site_root = tmp_path / "data" / "sites" / "demo.edu"
     write_json(
         site_root / "discovered_urls.json",
@@ -384,10 +372,12 @@ def test_embedding_job_failure_state_keeps_report_and_error(tmp_path: Path, monk
 
 
 class FakeMcpRunner:
-    def __init__(self, *, exists: bool = False, ok: bool = True) -> None:
+    def __init__(self, *, exists: bool = False, ok: bool = True, kill_ok: bool = True) -> None:
         self.exists = exists
         self.ok = ok
+        self.kill_ok = kill_ok
         self.started: list[tuple[str, str, str]] = []
+        self.killed: list[str] = []
 
     def available(self) -> bool:
         return True
@@ -401,6 +391,13 @@ class FakeMcpRunner:
             return {"ok": False, "error": "tmux refused"}
         self.exists = True
         return {"ok": True, "command": command}
+
+    def kill(self, name: str) -> dict:
+        self.killed.append(name)
+        if not self.kill_ok:
+            return {"ok": False, "error": "kill refused"}
+        self.exists = False
+        return {"ok": True}
 
 
 def test_mcp_start_endpoint_starts_site_scoped_server_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -436,6 +433,36 @@ def test_mcp_start_endpoint_reuses_existing_session(tmp_path: Path, monkeypatch:
     assert payload["status"] == "already_running"
     assert payload["mcp"]["running"] is True
     assert fake_runner.started == []
+
+
+def test_mcp_stop_endpoint_kills_site_scoped_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data_root = tmp_path / "data"
+    site_root = write_embedding_ready_site(data_root, changed=0, embedding_enabled=True)
+    monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(data_root))
+    fake_runner = FakeMcpRunner(exists=True)
+    monkeypatch.setattr("src.scrape_planner.webapp.api.mcp_runner", lambda: fake_runner)
+
+    response = TestClient(create_app()).post("/api/sites/demo.edu/mcp/stop")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "stopped"
+    assert payload["mcp"]["running"] is False
+    assert fake_runner.killed == ["llm-wiki-mcp-demo-edu"]
+    assert fake_runner.exists is False
+
+
+def test_mcp_stop_endpoint_when_not_running(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data_root = tmp_path / "data"
+    write_embedding_ready_site(data_root, changed=0, embedding_enabled=True)
+    monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(data_root))
+    fake_runner = FakeMcpRunner(exists=False)
+    monkeypatch.setattr("src.scrape_planner.webapp.api.mcp_runner", lambda: fake_runner)
+
+    response = TestClient(create_app()).post("/api/sites/demo.edu/mcp/stop")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "not_running"
 
 
 def write_agent_metrics(data_root: Path) -> None:
@@ -574,3 +601,55 @@ def test_confidence_gaps_endpoint(client: TestClient, tmp_path: Path) -> None:
     payload = response.json()
     assert payload["count"] == 1
     assert payload["gaps"][0]["question"] == "fall 2026 schedule"
+
+
+def test_operator_skills_catalog(client: TestClient) -> None:
+    response = client.get("/api/operator/skills")
+    assert response.status_code == 200
+    skills = {item["id"] for item in response.json()["skills"]}
+    assert {"site-discovery", "site-url-curation", "llm-wiki-noninteractive"}.issubset(skills)
+
+
+def test_start_site_job_launches_tmux(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_launch(site_root, skill_id, **kwargs):
+        captured["skill"] = skill_id
+        captured["site_root"] = site_root
+        return {
+            "ok": True,
+            "session_name": "discover-demo.edu-test",
+            "report_path": str(site_root / "jobs" / "reports" / "site-discovery-latest.json"),
+            "builder_command": "bash discover_site.sh",
+        }
+
+    monkeypatch.setattr("src.scrape_planner.webapp.jobs.launch_operator_job", fake_launch)
+
+    response = client.post(
+        "/api/sites/demo.edu/jobs",
+        json={"skill": "site-discovery", "prompt": "discover registrar URLs"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["skill"] == "site-discovery"
+    assert payload["session_name"] == "discover-demo.edu-test"
+    assert captured["skill"] == "site-discovery"
+
+
+def test_start_site_job_unknown_skill(client: TestClient) -> None:
+    response = client.post("/api/sites/demo.edu/jobs", json={"skill": "not-a-skill"})
+    assert response.status_code == 400
+
+
+def test_site_job_status(client: TestClient, tmp_path: Path) -> None:
+    report_dir = tmp_path / "data" / "sites" / "demo.edu" / "jobs" / "reports"
+    report_dir.mkdir(parents=True)
+    (report_dir / "site-discovery-latest.json").write_text(
+        json.dumps({"status": "completed", "tmux_session": "discover-demo-old"}),
+        encoding="utf-8",
+    )
+    response = client.get("/api/sites/demo.edu/jobs/site-discovery")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["skill"] == "site-discovery"
+    assert payload["report"]["status"] == "completed"

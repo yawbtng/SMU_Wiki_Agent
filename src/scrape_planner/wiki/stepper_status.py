@@ -9,9 +9,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from ..core.storage import read_json
+from ..core.storage import read_json, read_jsonl
 from ..core.wiki_common import INTEGRATED_STATES
 from ..infra.tmux_runner import TmuxRunner
+from ..infra.tmux_session_lifecycle import reconcile_expired_tmux_sessions
 
 FUTURE_MCP_MODULE = "mcp_servers.llm_wiki_mcp"
 RUNNING_JOB_STATUSES = frozenset({"running", "initializing", "starting", "queued"})
@@ -28,19 +29,7 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def read_jsonl_rows(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    rows: list[dict] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if line.strip():
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(row, dict):
-                rows.append(row)
-    return rows
+read_jsonl_rows = read_jsonl
 
 
 def _read_report_payload(path: Path) -> dict:
@@ -118,7 +107,9 @@ def _fallback_report(path: Path) -> tuple[Path | None, dict]:
 
 
 def tmux_session_alive(session_name: str, *, runner: TmuxRunner | None = None) -> bool:
-    name = str(session_name or "").strip()
+    from ..infra.tmux_session_shell import sanitize_tmux_session_name
+
+    name = sanitize_tmux_session_name(str(session_name or "").strip())
     if not name:
         return False
     tmux = runner or TmuxRunner()
@@ -136,13 +127,14 @@ def reconcile_tmux_job_status(
     """Return display status plus stale_running when report says running but tmux is gone."""
     normalized = str(job_status or "").strip().lower() or "unknown"
     session = str(tmux_session or "").strip()
-    stale_running = normalized in RUNNING_JOB_STATUSES and bool(session) and not tmux_session_alive(session, runner=runner)
+    alive = tmux_session_alive(session, runner=runner) if session else False
+    stale_running = normalized in RUNNING_JOB_STATUSES and bool(session) and not alive
     display_status = "stale" if stale_running else normalized
     return {
         "job_status": display_status,
         "reported_job_status": normalized,
         "stale_running": stale_running,
-        "tmux_session_alive": tmux_session_alive(session, runner=runner) if session else False,
+        "tmux_session_alive": alive,
     }
 
 
@@ -166,7 +158,12 @@ def load_wiki_agent_status(reports_dir: Path, *, runner: TmuxRunner | None = Non
 
 
 def load_wiki_status(layout, raw_status: dict, *, runner: TmuxRunner | None = None) -> dict:
-    report_path, report = latest_json_report(layout.wiki_dir / "reports", "wiki-build-*.json")
+    reports_dir = layout.wiki_dir / "reports"
+    from ..app.tmux_settings import tmux_reconcile_expired_sessions
+
+    if tmux_reconcile_expired_sessions():
+        reconcile_expired_tmux_sessions(reports_dir, runner=runner)
+    report_path, report = latest_json_report(reports_dir, "wiki-build-*.json")
     if not report:
         report_path, report = _fallback_report(layout.wiki_dir / "build_report.json")
     review_queue_path = layout.wiki_dir / "review_queue.md"

@@ -21,7 +21,7 @@ from .source_registry import (
     utc_now_iso,
     write_registry_rows,
 )
-from ..core.storage import read_json, write_json
+from ..core.storage import read_json, read_jsonl, write_json
 
 
 MAX_PDF_RAW_MARKDOWN_CHARS = 20_000
@@ -583,10 +583,10 @@ def _normalize_pdf_chunk_fallbacks(
         chunks_path = artifact_dir / "pdf_chunks.jsonl"
         sources_path = artifact_dir / "pdf_sources.jsonl"
         quarantine_path = artifact_dir / "pdf_quarantine.jsonl"
-        source_rows = {str(row.get("pdf_source_id") or ""): row for row in _read_jsonl(sources_path)}
-        quarantine_rows = {str(row.get("pdf_source_id") or ""): row for row in _read_jsonl(quarantine_path)}
+        source_rows = {str(row.get("pdf_source_id") or ""): row for row in read_jsonl(sources_path)}
+        quarantine_rows = {str(row.get("pdf_source_id") or ""): row for row in read_jsonl(quarantine_path)}
         chunks_by_source: dict[str, list[dict[str, Any]]] = {}
-        for row in _read_jsonl(chunks_path):
+        for row in read_jsonl(chunks_path):
             pdf_source_id = str(row.get("pdf_source_id") or "")
             if pdf_source_id:
                 chunks_by_source.setdefault(pdf_source_id, []).append(row)
@@ -1141,22 +1141,6 @@ def _write_quality_diagnostic(site_root: Path, quality: SourceQualityRecord, *, 
         encoding="utf-8",
     )
     return diagnostic_path
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            rows.append(value)
-    return rows
 
 
 def _site_relative(path: Path, site_root: Path) -> str:

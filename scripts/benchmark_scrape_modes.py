@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from src.scrape_planner.scrape_benchmark import benchmark_mode, build_report, load_sample_urls
+from src.scrape_planner.scrape.scrape_benchmark import benchmark_mode, build_report, load_sample_urls
 
 
 def parse_args() -> argparse.Namespace:

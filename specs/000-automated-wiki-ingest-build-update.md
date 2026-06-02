@@ -102,7 +102,7 @@ The existing end-to-end entrypoint is `src.scrape_planner.wiki_ingestion_pipelin
 16. UI status must show progress and outcome for each stage, not only the wiki build stage.
 17. If any stage fails, stop subsequent dependent stages, mark the overall pipeline failed, and surface the error in the UI.
 18. Prevent concurrent duplicate pipeline launches for the same site when a pipeline/report is already running.
-19. Update `WORK_INDEX.md` after completion so the queue, completion ledger, and stop point stay visible.
+19. Update `docs/planning/work-index.md` after completion so the queue, completion ledger, and stop point stay visible.
 20. Keep existing separate advanced/manual internals if useful, but the normal UI should only expose Build Wiki and Update Wiki.
 21. Respect `.specify/memory/constitution.md` Git Autonomy settings; do not commit or push unless explicitly enabled by the user.
 
@@ -129,7 +129,7 @@ The existing end-to-end entrypoint is `src.scrape_planner.wiki_ingestion_pipelin
 - [ ] A smoke query similar to `I am a new graduate student likely joining Cox; tell me about courses, course fees, and the admission process` retrieves organized wiki pages/evidence that cover all three aspects: courses, fees, and admissions.
 - [ ] The UI displays per-stage status for Ingest, Clean, Standardize, Lint, Build Wiki, Build Index, and Verify.
 - [ ] If the pipeline is already running for a site, clicking the automated action again does not start a duplicate concurrent run.
-- [ ] `WORK_INDEX.md` is updated with status and verification notes after completion.
+- [ ] `docs/planning/work-index.md` is updated with status and verification notes after completion.
 - [ ] Unit tests cover cleanup/de-boilerplating, common-structure standardization, lint rules, and automated pipeline command/status report behavior.
 - [ ] UI tests or smoke tests cover the automated action and per-stage status rendering.
 - [ ] Syntax/compile checks pass for changed Python and Node paths.

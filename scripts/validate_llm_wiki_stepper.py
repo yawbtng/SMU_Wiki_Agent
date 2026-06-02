@@ -14,11 +14,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.scrape_planner.llm_wiki_builder import build_wiki
-from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
-from src.scrape_planner.raw_source_normalizer import run_normalization_command
-from src.scrape_planner.source_registry import read_registry_rows
-from src.scrape_planner.storage import write_json
+from src.scrape_planner.wiki.llm_wiki_builder import build_wiki
+from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+from src.scrape_planner.sources.raw_source_normalizer import run_normalization_command
+from src.scrape_planner.sources.source_registry import read_registry_rows
+from src.scrape_planner.core.storage import write_json
 
 
 FIXED_NOW = "2026-05-21T12:00:00+00:00"

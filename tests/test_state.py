@@ -1,16 +1,16 @@
 from pathlib import Path
 
-from src.scrape_planner.run_persistence import write_run_status
-from src.scrape_planner.site_layout import site_layout
-from src.scrape_planner.state import RunStateStore
-from src.scrape_planner.stepper_status import (
+from src.scrape_planner.runtime.run_persistence import write_run_status
+from src.scrape_planner.core.site_layout import site_layout
+from src.scrape_planner.runtime.state import RunStateStore
+from src.scrape_planner.wiki.stepper_status import (
     load_embedding_status,
     load_mcp_status,
     load_wiki_status,
     raw_source_status,
 )
-from src.scrape_planner.storage import write_json
-from src.scrape_planner.source_registry import build_source_row, read_registry_rows, write_registry_rows
+from src.scrape_planner.core.storage import write_json
+from src.scrape_planner.sources.source_registry import build_source_row, read_registry_rows, write_registry_rows
 
 
 def test_port_zero_redis_url_disables_redis_client() -> None:
@@ -50,6 +50,26 @@ def test_app_state_repository_normalizes_malformed_top_level_shapes(tmp_path: Pa
     assert loaded["workspaces"] == []
     assert loaded["last_run_by_site"] == {}
     assert loaded["site_history"] == ["ok"]
+
+
+def test_app_state_repository_normalizes_wiki_tmux_settings(tmp_path: Path) -> None:
+    from src.scrape_planner.app.repositories import AppStateRepository
+
+    path = tmp_path / "app_state.json"
+    path.write_text(
+        '{"tmux_session_grace_seconds":"900","wiki_builder_runtime":"deterministic","wiki_skip_pi":"on",'
+        '"tmux_archive_sessions":"off","tmux_reconcile_expired_sessions":0,"pi_cmd":"  /opt/pi  "}',
+        encoding="utf-8",
+    )
+
+    loaded = AppStateRepository(path).load()
+
+    assert loaded["tmux_session_grace_seconds"] == 900
+    assert loaded["wiki_builder_runtime"] == "python"
+    assert loaded["wiki_skip_pi"] is True
+    assert loaded["tmux_archive_sessions"] is False
+    assert loaded["tmux_reconcile_expired_sessions"] is False
+    assert loaded["pi_cmd"] == "/opt/pi"
 
 
 def test_site_artifact_repository_loads_discovered_rows_without_rewriting_file(tmp_path: Path) -> None:

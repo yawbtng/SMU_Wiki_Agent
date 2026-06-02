@@ -1,4 +1,4 @@
-from src.scrape_planner.scrape_benchmark import (
+from src.scrape_planner.scrape.scrape_benchmark import (
     build_report,
     quality_score,
     summarize_mode_results,
@@ -78,7 +78,7 @@ def test_build_report_ranks_available_modes_before_skipped_modes() -> None:
 
 
 def test_mode_availability_marks_plain_agent_browser_available() -> None:
-    from src.scrape_planner.scrape_benchmark import mode_availability
+    from src.scrape_planner.scrape.scrape_benchmark import mode_availability
 
     available, reason = mode_availability("agent_browser")
 

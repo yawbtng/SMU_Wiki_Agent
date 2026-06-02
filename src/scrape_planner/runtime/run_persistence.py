@@ -5,7 +5,10 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from ..tracer.tracer_dependencies import (
+from ..core.storage import append_jsonl as _append_jsonl_impl
+from ..core.storage import read_jsonl
+from ..core.storage import write_json_atomic as _write_json_atomic_impl
+from ..tracer_dependencies import (
     StaleEvaluationResult,
     TracerMaintenanceJobPacket,
     serialize_job_packet,
@@ -15,40 +18,13 @@ _LOCK = Lock()
 
 
 def _write_json_atomic(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    text = json.dumps(payload, indent=2, ensure_ascii=True)
     with _LOCK:
-        tmp_path.write_text(text, encoding="utf-8")
-        tmp_path.replace(path)
+        _write_json_atomic_impl(path, payload)
 
 
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        line = json.dumps(payload, ensure_ascii=True) + "\n"
-    except TypeError as exc:
-        raise ValueError(f"jsonl payload is not serializable for {path}: {exc}") from exc
     with _LOCK:
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            rows.append(parsed)
-    return rows
+        _append_jsonl_impl(path, payload)
 
 
 def write_run_status(run_root: Path, status: dict[str, Any]) -> None:
@@ -71,7 +47,7 @@ def append_run_event(run_root: Path, event: dict[str, Any]) -> None:
 
 
 def read_run_events(run_root: Path, limit: int | None = None) -> list[dict[str, Any]]:
-    events = _read_jsonl(run_root / "events.jsonl")
+    events = read_jsonl(run_root / "events.jsonl")
     if limit is None or limit <= 0:
         return events
     return events[-limit:]
@@ -99,7 +75,7 @@ def write_page_states(run_root: Path, pages: list[dict[str, Any]]) -> None:
 
 
 def read_page_states(run_root: Path) -> list[dict[str, Any]]:
-    rows = _read_jsonl(run_root / "pages.jsonl")
+    rows = read_jsonl(run_root / "pages.jsonl")
     pages_by_url: dict[str, dict[str, Any]] = {}
     for row in rows:
         url = str(row.get("url") or "").strip()

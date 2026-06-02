@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.scrape_planner.site_layout import ensure_site_layout
-from src.scrape_planner.source_registry import (
+from src.scrape_planner.core.site_layout import ensure_site_layout
+from src.scrape_planner.sources.source_registry import (
     build_source_row,
     checksum_text,
     merge_registry_rows,

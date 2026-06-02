@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from src.scrape_planner.storage import write_json
-from src.scrape_planner.zvec_index import chunks, load_index_docs
+from src.scrape_planner.core.storage import write_json
+from src.scrape_planner.index.zvec_index import chunks, load_index_docs
 
 
 def test_load_index_docs_prefers_raw_scrape_and_pdf_sources(tmp_path: Path) -> None:
@@ -67,7 +67,7 @@ def test_uploaded_pdf_materialization_preserves_existing_downloaded_pdf_chunks(t
             return {"chunk_id": "uploaded-c1", "pdf_source_id": "uploaded", "text": "Uploaded PDF text"}
 
     monkeypatch.setattr(
-        "src.scrape_planner.zvec_index.ingest_pdfs",
+        "src.scrape_planner.index.zvec_index.ingest_pdfs",
         lambda paths, config: SimpleNamespace(sources=[Source()], chunks=[Chunk()], quarantine=[]),
     )
 

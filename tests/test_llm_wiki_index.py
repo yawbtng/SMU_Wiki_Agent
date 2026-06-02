@@ -3,114 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from src.scrape_planner.sources.source_registry import build_source_row, checksum_text, write_registry_rows
+import pytest
 
+from src.scrape_planner.sources.source_registry import checksum_text, write_registry_rows
 
-NOW = "2026-05-21T12:00:00+00:00"
-LATER = "2026-05-21T13:00:00+00:00"
-
-
-def _write_source(
-    site_root: Path,
-    *,
-    source_id: str,
-    source_kind: str = "web",
-    title: str,
-    body: str,
-    checksum: str | None = None,
-) -> dict:
-    raw_dir = site_root / "raw_sources" / source_kind
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    markdown_path = raw_dir / f"{source_id}.md"
-    markdown_path.write_text(body, encoding="utf-8")
-    metadata_path = raw_dir / f"{source_id}.metadata.json"
-    metadata_path.write_text(json.dumps({"parser_detail": "fixture"}), encoding="utf-8")
-    return build_source_row(
-        source_id=source_id,
-        source_kind=source_kind,
-        title=title,
-        original_url=f"https://example.edu/{source_id}",
-        original_path="",
-        markdown_path=str(markdown_path.relative_to(site_root)),
-        metadata_path=str(metadata_path.relative_to(site_root)),
-        checksum=checksum or checksum_text(body),
-        parser="fixture-parser",
-        status="ready",
-        now=NOW,
-        wiki_status="integrated",
-    )
-
-
-def _write_wiki_page(
-    site_root: Path,
-    *,
-    name: str,
-    title: str,
-    tags: list[str],
-    source_ids: list[str],
-    body: str,
-    updated_at: str = NOW,
-    audiences: list[str] | None = None,
-    roles: list[str] | None = None,
-    intents: list[str] | None = None,
-    academic_interests: list[str] | None = None,
-) -> Path:
-    pages_dir = site_root / "wiki" / "pages"
-    pages_dir.mkdir(parents=True, exist_ok=True)
-    page_path = pages_dir / f"{name}.md"
-    frontmatter = [
-        "---",
-        f"title: {title}",
-        "tags:",
-        *[f"  - {tag}" for tag in tags],
-        "source_ids:",
-        *[f"  - {source_id}" for source_id in source_ids],
-        *(_frontmatter_list("audiences", audiences or [])),
-        *(_frontmatter_list("roles", roles or [])),
-        *(_frontmatter_list("intents", intents or [])),
-        *(_frontmatter_list("academic_interests", academic_interests or [])),
-        f"updated_at: {updated_at}",
-        "---",
-        "",
-    ]
-    page_path.write_text("\n".join(frontmatter) + body, encoding="utf-8")
-    return page_path
-
-
-def _frontmatter_list(key: str, values: list[str]) -> list[str]:
-    if not values:
-        return []
-    return [f"{key}:", *[f"  - {value}" for value in values]]
-
-
-def _fixture_site(tmp_path: Path) -> Path:
-    site_root = tmp_path / "site"
-    rows = [
-        _write_source(
-            site_root,
-            source_id="web_admissions",
-            title="Admissions Raw",
-            body="# Admissions Raw\n\nThe final application deadline is February 1. Transcripts are required.\n",
-        ),
-        _write_source(
-            site_root,
-            source_id="pdf_catalog",
-            source_kind="pdf",
-            title="Catalog Tuition Raw",
-            body="# Catalog Tuition Raw\n\nTuition for the graduate catalog is 100 credits per term.\n",
-        ),
-    ]
-    rows[0]["wiki_page_paths"] = ["wiki/pages/admissions.md"]
-    write_registry_rows(site_root / "raw_sources" / "registry.jsonl", rows)
-    _write_wiki_page(
-        site_root,
-        name="admissions",
-        title="Admissions",
-        tags=["admissions"],
-        source_ids=["web_admissions"],
-        body="# Admissions\n\nThe admissions wiki says the final application deadline is February 1.\n",
-    )
-    return site_root
+from tests.fixtures.llm_wiki import LATER, NOW, _fixture_site, _write_source, _write_wiki_page
 
 
 def test_wiki_documents_include_nested_category_source_pages(tmp_path: Path) -> None:
@@ -251,8 +148,8 @@ def test_build_query_prefers_relevant_wiki_and_includes_raw_support(tmp_path: Pa
     assert report["changed_raw_count"] == report["raw_index_count"]
     assert report["changed_wiki_count"] == 1
     assert report["embedding"]["provider"] == "ollama"
-    assert report["embedding"]["fallback_provider"] == "deterministic-hash-embedding"
-    assert report["embedding"]["degraded"] is True
+    assert "fallback_provider" not in report["embedding"]
+    assert report["embedding"]["degraded"] is False
     assert report["embedding"]["vector_dimensions"] > 0
 
     docs = [
@@ -325,21 +222,6 @@ def test_mcp_factual_bm25_falls_back_to_hybrid_when_wiki_has_no_hit(tmp_path: Pa
     assert response["metadata"]["retrieval"]["attempted_strategies"] == ["wiki_bm25", "vector"]
     assert response["evidence"][0]["source_kind"] == "pdf"
     assert response["evidence"][0]["source_id"] == "pdf_catalog"
-
-
-def test_mcp_query_wiki_tool_uses_auto_routing(tmp_path: Path, monkeypatch) -> None:
-    from mcp_servers import llm_wiki_mcp
-    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index
-
-    site_root = _fixture_site(tmp_path)
-    build_llm_wiki_index(site_root, now=NOW)
-    monkeypatch.setattr(llm_wiki_mcp, "SITE_ROOT", site_root.resolve())
-
-    response = llm_wiki_mcp.query_wiki("When is the admissions application deadline?", max_results=2)
-
-    assert response["ok"] is True
-    assert response["metadata"]["retrieval"]["selected_strategy"] == "hybrid_fused"
-    assert response["evidence"][0]["path"] == "wiki/pages/admissions.md"
 
 
 def test_mcp_query_uses_vector_search_for_reasoning_questions(tmp_path: Path) -> None:
@@ -494,6 +376,62 @@ def test_canonical_department_page_outranks_broad_raw_leadership_chunk(tmp_path:
     assert "wiki_synthesis_boost" in response["evidence"][0]["ranking_reasons"]
 
 
+def test_networking_director_query_surfaces_program_leadership_page(tmp_path: Path) -> None:
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+
+    site_root = tmp_path / "site"
+    raw = _write_source(
+        site_root,
+        source_id="web_ms_net",
+        title="M.S. Network Engineering",
+        body=(
+            "# M.S. Network Engineering\n\n"
+            "M. Scott Kingsley, Eng.D. — Director of Graduate Network Engineering Program\n\n"
+            "The program covers telecommunications and network design."
+        ),
+    )
+    raw["wiki_page_paths"] = ["wiki/pages/ms-network-engineering.md"]
+    write_registry_rows(site_root / "raw_sources" / "registry.jsonl", [raw])
+    _write_wiki_page(
+        site_root,
+        name="ms-network-engineering",
+        title="M.S. Network Engineering",
+        tags=["programs", "leadership"],
+        source_ids=["web_ms_net"],
+        audiences=["graduate"],
+        roles=["student"],
+        intents=["study", "contact"],
+        academic_interests=["engineering"],
+        body=(
+            "# M.S. Network Engineering\n\n"
+            "## Fast Answer\n\n"
+            "M. Scott Kingsley, Eng.D. — Director of Graduate Network Engineering Program\n"
+        ),
+    )
+    _write_wiki_page(
+        site_root,
+        name="networking-social-events",
+        title="Networking Social Events",
+        tags=["events"],
+        source_ids=[],
+        audiences=["graduate"],
+        roles=["student"],
+        intents=["visit"],
+        academic_interests=[],
+        body="# Networking Social Events\n\nCareer networking happy hour.\n",
+    )
+    build_llm_wiki_index(site_root, now=NOW)
+
+    response = query_llm_wiki_index(site_root, "Who is the director of SMU networking?", max_evidence=3)
+
+    assert response["status"] == "ok"
+    assert response["evidence"]
+    top_path = str(response["evidence"][0]["path"])
+    assert "ms-network-engineering" in top_path
+    assert response["metadata"]["confidence"]["confident"] is True
+    assert "leadership_entity_match" in response["metadata"]["confidence"]["reasons"]
+
+
 def test_search_sources_retrieves_raw_candidates_before_filtering_mixed_results(tmp_path: Path) -> None:
     from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, search_source_index
 
@@ -558,20 +496,37 @@ def test_query_uses_openrouter_rerank_when_configured(tmp_path: Path, monkeypatc
     assert "openrouter_rerank" in response["evidence"][0]["ranking_reasons"]
 
 
-def test_offline_embedding_fallback_sets_degraded_and_still_queries(tmp_path: Path, monkeypatch) -> None:
+def test_build_fails_when_dense_embeddings_are_unavailable(tmp_path: Path, monkeypatch) -> None:
     import src.scrape_planner.wiki.llm_wiki_index as llm_wiki_index
-    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index
 
     site_root = _fixture_site(tmp_path)
     monkeypatch.delenv("RAG_DISABLE_DENSE_EMBEDDING", raising=False)
     monkeypatch.setattr(llm_wiki_index, "embed_text", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
 
-    report = build_llm_wiki_index(site_root, now=NOW)
-    response = query_llm_wiki_index(site_root, "admissions application deadline", max_evidence=2)
+    with pytest.raises(llm_wiki_index.EmbeddingUnavailableError, match="Ollama dense embeddings unavailable"):
+        build_llm_wiki_index(site_root, now=NOW)
 
-    assert report["embedding_degraded"] is True
-    assert response["status"] == "ok"
-    assert response["metadata"]["embedding_degraded"] is True
+    assert not (site_root / "indexes" / "llm_wiki_manifest.json").exists()
+
+
+def test_mcp_query_fails_for_degraded_hash_index_manifest(tmp_path: Path) -> None:
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_mcp_wiki_index
+
+    site_root = _fixture_site(tmp_path)
+    report = build_llm_wiki_index(site_root, now=NOW)
+    manifest_path = Path(report["report_path"]).parent.parent / "llm_wiki_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["embedding_degraded"] = True
+    manifest["embedding_space"] = "hash-fallback"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    response = query_mcp_wiki_index(site_root, "When is the admissions application deadline?", max_evidence=2)
+
+    assert response["status"] == "embedding_unavailable"
+    assert response["evidence"] == []
+    assert response["metadata"]["reason"] == "embedding_degraded"
+    assert response["metadata"]["embedding_space"] == "hash-fallback"
 
 
 

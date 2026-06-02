@@ -116,7 +116,17 @@ mcp_servers/                 Local MCP entrypoints
 .pi/skills/                  Operator skills launched from the UI
 ```
 
-See `docs/CODEBASE.md` for the detailed module map.
+See [docs/CODEBASE.md](docs/CODEBASE.md) for the detailed module map.
+
+## Documentation
+
+| Guide | Description |
+| --- | --- |
+| [docs/README.md](docs/README.md) | Full documentation index |
+| [docs/CODEBASE.md](docs/CODEBASE.md) | Python package map |
+| [docs/cursor-mcp-setup.md](docs/cursor-mcp-setup.md) | MCP install and production query |
+| [docs/planning/work-index.md](docs/planning/work-index.md) | Ralph spec queue (agents) |
+| [docs/openspec/opsx-quickstart.md](docs/openspec/opsx-quickstart.md) | OpenSpec change workflow |
 
 ## Operator Skills
 
@@ -201,7 +211,27 @@ metrics/
 
 `data/` is runtime state and can become large. It is intentionally not source code.
 
-## MCP
+## Local operator vs production
+
+| Mode | Where it runs | What you install | What runs day to day |
+| --- | --- | --- | --- |
+| **Local operator** | Laptop / dev machine | `requirements.txt` + `requirements-pdf.txt` (Docling) + `requirements-mcp.txt` + frontend | Full app: scrape, PDF ingest, wiki build, index rebuild, Pi jobs, MCP |
+| **Production query** | Small host or your Cursor machine | `requirements-mcp.txt` at minimum; same venv as local is fine | **MCP + LLM APIs** over **pre-built** `data/sites/<site_id>/` — no rescrape, no Docling, no Pi |
+
+**Docling stays in the project** (`requirements-pdf.txt`, Docker image) so the operator app can parse PDFs, normalize sources, and rebuild indexes when you refresh content. Production assumes that work is **already done**; the prod path only **reads** wiki pages and hybrid index files.
+
+Build once (local or a build host), then ship runtime data:
+
+```text
+data/sites/<site_id>/
+  wiki/pages/          # student wiki markdown
+  indexes/             # llm_wiki_*.json(l) hybrid index
+  indexes/mcp-server-latest.json   # optional UI MCP status
+```
+
+You do **not** need original PDFs, `sources/pdf_ingest/`, or scrape runs on the production query path if the index and wiki already contain the evidence.
+
+## MCP (local and production)
 
 Primary MCP server:
 
@@ -218,7 +248,7 @@ Tools exposed:
 | `search_sources` | Raw source evidence only |
 | `get_wiki_page` | Fetch a wiki page by path, id, or title |
 | `answer_question` | Local cited answer path with confidence checks |
-| `ingest_url` | Queue one manual URL ingest |
+| `ingest_url` | Queue one manual URL ingest (operator refresh; skip in read-only prod) |
 
 Install Cursor MCP config:
 
@@ -227,6 +257,53 @@ Install Cursor MCP config:
 ```
 
 See `docs/cursor-mcp-setup.md` and `configs/cursor-mcp-llm-wiki.example.json`.
+
+### Using MCP in production
+
+Production means: **indexes and wiki pages exist**, and agents **query** them through MCP. The LLM that answers the user lives in **Cursor** (or your API product); MCP supplies **evidence and page text**, not Docling or wiki compilation.
+
+1. **Finish the build on an operator machine** (discovery → scrape → PDF ingest with Docling → wiki build → embedding/index rebuild). Confirm `indexes/llm_wiki_manifest.json` exists and `index_info` reports a healthy wiki index count.
+2. **Copy or mount** `data/sites/<site_id>/` to the machine where MCP runs (prod VM, or your laptop with a synced copy). `SCRAPE_PLANNER_DATA_ROOT` must point at the parent `data/` directory if you relocate it.
+3. **Install MCP deps** on that machine (full venv is OK; minimum is `pip install -r requirements-mcp.txt` plus app imports from the repo).
+4. **Wire Cursor MCP** with an absolute `--site-root` to that site folder:
+
+   ```bash
+   LLM_WIKI_SITE_ID=www.smu.edu ./scripts/install-cursor-mcp.sh
+   ```
+
+   Or merge `configs/cursor-mcp-llm-wiki.example.json` into `~/.cursor/mcp.json` with production paths.
+5. **Set API keys for query-time quality** (no local Ollama required on a tiny prod box if the index was built with dense embeddings):
+
+   | Variable | Production use |
+   | --- | --- |
+   | `OPENROUTER_API_KEY` | Hybrid rerank over retrieved evidence |
+   | `OLLAMA_BASE_URL` / `OLLAMA_EMBED_MODEL` | Only if you must embed **new** queries and the index expects Ollama-sized vectors |
+   | `TAVILY_API_KEY` | Optional; only if you use `answer_question` web fallback |
+
+6. In Cursor: **Settings → MCP** → enable `llm-wiki-<site_id>` → **reload window**.
+7. **Ask questions** with tools, for example:
+   - `query_wiki` — cited snippets from the hybrid index (primary prod path).
+   - `get_wiki_page` — full markdown for a topic page.
+   - `search_sources` — raw source rows when you need catalog/PDF evidence ids.
+   - Prefer **not** calling `ingest_url` / relying on `answer_question` auto-ingest on a read-only prod dataset unless you intentionally run the full operator stack again.
+
+Terminal smoke test (same as production MCP process):
+
+```bash
+SITE="/path/to/data/sites/www.smu.edu"
+PY="/path/to/ultra-fast-rag/.venv/bin/python"
+cd /path/to/ultra-fast-rag
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"index_info","arguments":{}}}' \
+| PYTHONPATH=. OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}" "$PY" -m mcp_servers.llm_wiki_mcp --site-root "$SITE"
+```
+
+Expect `"ok": true` and non-zero index counts. Then call `query_wiki` with a student question and use `get_wiki_page` for pages returned in evidence.
+
+**Production host sizing:** a small VM can hold only `data/` plus Python MCP (hundreds of MB RAM). Docling/torch belong on the **build** machine or the full Docker image when you refresh content—not on a read-only query instance.
+
+**Optional FastAPI container:** `docker compose up` serves the React operator UI and API on port 8000 with Docling included so the **app still works** for refreshes; for prod query-only you can run MCP alone and skip exposing the UI.
 
 ## API Highlights
 
@@ -267,12 +344,34 @@ Useful targeted checks:
 cd frontend && npm run build
 ```
 
+## Docker (full operator app)
+
+The image installs **all** Python deps (`requirements.txt`, `requirements-pdf.txt` with **Docling**, `requirements-mcp.txt`) so PDF ingest and the rest of the pipeline work when you need to refresh data—not because production query requires Docling on every request.
+
+Build and run on port **8000** (API + static UI from one container):
+
+```bash
+docker compose build
+docker compose up -d
+./scripts/docker-smoke.sh
+```
+
+Open `http://127.0.0.1:8000`. Mount `./data` so pre-built `data/sites/<site_id>/` indexes and wiki pages are available inside the container.
+
+| Docker use | Docling in image? | Typical workload |
+| --- | --- | --- |
+| Operator refresh in container | Yes | Scrape, PDF ingest, wiki/index rebuild |
+| Production query only | Installed but unused at runtime | Serve UI/API or run MCP against mounted `data/` |
+
+Local dev without Docker still uses `./start.sh` (Vite on **5173**, API on **8000**).
+
 ## Current Limits
 
-- Dockerfile and `docker-compose.yml` still reference the removed Streamlit entrypoint. Use `./start.sh` for the current React/FastAPI app until Docker is updated.
-- Embeddings require a healthy dense embedding backend. Hash fallback indexes are treated as degraded.
+- Docker images do not include **Pi** or **tmux**; long Pi jobs still use host `./start.sh` unless you run them another way.
+- Cursor MCP is **stdio-local** to the machine in `mcp.json`; production usually means syncing `data/sites/<site_id>/` to that host or running MCP where Cursor can reach the repo.
+- Embeddings require a healthy dense embedding backend at **index build** time; query-time embedding must match the index (or use BM25/degraded mode). Hash fallback indexes are treated as degraded.
 - MCP answers are local-index first. External web fallback only works when provider config and budgets allow it.
-- Student wiki quality depends on current source discovery, curation, normalization, and rebuild freshness.
+- Student wiki quality depends on build-time discovery, curation, normalization, and rebuild freshness—not on prod hardware.
 
 ## Design Principles
 

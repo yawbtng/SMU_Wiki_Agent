@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from src.scrape_planner.pdf_ingest import ParsedPdf, PdfIngestConfig, PdfParserUnavailableError, ingest_pdfs
+from src.scrape_planner.pdf.pdf_ingest import ParsedPdf, PdfIngestConfig, PdfParserUnavailableError, ingest_pdfs
 
 
 def test_empty_input_returns_no_rows(tmp_path: Path) -> None:
@@ -34,7 +34,7 @@ def test_docling_parse_failure_is_recorded_without_fallback(tmp_path: Path, monk
     def fail_docling(_path: Path) -> str:
         raise RuntimeError("docling could not parse")
 
-    monkeypatch.setattr("src.scrape_planner.pdf_ingest._parse_pdf_with_docling", fail_docling)
+    monkeypatch.setattr("src.scrape_planner.pdf.pdf_ingest._parse_pdf_with_docling", fail_docling)
 
     result = ingest_pdfs([pdf_path])
 
@@ -49,7 +49,7 @@ def test_docling_empty_output_is_low_text(tmp_path: Path, monkeypatch: pytest.Mo
     pdf_path = tmp_path / "empty.pdf"
     pdf_path.write_bytes(b"%PDF-1.7\n")
 
-    monkeypatch.setattr("src.scrape_planner.pdf_ingest._parse_pdf_with_docling", lambda _path: ParsedPdf("", 1))
+    monkeypatch.setattr("src.scrape_planner.pdf.pdf_ingest._parse_pdf_with_docling", lambda _path: ParsedPdf("", 1))
 
     result = ingest_pdfs([pdf_path], PdfIngestConfig(min_meaningful_chars=20, ocr_like_char_threshold=-1))
 
@@ -65,7 +65,7 @@ def test_docling_happy_path_chunks_deterministically(tmp_path: Path, monkeypatch
     pdf_path.write_bytes(b"%PDF-1.7\n")
     markdown = "# Catalog\n\n" + "Admissions requirements and tuition information for students. " * 6
 
-    monkeypatch.setattr("src.scrape_planner.pdf_ingest._parse_pdf_with_docling", lambda _path: ParsedPdf(markdown, 1))
+    monkeypatch.setattr("src.scrape_planner.pdf.pdf_ingest._parse_pdf_with_docling", lambda _path: ParsedPdf(markdown, 1))
 
     cfg = PdfIngestConfig(chunk_size=80, chunk_overlap=20, min_meaningful_chars=10)
     r1 = ingest_pdfs([pdf_path], cfg)
@@ -87,7 +87,7 @@ def test_docling_page_count_is_preserved_for_page_level_chunks(
     pdf_path.write_bytes(b"%PDF-1.7\n")
 
     monkeypatch.setattr(
-        "src.scrape_planner.pdf_ingest._parse_pdf_with_docling",
+        "src.scrape_planner.pdf.pdf_ingest._parse_pdf_with_docling",
         lambda _path: ParsedPdf(
             "# Catalog\n\n" + "Admissions requirements and tuition information for students. " * 4,
             2,
@@ -127,7 +127,7 @@ def test_pdf_chunks_include_docling_parser_metadata(tmp_path: Path, monkeypatch:
     pdf_path.write_bytes(b"%PDF-1.7\n")
 
     monkeypatch.setattr(
-        "src.scrape_planner.pdf_ingest._parse_pdf_with_docling",
+        "src.scrape_planner.pdf.pdf_ingest._parse_pdf_with_docling",
         lambda _path: ParsedPdf("# Catalog\n\nAdmissions requirements and tuition information for students.", None),
     )
 

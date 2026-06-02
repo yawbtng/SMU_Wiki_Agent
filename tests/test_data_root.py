@@ -1,65 +1,60 @@
-import ast
+from __future__ import annotations
+
 from pathlib import Path
 
-from src.scrape_planner.data_root import resolve_data_root
+
+def _clean_env(monkeypatch) -> None:
+    monkeypatch.delenv("SCRAPE_PLANNER_DATA_ROOT", raising=False)
+    monkeypatch.delenv("ULTRA_FAST_RAG_DATA_ROOT", raising=False)
+    monkeypatch.delenv("SCRAPE_PLANNER_DATA_ROOT_STRICT", raising=False)
 
 
-def test_env_data_root_override_wins(tmp_path: Path):
-    project_root = tmp_path / "repo"
-    configured = tmp_path / "configured-data"
-    project_root.mkdir()
+def test_resolve_data_root_prefers_populated_sibling_when_explicit_empty(tmp_path: Path, monkeypatch) -> None:
+    from src.scrape_planner.core.data_root import resolve_data_root
 
-    assert resolve_data_root(project_root, {"ULTRA_FAST_RAG_DATA_ROOT": str(configured)}) == configured.resolve()
+    _clean_env(monkeypatch)
+    project = tmp_path / "webapp"
+    sibling = tmp_path / "sibling"
+    empty = tmp_path / "empty-data"
+    (sibling / "data" / "sites" / "demo.edu").mkdir(parents=True)
+    empty.mkdir()
+    project.mkdir()
 
-
-def test_local_populated_data_root_wins(tmp_path: Path):
-    project_root = tmp_path / "repo"
-    local_data = project_root / "data"
-    (local_data / "sites").mkdir(parents=True)
-
-    assert resolve_data_root(project_root, {}) == local_data.resolve()
-
-
-def test_worktree_reuses_populated_main_checkout_data(tmp_path: Path):
-    main_root = tmp_path / "main" / "ultra-fast-rag"
-    worktree_root = tmp_path / "worktrees" / "9733" / "ultra-fast-rag"
-    main_data = main_root / "data"
-    gitdir = main_root / ".git" / "worktrees" / "ultra-fast-rag5"
-
-    (main_data / "sites" / "www.smu.edu").mkdir(parents=True)
-    gitdir.mkdir(parents=True)
-    worktree_root.mkdir(parents=True)
-    (worktree_root / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
-
-    assert resolve_data_root(worktree_root, {}) == main_data.resolve()
+    monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(empty))
+    resolved = resolve_data_root(project)
+    assert resolved == (sibling / "data").resolve()
 
 
-def test_unpopulated_worktree_uses_local_data_when_main_has_no_data(tmp_path: Path):
-    main_root = tmp_path / "main" / "ultra-fast-rag"
-    worktree_root = tmp_path / "worktrees" / "9733" / "ultra-fast-rag"
-    gitdir = main_root / ".git" / "worktrees" / "ultra-fast-rag5"
+def test_resolve_data_root_uses_local_populated_data(tmp_path: Path, monkeypatch) -> None:
+    from src.scrape_planner.core.data_root import resolve_data_root
 
-    gitdir.mkdir(parents=True)
-    worktree_root.mkdir(parents=True)
-    (worktree_root / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+    _clean_env(monkeypatch)
+    project = tmp_path / "repo"
+    (project / "data" / "sites" / "demo.edu").mkdir(parents=True)
 
-    assert resolve_data_root(worktree_root, {}) == (worktree_root / "data").resolve()
+    assert resolve_data_root(project) == (project / "data").resolve()
 
 
-def test_app_py_keeps_local_data_root_assignment_for_this_wave() -> None:
-    app_path = Path(__file__).resolve().parents[1] / "app.py"
-    tree = ast.parse(app_path.read_text(encoding="utf-8"))
+def test_resolve_data_root_honors_strict_empty_explicit(tmp_path: Path, monkeypatch) -> None:
+    from src.scrape_planner.core.data_root import resolve_data_root
 
-    data_root_assign = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "DATA_ROOT" for target in node.targets)
-    )
+    _clean_env(monkeypatch)
+    project = tmp_path / "repo"
+    project.mkdir()
+    empty = tmp_path / "configured-empty"
+    empty.mkdir()
 
-    assert isinstance(data_root_assign.value, ast.BinOp)
-    assert isinstance(data_root_assign.value.op, ast.Div)
-    assert isinstance(data_root_assign.value.left, ast.Name)
-    assert data_root_assign.value.left.id == "ROOT"
-    assert isinstance(data_root_assign.value.right, ast.Constant)
-    assert data_root_assign.value.right.value == "data"
+    monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(empty))
+    monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT_STRICT", "1")
+    assert resolve_data_root(project) == empty.resolve()
+
+
+def test_empty_sites_dir_is_not_populated(tmp_path: Path) -> None:
+    from src.scrape_planner.core.data_root import _looks_populated_data_root
+
+    root = tmp_path / "data"
+    (root / "sites").mkdir(parents=True)
+    assert _looks_populated_data_root(root) is False
+
+    (root / "sites" / "demo.edu").mkdir()
+    assert _looks_populated_data_root(root) is True

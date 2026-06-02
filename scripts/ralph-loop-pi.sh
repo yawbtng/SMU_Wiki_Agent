@@ -124,7 +124,7 @@ Pi Coding Agent.
 
 Read `.specify/memory/constitution.md` for project principles. Study `specs/`
 and compare against the current codebase. Create or update
-`IMPLEMENTATION_PLAN.md` with a prioritized task breakdown. Do not implement
+`docs/planning/implementation-plan.md` with a prioritized task breakdown. Do not implement
 anything.
 
 When the plan is complete, output `<promise>DONE</promise>`.

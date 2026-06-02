@@ -104,9 +104,11 @@ Installed under `~/.cursor/plugins/local/` from [cursor/plugins](https://github.
 
 ## Repository layout
 
-- Keep the repository root limited to app entrypoints, dependency manifests, and agent pointers.
-- Planning docs live under `docs/planning/`; feature specs live under `specs/`.
-- UI simplification plan: `docs/planning/ui-simplification-plan.md`.
+- Keep the repository root limited to **README.md**, **AGENTS.md**, **CLAUDE.md**, dependency manifests, `start.sh` / `stop.sh` / `status.sh`, and Ralph prompt seeds (`PROMPT_build.md`, `PROMPT_plan.md`).
+- All other documentation lives under **`docs/`** — see [docs/README.md](docs/README.md).
+- Planning: `docs/planning/work-index.md`, `history.md`, `implementation-plan.md`, `completion_log/`.
+- Feature specs: `specs/`.
+- UI simplification: `docs/planning/ui-simplification-plan.md`.
 
 ## Codebase layout
 
@@ -119,8 +121,10 @@ See `docs/CODEBASE.md` for the full module map.
 ## Ralph Wiggum
 
 - For Ralph Wiggum/spec-driven autonomous loops, read `.specify/memory/constitution.md` first; it is the project-level Ralph source of truth.
+- Queue and history: `docs/planning/work-index.md`, `docs/planning/history.md`, `docs/planning/implementation-plan.md`.
 - The Pi-specific Ralph entrypoint is `scripts/ralph-loop-pi.sh`; Pi prompt templates are available as `/ralph-build` and `/ralph-plan` after `/reload`.
 - For in-IDE Ralph loops, use the **ralph-loop** plugin (`ralph-loop` / `cancel-ralph` skills).
+- Generic master prompt template: `docs/ralph/master-prompt.md`.
 
 ## Exploration preference
 
@@ -167,9 +171,28 @@ Exclude/demote:
 
 For stale-content questions, recommend refresh discovery/scrape, re-normalize sources, purge excluded artifacts, and rebuild the wiki/index cleanly.
 
-## Learned user preferences
+## Learned User Preferences
 
 - The user expects a git-first workflow for all changes: status/diff first, small focused edits, verification, and scoped commits following GitHub hygiene.
 - Do not add explanatory UI/code artifacts, such as diagrams, unless the user explicitly asks to implement them in the product.
 - The user prefers concise, evidence-backed reports with clear “keep/remove/next action” recommendations.
 - The user expects agents to choose skills by reading the skill router first, not by guessing or adding unrelated services/tools.
+- The React/FastAPI app is the only operator UI; Streamlit is removed—do not reintroduce it. When asked to start the app, use `./start.sh` from the repo root (not `streamlit run app.py`).
+- Prefer Pi skills (`.pi/skills/`) for operator workflows—URL discovery, curation, wiki compile, scrape planning—launched via tmux with `pi --mode json` for live event streaming into the UI. Keep FastAPI thin: job launch, artifact I/O, and validators only; avoid expanding deterministic regex/policy Python or inline LLM calls in API routes.
+- For multi-step work, take autonomous end-to-end decisions following best practices and only ask the user when blocked or fully complete.
+- Verify UI/operator changes with `agent-browser` on the running app before declaring work complete.
+- Keep the operator UI minimal—show actionable status (Pi progress, jobs, embeddings, MCP) without clutter or debug-only panels.
+- Prefer de-bloating (delete legacy modules, split god files, remove duplicate policy) over large deterministic hardening patch lists; use OpenSpec with agent-runtime boundaries before big changes.
+- Student-facing answers must be cite-backed with low hallucination tolerance; URL discovery/curation must demote stale or outdated sources before scrape. When confidence is low, plan for web search plus self-improving source/wiki rebuild rather than guessing.
+
+## Learned Workspace Facts
+
+- The React/FastAPI app (`frontend/`, `src/scrape_planner/webapp/`) lives in this repo; webapp code is split (`routes.py`, `jobs.py`, `deps.py`, `schemas.py`, thin `api.py`). Streamlit (`app.py`, `ui_*.py`) has been removed. Run `./start.sh`, `./stop.sh`, and `./status.sh` from the repo root (tmux session `ultra-fast-rag-webapp`).
+- Vite on port `5173`, backend API on port `8000`. Default data root is `data/` in this checkout (`SCRAPE_PLANNER_DATA_ROOT` optional).
+- Legacy sibling worktree `/Users/abhsheno/Desktop/Projects/ultra-fast-rag-webapp` may still hold site artifacts until moved into `data/sites/` here; `start.sh` resolves populated data across worktrees when needed.
+- Operator Pi jobs: `POST /api/sites/{site_id}/jobs` with `{ skill, prompt }` launches tmux + Pi; status via `GET /api/sites/{site_id}/jobs/{skill}`; catalog at `GET /api/operator/skills`. Registered skills include `site-discovery`, `site-url-curation`, and `llm-wiki-noninteractive`.
+- `repo_root()` resolves via `start.sh` and `src/`, not `app.py`. `./scripts/verify-webapp.sh` is the primary webapp CI gate.
+- OpenSpec `operator-agent-runtime` defines the Pi jobs API and skill registry (validated strict). `code-review-hardening` was interrogate-reviewed but should not be implemented as a deterministic patch list—fold reliability fixes into agent-runtime specs instead.
+- Tmux operator sessions should auto-kill after a configurable grace period (~30 minutes default) post-execution; the React Settings pane should list active sessions with archive/stop, expose lifecycle settings, and provide MCP server start/stop controls.
+- uops MCP is the local wiki-query MCP for Cursor testing; configure per `docs/cursor-mcp-setup.md` and `configs/cursor-mcp-llm-wiki.example.json` (not Playwright MCP).
+- Legacy `markdown_graph` and root `scrape_planner/*.py` import shims are removed; use canonical subpackage imports (`wiki.*`, `scrape.*`, `core.*`). `docs/CODEBASE.md` is the module map.

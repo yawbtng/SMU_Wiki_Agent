@@ -1,74 +1,31 @@
 ---
 name: llm-wiki-noninteractive
-description: Build or refresh this project's local LLM Wiki from normalized web/PDF/raw_sources artifacts in non-interactive mode. Use when the user wants to attach a Pi skill and run wiki generation, indexing, and smoke verification without prompts.
+description: Build or refresh this project's local LLM Wiki via Pi llm-wiki-v2 compile, Python lint, and hybrid index.
 ---
 
 # LLM Wiki Non-Interactive
 
-This skill operates the `ultra-fast-rag` deterministic wiki pipeline without asking follow-up questions.
+Orchestrates [LLM Wiki v2](https://gist.githubusercontent.com/rohitg00/2067ab416f7bbe447c1977edaaa681e2/raw/99d0366312ec10bd13326e74bfecb67ed4f587a2/llm-wiki.md):
 
-## When to use
+1. **Pi llm-wiki-v2** — compile wiki pages from `raw_sources/`
+2. **Python lint** — orphans, citations, stale checksums
+3. **Python index** — hybrid BM25 + vector search
 
-Use this when the user asks to:
+Python `llm_wiki_builder.py` is orchestration only (~100 lines); it does not render markdown.
 
-- build the wiki from extracted web/PDF sources
-- refresh or rebuild `data/sites/<site>/wiki/`
-- run the LLM Wiki builder/indexer non-interactively from Pi
-- attach a skill via `pi --skill ... -p ...`
-
-## Rules
-
-- Do not prompt the user during execution.
-- Do not modify raw source files under `raw_sources/`, scrape runs, or `sources/pdf_uploads/`.
-- Treat `wiki/` and `indexes/` as derived artifacts that may be rebuilt.
-- Prefer the helper script below for repeatable non-interactive operation.
-- Report exact commands run and final artifact paths.
-
-## Non-interactive command
-
-From the repository root:
+## Command
 
 ```bash
 .pi/skills/llm-wiki-noninteractive/scripts/build_wiki.sh \
   --site-root data/sites/www.smu.edu \
-  --mode rebuild \
-  --query "What graduate catalog programs are available?"
+  --mode rebuild
 ```
 
-Modes:
+`--skip-pi` for lint/index-only (CI). `--skip-smoke` to skip query check.
 
-- `--mode rebuild` fully rebuilds derived wiki pages from all normalized ready sources.
-- `--mode resume` incrementally processes pending/changed sources only.
-
-## Pi print-mode invocation
-
-Attach this skill explicitly and run Pi in non-interactive print mode:
+## Pi invocation
 
 ```bash
-pi --no-skills \
-  --skill .pi/skills/llm-wiki-noninteractive \
-  -p '/skill:llm-wiki-noninteractive Build the SMU wiki non-interactively with --site-root data/sites/www.smu.edu --mode rebuild and run the smoke query "What graduate catalog programs are available?"'
-```
-
-If skill commands are disabled, use the same command without `/skill:...`; the explicit `--skill` still makes this skill available to the model.
-
-## Expected outputs
-
-For `data/sites/www.smu.edu`, check:
-
-- `data/sites/www.smu.edu/wiki/index.md`
-- `data/sites/www.smu.edu/wiki/log.md`
-- `data/sites/www.smu.edu/wiki/review_queue.md`
-- `data/sites/www.smu.edu/wiki/reports/wiki-build-latest.json`
-- `data/sites/www.smu.edu/indexes/llm_wiki_manifest.json`
-- `data/sites/www.smu.edu/indexes/llm_wiki_documents.jsonl`
-
-## Verification
-
-Always run or confirm these checks before reporting completion:
-
-```bash
-source .venv/bin/activate
-python -m py_compile src/scrape_planner/llm_wiki_builder.py src/scrape_planner/llm_wiki_index.py
-.pi/skills/llm-wiki-noninteractive/scripts/build_wiki.sh --site-root data/sites/www.smu.edu --mode resume --query "What graduate catalog programs are available?"
+pi --no-skills --skill .pi/skills/llm-wiki-noninteractive \
+  -p 'Run build_wiki.sh --site-root data/sites/www.smu.edu --mode rebuild'
 ```

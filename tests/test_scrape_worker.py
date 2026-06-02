@@ -4,9 +4,9 @@ from types import SimpleNamespace
 import threading
 import time
 
-from src.scrape_planner.models import DiscoveredURL
+from src.scrape_planner.core.models import DiscoveredURL
 from src.scrape_planner.scrape.scrape_worker import ScrapeRunner, _extract_response_parts
-from src.scrape_planner.state import RunStateStore
+from src.scrape_planner.runtime.state import RunStateStore
 
 
 class _FakeResponse:

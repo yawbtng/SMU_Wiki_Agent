@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_llm_wiki_index import NOW, _fixture_site
+from tests.fixtures.llm_wiki import NOW, _fixture_site
 
 
 def _read_json_line(proc: subprocess.Popen[str]) -> dict:
@@ -106,10 +106,27 @@ def test_mcp_stdio_startup_index_info_query_and_missing_index(tmp_path: Path) ->
     )
     try:
         assert proc.stdin is not None
-        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}) + "\n")
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "pytest", "version": "0.0"},
+                    },
+                }
+            )
+            + "\n"
+        )
         proc.stdin.flush()
         init_response = _read_json_line(proc)
         assert init_response["result"]["serverInfo"]["name"] == "llm-wiki-query"
+
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}) + "\n")
+        proc.stdin.flush()
 
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}) + "\n")
         proc.stdin.flush()
@@ -148,8 +165,9 @@ def test_mcp_stdio_startup_index_info_query_and_missing_index(tmp_path: Path) ->
         proc.stdin.flush()
         query_response = _read_json_line(proc)
         query = json.loads(query_response["result"]["content"][0]["text"])
-        assert query["ok"] is True
-        assert query["evidence"][0]["source_kind"] == "wiki"
+        assert query["ok"] is False
+        assert query["error"] == "embedding_unavailable"
+        assert query["metadata"]["reason"] == "embedding_query_failed"
     finally:
         proc.terminate()
         try:

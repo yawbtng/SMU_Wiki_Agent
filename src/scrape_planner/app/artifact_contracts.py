@@ -21,8 +21,7 @@ class DiscoveredURLContract(TypedDict, total=False):
     selected: bool
 
 
-class SelectedURLContract(DiscoveredURLContract, total=False):
-    pass
+SelectedURLContract = DiscoveredURLContract
 
 
 class RunStatusContract(TypedDict, total=False):
@@ -138,6 +137,13 @@ class AppStateContract(TypedDict, total=False):
     tavily_cost_per_call_usd: float
     ollama_input_per_m_usd: float
     ollama_output_per_m_usd: float
+    tmux_session_grace_seconds: int
+    wiki_builder_runtime: str
+    wiki_skip_pi: bool
+    tmux_archive_sessions: bool
+    tmux_reconcile_expired_sessions: bool
+    pi_cmd: str
+    tmux_archive_subdir: str
 
 
 APP_STATE_DEFAULTS: AppStateContract = {
@@ -152,4 +158,11 @@ APP_STATE_DEFAULTS: AppStateContract = {
     "llm_provider": "openrouter",
     "ollama_base_url": "http://host.docker.internal:11434",
     "site_history": [],
+    "tmux_session_grace_seconds": 1800,
+    "wiki_builder_runtime": "pi",
+    "wiki_skip_pi": False,
+    "tmux_archive_sessions": True,
+    "tmux_reconcile_expired_sessions": True,
+    "pi_cmd": "pi",
+    "tmux_archive_subdir": "wiki/reports/tmux-archives",
 }

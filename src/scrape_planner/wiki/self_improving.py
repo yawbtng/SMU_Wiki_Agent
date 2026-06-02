@@ -20,7 +20,9 @@ from ..sources.source_quality import assess_source_quality
 from ..sources.source_registry import read_registry_rows
 from .confidence import assess_confidence
 from .ingest_safety import assess_trusted_domain, assess_url_safety, canonicalize_url
-from .llm_wiki_index import index_info, query_mcp_wiki_index
+from .leadership import extract_leadership_from_evidence
+from .llm_wiki_index import index_info, query_mcp_wiki_index, search_source_index
+from .query_intent import is_person_lookup_query, prepare_retrieval_query
 from .web_search import WebSearchProvider, web_search
 
 LOOP_GUARD_TTL_SECONDS = 60 * 60
@@ -55,19 +57,13 @@ def answer_question(
 ) -> dict[str, Any]:
     layout = ensure_layout_for_site_root(Path(site_root))
     current = now if now is not None else time.time()
-    local = query_mcp_wiki_index(layout.site_root, question, max_evidence=max_evidence)
-    confidence = assess_confidence(local)
+    local = _retrieve_local(layout.site_root, question, max_evidence=max_evidence)
+    confidence = assess_confidence(local, question=question)
     metadata = dict(local.get("metadata") or {}) if isinstance(local.get("metadata"), dict) else {}
     metadata["confidence"] = confidence
+    evidence = local.get("evidence", []) if isinstance(local.get("evidence"), list) else []
     if confidence.get("confident"):
-        return {
-            "status": "ok",
-            "provenance": "wiki",
-            "answer": _answer_from_evidence(local.get("evidence", [])),
-            "citations": _citations_from_evidence(local.get("evidence", [])),
-            "evidence": local.get("evidence", []),
-            "metadata": metadata,
-        }
+        return _wiki_answer_response(question, evidence, metadata)
 
     record_confidence_gap(
         layout.site_root,
@@ -79,20 +75,15 @@ def answer_question(
     guard = LoopGuard(layout.site_root)
     job_status = _resolve_pending_job(guard, question, now=current)
     if job_status.get("action") == "retry_local":
-        local = query_mcp_wiki_index(layout.site_root, question, max_evidence=max_evidence)
-        confidence = assess_confidence(local)
+        local = _retrieve_local(layout.site_root, question, max_evidence=max_evidence)
+        confidence = assess_confidence(local, question=question)
         metadata = dict(local.get("metadata") or {}) if isinstance(local.get("metadata"), dict) else {}
         metadata["confidence"] = confidence
         metadata["ingest_completed"] = True
-        return {
-            "status": "ok",
-            "provenance": "wiki",
-            "answer": _answer_from_evidence(local.get("evidence", [])),
-            "citations": _citations_from_evidence(local.get("evidence", [])),
-            "evidence": local.get("evidence", []),
-            "metadata": metadata,
-            "ingestion_job": job_status.get("job"),
-        }
+        evidence = local.get("evidence", []) if isinstance(local.get("evidence"), list) else []
+        response = _wiki_answer_response(question, evidence, metadata)
+        response["ingestion_job"] = job_status.get("job")
+        return response
     if job_status.get("action") == "surface_failure":
         return {
             "status": "ingest_failed",
@@ -141,7 +132,7 @@ def answer_question(
             "status": str(search.get("status") or "web_search_unavailable"),
             "provenance": "none",
             "answer": "",
-            "evidence": local.get("evidence", []),
+            "evidence": evidence,
             "metadata": {**metadata, "web_search": search},
         }
 
@@ -162,7 +153,7 @@ def answer_question(
             "status": "no_confident_answer",
             "provenance": "none",
             "answer": "",
-            "evidence": local.get("evidence", []),
+            "evidence": evidence,
             "web_results": search.get("results", []),
             "rejected_sources": rejected,
             "metadata": {**metadata, "web_search": search},
@@ -605,16 +596,83 @@ def _job_status_path(site_root: Path, job_id: str) -> Path:
     return layout.indexes_dir / "ingest_jobs" / f"{job_id}.json"
 
 
-def _answer_from_evidence(evidence: Any) -> str:
+def _retrieve_local(site_root: Path, question: str, *, max_evidence: int) -> dict[str, Any]:
+    plan = prepare_retrieval_query(question)
+    local = query_mcp_wiki_index(site_root, plan.effective, max_evidence=max_evidence)
+    evidence = local.get("evidence") if isinstance(local.get("evidence"), list) else []
+    if not is_person_lookup_query(question) or extract_leadership_from_evidence(question, evidence):
+        return local
+
+    raw = search_source_index(site_root, plan.effective, max_evidence=max_evidence)
+    raw_evidence = raw.get("evidence") if isinstance(raw.get("evidence"), list) else []
+    if not raw_evidence or not extract_leadership_from_evidence(question, raw_evidence):
+        return local
+
+    metadata = dict(local.get("metadata") or {}) if isinstance(local.get("metadata"), dict) else {}
+    metadata["raw_source_fallback"] = {
+        "status": str(raw.get("status") or ""),
+        "evidence_count": len(raw_evidence),
+    }
+    return {
+        **local,
+        "evidence": _dedupe_evidence(raw_evidence + evidence)[:max_evidence],
+        "metadata": metadata,
+    }
+
+
+def _dedupe_evidence(evidence: list[Any]) -> list[Any]:
+    seen: set[str] = set()
+    deduped: list[Any] = []
+    for item in evidence:
+        if not isinstance(item, dict):
+            deduped.append(item)
+            continue
+        key = str(item.get("path") or item.get("source_id") or item.get("id") or "")
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _wiki_answer_response(question: str, evidence: list[Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    answer, leadership_meta = _answer_from_evidence(question, evidence)
+    if leadership_meta:
+        metadata = {**metadata, "leadership": leadership_meta}
+    return {
+        "status": "ok",
+        "provenance": "wiki",
+        "answer": answer,
+        "citations": _citations_from_evidence(evidence, leadership_meta),
+        "evidence": evidence,
+        "metadata": metadata,
+    }
+
+
+def _answer_from_evidence(question: str, evidence: Any) -> tuple[str, dict[str, Any] | None]:
     if not isinstance(evidence, list) or not evidence:
-        return ""
+        return "", None
+    if is_person_lookup_query(question):
+        match = extract_leadership_from_evidence(question, evidence)
+        if match:
+            return match.answer, match.to_dict()
     top = evidence[0] if isinstance(evidence[0], dict) else {}
     title = str(top.get("title") or "")
     snippet = str(top.get("snippet") or "")
-    return f"{title}: {snippet}" if title else snippet
+    text = f"{title}: {snippet}" if title else snippet
+    return text, None
 
 
-def _citations_from_evidence(evidence: Any) -> list[dict[str, Any]]:
+def _citations_from_evidence(evidence: Any, leadership: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    if leadership:
+        return [
+            {
+                "title": leadership.get("title", ""),
+                "path": leadership.get("source_path", ""),
+                "source_id": leadership.get("source_id", ""),
+            }
+        ]
     if not isinstance(evidence, list):
         return []
     return [

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from src.scrape_planner.observability import append_event, load_events, summarize_events
+from src.scrape_planner.runtime.observability import append_event, load_events, summarize_events
 
 
 def test_append_and_load_events(tmp_path: Path):

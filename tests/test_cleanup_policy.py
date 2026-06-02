@@ -10,26 +10,8 @@ def read_repo_file(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8")
 
 
-def test_app_does_not_keep_hidden_legacy_ui_or_dead_tool_runners() -> None:
-    app_source = read_repo_file("app.py")
-
-    removed_tokens = [
-        "_show_legacy_cleanup_ui",
-        "_show_legacy_review_ui",
-        "TerminalSkillRunner",
-        "_get_terminal_skill_runner",
-        "_detect_graphify_binary",
-        "_run_graphify_for_raw_markdown",
-        "_run_graphify_lookup",
-        "retry_failed_with_tavily",
-    ]
-
-    for token in removed_tokens:
-        assert token not in app_source
-
-
 def test_pdf_ingest_is_docling_only() -> None:
-    pdf_source = read_repo_file("src/scrape_planner/pdf_ingest.py")
+    pdf_source = read_repo_file("src/scrape_planner/pdf/pdf_ingest.py")
     requirements = read_repo_file("requirements-pdf.txt")
 
     assert "pypdf" not in pdf_source.lower()

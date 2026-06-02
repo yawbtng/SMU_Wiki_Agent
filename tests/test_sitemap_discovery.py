@@ -1,4 +1,4 @@
-from src.scrape_planner.sitemap_discovery import apply_manual_urls, discover_site_urls
+from src.scrape_planner.scrape.sitemap_discovery import apply_manual_urls, discover_site_urls
 
 
 def test_manual_urls_accept_same_root_subdomains():
@@ -25,7 +25,7 @@ def test_discovery_keeps_specific_seed_url_path_when_sitemaps_are_empty(monkeypa
     def fake_get(url, timeout):
         return FakeResponse()
 
-    monkeypatch.setattr("src.scrape_planner.sitemap_discovery.requests.get", fake_get)
+    monkeypatch.setattr("src.scrape_planner.scrape.sitemap_discovery.requests.get", fake_get)
 
     result = discover_site_urls("https://github.com/earendil-works/pi/tree/main/packages/agent")
 

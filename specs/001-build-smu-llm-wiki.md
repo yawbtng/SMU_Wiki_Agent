@@ -18,7 +18,7 @@ Refresh the local LLM Wiki for the SMU workspace from existing normalized source
 3. Generate/refresh the LLM Wiki pages, reports, manifest, and document index artifacts.
 4. Run a smoke query against the generated wiki/index.
 5. Run the relevant syntax/compile checks for changed wiki code paths before completion.
-6. Record completion in `history.md` and `completion_log/` if the build succeeds.
+6. Record completion in `docs/planning/history.md` and `docs/planning/completion_log/` if the build succeeds.
 7. Respect `.specify/memory/constitution.md` Git Autonomy settings; do not commit or push unless explicitly enabled by the user.
 
 ## Suggested Commands
@@ -52,7 +52,7 @@ If rebuild succeeds, a follow-up resume smoke check is acceptable:
 - [ ] The smoke query `What graduate catalog programs are available?` runs without exceptions and returns a useful answer or retrievable supporting content.
 - [ ] `python -m py_compile src/scrape_planner/llm_wiki_builder.py src/scrape_planner/llm_wiki_index.py` passes.
 - [ ] No raw source artifacts are modified.
-- [ ] `history.md` and a timestamped `completion_log/` entry summarize the build and verification.
+- [ ] `docs/planning/history.md` and a timestamped `docs/planning/completion_log/` entry summarize the build and verification.
 
 ## Status: TODO
 

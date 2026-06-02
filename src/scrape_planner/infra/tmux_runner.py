@@ -3,7 +3,10 @@ from __future__ import annotations
 import shlex
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Any
+
+from .tmux_session_shell import build_managed_session_shell, grace_seconds as resolve_grace_seconds
 
 
 def _run_tmux(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -29,20 +32,35 @@ class TmuxRunner:
         r = self._run(["has-session", "-t", name], tmux_bin=tmux_bin)
         return r.returncode == 0
 
+    def list_sessions(self, tmux_bin: str | None = None) -> list[str]:
+        r = self._run(["list-sessions", "-F", "#{session_name}"], tmux_bin=tmux_bin)
+        if r.returncode != 0:
+            return []
+        return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+
     def available(self, tmux_bin: str | None = None) -> bool:
         return self._resolve_tmux(tmux_bin) is not None
 
-    def start(self, name: str, command: str, workdir: str, tmux_bin: str | None = None) -> dict[str, Any]:
+    def start(
+        self,
+        name: str,
+        command: str,
+        workdir: str,
+        tmux_bin: str | None = None,
+        *,
+        archive_path: Path | str | None = None,
+        grace_seconds: int | None = None,
+    ) -> dict[str, Any]:
         if self.session_exists(name, tmux_bin=tmux_bin):
             return {"ok": False, "error": f"Session `{name}` already exists."}
-        wrapped = (
-            f"cd {shlex.quote(workdir)} && "
-            "export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH && "
-            f"{command}; "
-            "code=$?; echo; echo \"[tmux-runner] command exited with code $code\"; "
-            "exec /bin/zsh -l"
+        if archive_path:
+            Path(archive_path).parent.mkdir(parents=True, exist_ok=True)
+        shell_command = build_managed_session_shell(
+            command,
+            workdir,
+            archive_path=archive_path,
+            grace=grace_seconds,
         )
-        shell_command = f"/bin/zsh -lic {shlex.quote(wrapped)}"
         r = self._run(["new-session", "-d", "-s", name, shell_command], tmux_bin=tmux_bin)
         if r.returncode != 0:
             return {
@@ -50,7 +68,12 @@ class TmuxRunner:
                 "error": r.stderr.strip() or "Failed to start tmux session.",
                 "command": shell_command,
             }
-        return {"ok": True, "command": shell_command}
+        return {
+            "ok": True,
+            "command": shell_command,
+            "tmux_archive_path": str(archive_path) if archive_path else "",
+            "tmux_grace_seconds": resolve_grace_seconds(grace_seconds),
+        }
 
     def start_shell(self, name: str, workdir: str, tmux_bin: str | None = None) -> dict[str, Any]:
         if self.session_exists(name, tmux_bin=tmux_bin):

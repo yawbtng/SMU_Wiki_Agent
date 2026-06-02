@@ -69,11 +69,13 @@ Track attempts per spec via `<!-- NR_OF_TRIES: N -->` at the bottom of the spec 
 
 ## Work Index and History
 
-`WORK_INDEX.md` is the human-readable index of Ralph work, queue status, completion ledger, and stop rule. Check it before starting work.
+`docs/planning/work-index.md` is the human-readable index of Ralph work, queue status, completion ledger, and stop rule. Check it before starting work.
 
-Append a 1-line summary to `history.md` after each spec completion. For details, create `history/YYYY-MM-DD--spec-name.md` with lessons learned, decisions made, and issues encountered. Check history before starting work on any spec.
+Append a 1-line summary to `docs/planning/history.md` after each spec completion. For details, create `docs/planning/completion_log/YYYY-MM-DD--HH-MM-SS--spec-name.md` with lessons learned, decisions made, and issues encountered. Check history before starting work on any spec.
 
-After each completed spec, update `WORK_INDEX.md`, `history.md`, and a timestamped `completion_log/` entry. When every spec in `specs/` has `## Status: COMPLETE`, re-verify one completed spec and output `<promise>ALL_DONE</promise>`.
+After each completed spec, update `docs/planning/work-index.md`, `docs/planning/history.md`, and a timestamped `docs/planning/completion_log/` entry. When every spec in `specs/` has `## Status: COMPLETE`, re-verify one completed spec and output `<promise>ALL_DONE</promise>`.
+
+Planning mode writes or updates `docs/planning/implementation-plan.md` (not a root-level plan file).
 
 For semantic wiki organization specs, Ralph must keep iterating until the generated Markdown wiki is concept-first, hierarchical, citation-backed, and retrieval-verified against student questions. Do not mark those specs complete just because the builder emitted files.
 
@@ -81,7 +83,7 @@ For semantic wiki organization specs, Ralph must keep iterating until the genera
 
 ## Completion Logs
 
-After each completed spec, create `completion_log/YYYY-MM-DD--HH-MM-SS--spec-name.md` with a brief summary of what changed, how it was verified, and any follow-up risks.
+After each completed spec, create `docs/planning/completion_log/YYYY-MM-DD--HH-MM-SS--spec-name.md` with a brief summary of what changed, how it was verified, and any follow-up risks.
 
 ---
 

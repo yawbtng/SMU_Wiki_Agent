@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -22,6 +23,8 @@ from ..core.wiki_common import parse_markdown_frontmatter, site_relative, strip_
 from ..index.embedding_client import embed_text, embedding_config_from_env
 from .confidence import assess_confidence
 from .index_lock import site_index_write_lock
+from .leadership import leadership_text_boost
+from .query_intent import is_leadership_query, prepare_retrieval_query
 
 
 INDEX_VERSION = "llm-wiki-hybrid-v2"
@@ -30,14 +33,21 @@ EMBEDDING_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text:latest").str
 EMBEDDING_DIMENSIONS = 768
 EMBEDDING_SPACE_DENSE = "dense-ollama"
 EMBEDDING_SPACE_HASH = "hash-fallback"
-FALLBACK_EMBEDDING_PROVIDER = "deterministic-hash-embedding"
-FALLBACK_EMBEDDING_MODEL = "hashed-token-vector-v1"
 RERANK_PROVIDER = "openrouter"
 RERANK_API_URL = "https://openrouter.ai/api/v1/rerank"
 RERANK_MODEL = "cohere/rerank-4-pro"
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 _DENSE_EMBEDDING_UNAVAILABLE = False
 _EMBEDDING_DEGRADED = False
+RAW_SUPPORT_SCORE_FACTOR = 0.05
+RAW_SUPPORT_SCORE_CAP = 0.25
+_LOGGER = logging.getLogger(__name__)
+
+try:
+    import bm25s as _BM25S_MODULE
+except ImportError:
+    _BM25S_MODULE = None
+
 BM25_STOPWORDS = {
     "a",
     "an",
@@ -97,6 +107,10 @@ class QueryProfile:
     query: str = ""
 
 
+class EmbeddingUnavailableError(RuntimeError):
+    """Raised when required dense embeddings cannot be produced."""
+
+
 def build_llm_wiki_index(
     site_root: Path,
     *,
@@ -137,9 +151,9 @@ def _build_llm_wiki_index_locked(
     timestamp: str,
     started: float,
 ) -> dict[str, Any]:
-    _reset_embedding_backend_state()
     previous_docs = _read_documents(docs_path)
     previous_manifest = _read_manifest(manifest_path)
+    _reset_embedding_backend_state()
     previous_by_id = {str(row.get("id") or ""): row for row in previous_docs}
     current_docs: list[dict[str, Any]] = []
     invalid_sources: list[dict[str, Any]] = []
@@ -194,13 +208,11 @@ def _build_llm_wiki_index_locked(
         "reranker_ready": _openrouter_rerank_ready(),
         "index_health": "ready" if current_docs else "empty",
         "embedding_space": index_embedding_space,
-        "vector_leg_enabled": not degraded,
+        "vector_leg_enabled": bool(current_docs),
         "embedding": {
             "provider": EMBEDDING_PROVIDER,
             "model": EMBEDDING_MODEL,
             "vector_dimensions": EMBEDDING_DIMENSIONS,
-            "fallback_provider": FALLBACK_EMBEDDING_PROVIDER,
-            "fallback_model": FALLBACK_EMBEDDING_MODEL,
             "degraded": degraded,
             "space": index_embedding_space,
         },
@@ -214,7 +226,7 @@ def _build_llm_wiki_index_locked(
     }
     _write_json_atomic(manifest_path, manifest)
     reports_dir = layout.indexes_dir / "reports"
-    report_path = reports_dir / f"embedding-{_timestamp_slug(timestamp)}.json"
+    report_path = reports_dir / f"embedding-{timestamp_slug(timestamp, fallback_hash=True)}.json"
     report = {**manifest, "report_path": str(report_path), "last_build_time": timestamp}
     _write_json_atomic(report_path, report)
     _write_json_atomic(layout.indexes_dir / "embedding_status.json", {**report, "report_path": str(layout.indexes_dir / "embedding_status.json")})
@@ -276,7 +288,8 @@ def _record_embedding_metrics(
                 },
             )
         )
-    except Exception:
+    except (OSError, ValueError, TypeError) as exc:
+        _LOGGER.warning("failed to record embedding metrics: %s", exc)
         return
 
 
@@ -311,9 +324,14 @@ def query_llm_wiki_index(
             "evidence": [],
             "metadata": {"site_root": str(layout.site_root.resolve()), "reason": "index_artifacts_malformed"},
         }
+    embedding_error = _embedding_manifest_error(manifest)
+    if embedding_error:
+        return _embedding_error_response(query, layout.site_root, manifest=manifest, **embedding_error)
 
-    query_profile = infer_query_profile(query, profile)
-    tokens = _tokenize(query)
+    query_plan = prepare_retrieval_query(query)
+    retrieval_query = query_plan.effective
+    query_profile = infer_query_profile(retrieval_query, profile)
+    tokens = _tokenize(retrieval_query)
     if max_evidence <= 0 or not tokens:
         return {
             "status": "ok",
@@ -322,20 +340,35 @@ def query_llm_wiki_index(
             "metadata": {"bounded": True, "reason": "empty_query_or_zero_limit"},
         }
 
-    retrieval = _select_retrieval_candidates(
-        docs,
-        postings if isinstance(postings, dict) else {},
-        query,
-        tokens,
-        max_candidates=max_candidates,
-        retrieval_strategy=retrieval_strategy,
-        manifest=manifest,
-    )
-    candidates = retrieval["candidates"]
-    lexical_scores = retrieval["lexical_scores"]
-    evidence = _dedupe_evidence_by_path(
-        rerank_candidates(query, candidates, lexical_scores, profile=query_profile, manifest=manifest)
-    )[:max_evidence]
+    try:
+        retrieval = _select_retrieval_candidates(
+            docs,
+            postings if isinstance(postings, dict) else {},
+            retrieval_query,
+            tokens,
+            max_candidates=max_candidates,
+            retrieval_strategy=retrieval_strategy,
+            manifest=manifest,
+        )
+        candidates = retrieval["candidates"]
+        lexical_scores = retrieval["lexical_scores"]
+        evidence = _dedupe_evidence_by_path(
+            rerank_candidates(retrieval_query, candidates, lexical_scores, profile=query_profile, manifest=manifest)
+        )[:max_evidence]
+    except EmbeddingUnavailableError as exc:
+        return _embedding_error_response(
+            query,
+            layout.site_root,
+            manifest=manifest,
+            reason="embedding_query_failed",
+            message=str(exc),
+        )
+    expansion_meta = {
+        "original": query_plan.original,
+        "effective": query_plan.effective,
+        "expansions": list(query_plan.expansions),
+        "person_lookup": query_plan.person_lookup,
+    }
     _apply_retrieval_annotations(evidence, retrieval)
     next_pages = _next_pages_from_navigation_manifest(layout.site_root, query, evidence)
     if not evidence:
@@ -355,7 +388,8 @@ def query_llm_wiki_index(
                 "embedding_space": str(manifest.get("embedding_space") or ""),
             },
         }
-        result["metadata"]["confidence"] = assess_confidence(result)
+        result["metadata"]["query_expansion"] = expansion_meta
+        result["metadata"]["confidence"] = assess_confidence(result, question=query)
         return result
     result = {
         "status": "ok",
@@ -374,9 +408,10 @@ def query_llm_wiki_index(
             "embedding_degraded": bool(manifest.get("embedding_degraded")),
             "vector_leg_enabled": bool(manifest.get("vector_leg_enabled", not manifest.get("embedding_degraded"))),
             "embedding_space": str(manifest.get("embedding_space") or ""),
+            "query_expansion": expansion_meta,
         },
     }
-    result["metadata"]["confidence"] = assess_confidence(result)
+    result["metadata"]["confidence"] = assess_confidence(result, question=query)
     return result
 
 
@@ -460,6 +495,47 @@ def query_mcp_wiki_index(
     )
 
 
+def _embedding_manifest_error(manifest: dict[str, Any]) -> dict[str, str] | None:
+    space = str(manifest.get("embedding_space") or "")
+    if bool(manifest.get("embedding_degraded")):
+        return {
+            "reason": "embedding_degraded",
+            "message": "Index was built with degraded embeddings. Rebuild the index after Ollama embeddings are available.",
+        }
+    if space and space != EMBEDDING_SPACE_DENSE:
+        return {
+            "reason": "embedding_space_mismatch",
+            "message": f"Index embedding space is {space}; expected {EMBEDDING_SPACE_DENSE}. Rebuild the index.",
+        }
+    return None
+
+
+def _embedding_error_response(
+    query: str,
+    site_root: Path,
+    *,
+    manifest: dict[str, Any] | None,
+    reason: str,
+    message: str,
+) -> dict[str, Any]:
+    manifest = manifest or {}
+    return {
+        "status": "embedding_unavailable",
+        "query": query,
+        "evidence": [],
+        "metadata": {
+            "bounded": True,
+            "reason": reason,
+            "message": message,
+            "site_root": str(Path(site_root).resolve()),
+            "index_version": manifest.get("version"),
+            "embedding_degraded": bool(manifest.get("embedding_degraded")),
+            "embedding_space": str(manifest.get("embedding_space") or ""),
+            "vector_leg_enabled": False,
+        },
+    }
+
+
 def search_source_index(site_root: Path, query: str, *, max_evidence: int = 5, max_candidates: int = 50) -> dict[str, Any]:
     layout = site_layout(Path(site_root))
     docs_path = layout.indexes_dir / "llm_wiki_documents.jsonl"
@@ -483,6 +559,11 @@ def search_source_index(site_root: Path, query: str, *, max_evidence: int = 5, m
             "evidence": [],
             "metadata": {"site_root": str(layout.site_root.resolve()), "reason": "index_artifacts_malformed", "source_only": True},
         }
+    embedding_error = _embedding_manifest_error(manifest)
+    if embedding_error:
+        response = _embedding_error_response(query, layout.site_root, manifest=manifest, **embedding_error)
+        response["metadata"]["source_only"] = True
+        return response
     tokens = _tokenize(query)
     if max_evidence <= 0 or not tokens:
         return {
@@ -498,7 +579,18 @@ def search_source_index(site_root: Path, query: str, *, max_evidence: int = 5, m
         corpus="raw",
         max_candidates=max_candidates,
     )
-    evidence = rerank_candidates(query, candidates, lexical_scores)[:max_evidence]
+    try:
+        evidence = rerank_candidates(query, candidates, lexical_scores, manifest=manifest)[:max_evidence]
+    except EmbeddingUnavailableError as exc:
+        response = _embedding_error_response(
+            query,
+            layout.site_root,
+            manifest=manifest,
+            reason="embedding_query_failed",
+            message=str(exc),
+        )
+        response["metadata"]["source_only"] = True
+        return response
     return {
         "status": "ok",
         "query": query,
@@ -536,8 +628,8 @@ def rerank_candidates(
     manifest: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     tokens = _tokenize(query)
-    query_vector, query_space = _embedding_vector_and_space(query)
     vector_leg_enabled = _vector_leg_enabled(manifest)
+    query_vector, query_space = _embedding_vector_and_space(query, manifest=manifest)
     query_type, _classifier_reason = _classify_query_type(query)
     raw_candidate_ids = {str(row.get("source_id") or "") for row in candidates if row.get("corpus") == "raw"}
     wiki_cited_ids = {
@@ -587,7 +679,15 @@ def rerank_candidates(
             reasons.append("raw_source_fallback")
         if not reasons:
             reasons.append("lexical_match")
-        combined = lexical + (1.5 * vector) + keyword + source_priority + reasoning_wiki_boost + route_score + freshness + citation
+        leadership_boost = 0.0
+        if is_leadership_query(query):
+            leadership_boost, leadership_reasons = leadership_text_boost(
+                query,
+                str(row.get("title") or ""),
+                str(row.get("text") or ""),
+            )
+            reasons.extend(leadership_reasons)
+        combined = lexical + (1.5 * vector) + keyword + source_priority + reasoning_wiki_boost + route_score + freshness + citation + leadership_boost
         scored.append(
             {
                 "id": doc_id,
@@ -706,7 +806,8 @@ def _maybe_openrouter_rerank(query: str, scored: list[dict[str, Any]]) -> list[d
         ):
             reranked.append(item)
         return reranked
-    except Exception:
+    except (requests.RequestException, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        _LOGGER.warning("openrouter rerank failed: %s", exc)
         return None
 
 
@@ -731,11 +832,13 @@ def index_info(site_root: Path) -> dict[str, Any]:
             "site_root": str(layout.site_root.resolve()),
             "index_path": str(manifest_path),
         }
-    ready = str(manifest.get("status") or "") == "ready"
+    embedding_error = _embedding_manifest_error(manifest)
+    ready = str(manifest.get("status") or "") == "ready" and embedding_error is None
     return {
         "ok": ready,
         "ready": ready,
-        "error": "" if ready else str(manifest.get("status") or "not_ready"),
+        "error": "" if ready else (embedding_error or {}).get("reason", str(manifest.get("status") or "not_ready")),
+        "message": "" if ready else (embedding_error or {}).get("message", ""),
         "site_root": str(layout.site_root.resolve()),
         "index_path": str(manifest_path),
         "raw_index_count": int(manifest.get("raw_index_count") or 0),
@@ -836,13 +939,13 @@ def _wiki_documents(site_root: Path, *, chunk_chars: int, overlap: int) -> tuple
     invalid: list[dict[str, Any]] = []
     pages_dir = site_root / "wiki" / "pages"
     for path in sorted(pages_dir.rglob("*.md")) if pages_dir.exists() else []:
-        rel_path = _site_relative(path, site_root)
+        rel_path = site_relative(path, site_root, resolve=True)
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             invalid.append({"path": rel_path, "reason": f"wiki_page_unreadable:{exc}"})
             continue
-        metadata = _parse_frontmatter(text)
+        metadata = parse_markdown_frontmatter(text)
         title = str(metadata.get("title") or path.stem.replace("-", " ").title())
         source_ids = [str(value) for value in metadata.get("source_ids", []) if str(value)] if isinstance(metadata.get("source_ids"), list) else []
         tags = [str(value) for value in metadata.get("tags", []) if str(value)] if isinstance(metadata.get("tags"), list) else []
@@ -866,7 +969,7 @@ def _wiki_documents(site_root: Path, *, chunk_chars: int, overlap: int) -> tuple
             "source_priority": str(metadata.get("source_priority") or "curated-wiki"),
         }
         checksum = checksum_file(path)
-        for idx, chunk in enumerate(_chunk_text(_strip_frontmatter(text), chunk_chars=chunk_chars, overlap=overlap), start=1):
+        for idx, chunk in enumerate(_chunk_text(strip_markdown_frontmatter(text), chunk_chars=chunk_chars, overlap=overlap), start=1):
             docs.append(
                 IndexedDocument(
                     id=f"wiki:{rel_path}:{idx}",
@@ -930,7 +1033,7 @@ def _document_row_current(
     row_space = str(row.get("embedding_space") or "")
     if not row_space:
         row_space = EMBEDDING_SPACE_DENSE if str(row.get("embedding_provider") or "") == EMBEDDING_PROVIDER else EMBEDDING_SPACE_HASH
-    expected_space = EMBEDDING_SPACE_HASH if _embedding_degraded() else EMBEDDING_SPACE_DENSE
+    expected_space = EMBEDDING_SPACE_DENSE
     if row_space != expected_space:
         return False
     if previous_manifest and str(previous_manifest.get("version") or "") not in {"", INDEX_VERSION}:
@@ -1352,7 +1455,6 @@ def _retrieve_vector_candidates_by_corpus(
         max_candidates=max_candidates,
         query_space=query_space,
     )
-    # Prefer wiki synthesis pages for reasoning traversal, then fall back to raw evidence.
     return _dedupe_candidates(wiki_candidates + raw_candidates), {**raw_scores, **wiki_scores}
 
 
@@ -1406,36 +1508,24 @@ def _bm25_wiki_scores(
 def _bm25s_wiki_scores(
     query_tokens: list[str], wiki_docs: list[dict[str, Any]], *, max_candidates: int
 ) -> dict[str, float] | None:
-    try:
-        import bm25s  # type: ignore[import-not-found]
-    except Exception:
+    if _BM25S_MODULE is None:
         return None
     try:
         corpus = [_bm25_document_text(row) for row in wiki_docs]
         if not corpus:
             return {}
-        tokenized_corpus = _bm25s_tokenize(bm25s, corpus)
-        retriever = bm25s.BM25()
+        tokenized_corpus = _bm25s_tokenize(_BM25S_MODULE, corpus)
+        retriever = _BM25S_MODULE.BM25()
         try:
             retriever.index(tokenized_corpus, show_progress=False)
         except TypeError:
             retriever.index(tokenized_corpus)
-        tokenized_query = _bm25s_tokenize(bm25s, [" ".join(query_tokens)])
+        tokenized_query = _bm25s_tokenize(_BM25S_MODULE, [" ".join(query_tokens)])
         k = min(max_candidates, len(wiki_docs))
-        retrieve_result: tuple[Any, Any] | None = None
-        for kwargs in (
-            {"k": k, "show_progress": False},
-            {"k": k},
-            {"corpus": list(range(len(wiki_docs))), "k": k, "show_progress": False},
-            {"corpus": list(range(len(wiki_docs))), "k": k},
-        ):
-            try:
-                retrieve_result = retriever.retrieve(tokenized_query, **kwargs)
-                break
-            except TypeError:
-                continue
-        if retrieve_result is None:
-            return None
+        try:
+            retrieve_result = retriever.retrieve(tokenized_query, k=k, show_progress=False)
+        except TypeError:
+            retrieve_result = retriever.retrieve(tokenized_query, k=k)
         results, score_rows = retrieve_result
         result_values = _first_bm25s_row(results)
         score_values = _first_bm25s_row(score_rows)
@@ -1454,7 +1544,8 @@ def _bm25s_wiki_scores(
             if doc_id:
                 scores[doc_id] = numeric_score
         return scores
-    except Exception:
+    except (TypeError, ValueError, AttributeError, IndexError) as exc:
+        _LOGGER.warning("bm25s wiki scoring failed: %s", exc)
         return None
 
 
@@ -1565,10 +1656,7 @@ def _supporting_raw_candidates_for_wiki_hits(
         score = float(sum(counts.get(token, 0) for token in set(query_tokens)))
         if score <= 0:
             score = 0.01
-        # Raw rows are supporting citations for a wiki BM25 hit, not primary answers.
-        # Keep their lexical contribution bounded so factual MCP queries surface
-        # organized wiki evidence first while still returning raw provenance.
-        scores[doc_id] = min(score * 0.05, 0.25)
+        scores[doc_id] = min(score * RAW_SUPPORT_SCORE_FACTOR, RAW_SUPPORT_SCORE_CAP)
     ranked = sorted(raw_rows, key=lambda row: (-scores.get(str(row.get("id") or ""), 0.0), str(row.get("id") or "")))[
         :max_candidates
     ]
@@ -1653,12 +1741,14 @@ def infer_query_profile(query: str, profile: QueryProfile | dict[str, Any] | Non
         {
             "business": ("business", "mba"),
             "computer": ("computer", "cs", "software"),
-            "engineering": ("engineering",),
+            "engineering": ("engineering", "network engineering", "ece", "eets", "lyle"),
             "science": ("science",),
             "arts": ("arts", "music", "theatre"),
             "law": ("law",),
         },
     )
+    if not academic_interest and re.search(r"\bnetwork\s+engineering\b", haystack):
+        academic_interest = "engineering"
     return QueryProfile(
         education_level=education_level,
         role=role,
@@ -1819,15 +1909,17 @@ def _index_embedding_space(rows: list[dict[str, Any]]) -> str:
         return EMBEDDING_SPACE_HASH
     if spaces:
         return next(iter(spaces))
-    return EMBEDDING_SPACE_DENSE if not _embedding_degraded() else EMBEDDING_SPACE_HASH
+    return EMBEDDING_SPACE_DENSE
 
 
 def _vector_leg_enabled(manifest: dict[str, Any] | None) -> bool:
     if not manifest:
-        return not _embedding_degraded()
+        return True
     if manifest.get("vector_leg_enabled") is False:
         return False
     if bool(manifest.get("embedding_degraded")):
+        return False
+    if str(manifest.get("embedding_space") or "") not in {"", EMBEDDING_SPACE_DENSE}:
         return False
     return True
 
@@ -1899,34 +1991,31 @@ def _embedding_vector_and_space(
 ) -> tuple[list[float], str]:
     global _DENSE_EMBEDDING_UNAVAILABLE, _EMBEDDING_DEGRADED
     manifest_space = str(manifest.get("embedding_space") or "") if manifest else ""
-    if manifest and not _vector_leg_enabled(manifest):
-        return [0.0] * dimensions, manifest_space or EMBEDDING_SPACE_HASH
-    if manifest_space == EMBEDDING_SPACE_HASH:
-        return _hash_embedding_vector(text, dimensions=dimensions), EMBEDDING_SPACE_HASH
-    if not _DENSE_EMBEDDING_UNAVAILABLE and not _dense_embeddings_disabled():
-        try:
-            vector = embed_text(text[:8000], embedding_config_from_env())
-            if vector:
-                return _normalize_embedding_dimensions(vector, dimensions), EMBEDDING_SPACE_DENSE
-        except Exception:
-            _DENSE_EMBEDDING_UNAVAILABLE = True
-            _EMBEDDING_DEGRADED = True
-    else:
+    if manifest and manifest_space and manifest_space != EMBEDDING_SPACE_DENSE:
         _EMBEDDING_DEGRADED = True
-    return _hash_embedding_vector(text, dimensions=dimensions), EMBEDDING_SPACE_HASH
-
-
-def _hash_embedding_vector(text: str, *, dimensions: int = EMBEDDING_DIMENSIONS) -> list[float]:
-    vector = [0.0] * dimensions
-    for token, count in _token_counts(text).items():
-        digest = hashlib.sha256(token.encode("utf-8")).digest()
-        index = int.from_bytes(digest[:4], "big") % dimensions
-        sign = 1.0 if digest[4] % 2 else -1.0
-        vector[index] += sign * (1.0 + math.log(float(count)))
-    norm = math.sqrt(sum(value * value for value in vector))
-    if not norm:
-        return vector
-    return [round(value / norm, 6) for value in vector]
+        raise EmbeddingUnavailableError(
+            f"Index embedding space is {manifest_space}; expected {EMBEDDING_SPACE_DENSE}. Rebuild the index."
+        )
+    if _dense_embeddings_disabled():
+        _DENSE_EMBEDDING_UNAVAILABLE = True
+        _EMBEDDING_DEGRADED = True
+        raise EmbeddingUnavailableError("Ollama dense embeddings are disabled by RAG_DISABLE_DENSE_EMBEDDING.")
+    if _DENSE_EMBEDDING_UNAVAILABLE:
+        _EMBEDDING_DEGRADED = True
+        raise EmbeddingUnavailableError("Ollama dense embeddings unavailable.")
+    try:
+        vector = embed_text(text[:8000], embedding_config_from_env())
+    except Exception as exc:
+        _DENSE_EMBEDDING_UNAVAILABLE = True
+        _EMBEDDING_DEGRADED = True
+        raise EmbeddingUnavailableError(
+            "Ollama dense embeddings unavailable. Start Ollama, pull the embedding model, or fix OLLAMA_BASE_URL/OLLAMA_EMBED_MODEL."
+        ) from exc
+    if not vector:
+        _DENSE_EMBEDDING_UNAVAILABLE = True
+        _EMBEDDING_DEGRADED = True
+        raise EmbeddingUnavailableError("Ollama dense embedding response was empty.")
+    return _normalize_embedding_dimensions(vector, dimensions), EMBEDDING_SPACE_DENSE
 
 
 def _normalize_embedding_dimensions(vector: list[float], dimensions: int) -> list[float]:
@@ -2033,22 +2122,6 @@ def _snippet(text: str, tokens: list[str], *, chars: int = 320) -> str:
     if start + chars < len(compact):
         snippet = snippet.rstrip() + "..."
     return snippet
-
-
-def _parse_frontmatter(text: str) -> dict[str, Any]:
-    return parse_markdown_frontmatter(text)
-
-
-def _strip_frontmatter(text: str) -> str:
-    return strip_markdown_frontmatter(text)
-
-
-def _site_relative(path: Path, site_root: Path) -> str:
-    return site_relative(path, site_root, resolve=True)
-
-
-def _timestamp_slug(value: str) -> str:
-    return timestamp_slug(value, fallback_hash=True)
 
 
 def main(argv: list[str] | None = None) -> int:

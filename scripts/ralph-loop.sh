@@ -15,13 +15,13 @@
 # - Fresh context window each iteration
 #
 # Work sources (in priority order):
-# 1. IMPLEMENTATION_PLAN.md (if exists) - pick highest priority task
+# 1. docs/planning/implementation-plan.md (if exists) - pick highest priority task
 # 2. specs/ folder - pick highest priority incomplete spec
 #
 # Usage:
 #   ./scripts/ralph-loop.sh              # Build mode (unlimited)
 #   ./scripts/ralph-loop.sh 20           # Build mode (max 20 iterations)
-#   ./scripts/ralph-loop.sh plan         # Planning mode (creates IMPLEMENTATION_PLAN.md)
+#   ./scripts/ralph-loop.sh plan         # Planning mode (creates docs/planning/implementation-plan.md)
 #
 
 set -e
@@ -80,10 +80,10 @@ Usage:
 
 Modes:
   build (default)  Pick spec/task and implement
-  plan             Create IMPLEMENTATION_PLAN.md from specs (OPTIONAL)
+  plan             Create docs/planning/implementation-plan.md from specs (OPTIONAL)
 
 Work Sources (checked in order):
-  1. IMPLEMENTATION_PLAN.md - If exists, pick highest priority task
+  1. docs/planning/implementation-plan.md - If exists, pick highest priority task
   2. specs/ folder - Otherwise, pick highest priority incomplete spec
 
 The plan mode is OPTIONAL. Most projects can work directly from specs.
@@ -253,7 +253,7 @@ You are running inside a Ralph Wiggum autonomous loop in planning mode.
 Read `.specify/memory/constitution.md` for project principles.
 
 Study `specs/` and compare against the current codebase (gap analysis).
-Create or update `IMPLEMENTATION_PLAN.md` with a prioritized task breakdown.
+Create or update `docs/planning/implementation-plan.md` with a prioritized task breakdown.
 Do NOT implement anything.
 
 When the plan is complete, output `<promise>DONE</promise>`.
@@ -280,7 +280,7 @@ HAS_SPECS=false
 SPEC_COUNT=0
 INCOMPLETE_SPEC_COUNT=0
 FIRST_INCOMPLETE_SPEC=""
-[ -f "IMPLEMENTATION_PLAN.md" ] && HAS_PLAN=true
+[ -f "docs/planning/implementation-plan.md" ] && HAS_PLAN=true
 if [ -d "specs" ]; then
     SPEC_COUNT=$(count_root_specs "specs")
     INCOMPLETE_SPEC_COUNT=$(count_incomplete_root_specs "specs")
@@ -305,9 +305,9 @@ echo -e "${YELLOW}YOLO:${NC}     $([ "$YOLO_ENABLED" = true ] && echo "ENABLED" 
 echo ""
 echo -e "${BLUE}Work source:${NC}"
 if [ "$HAS_PLAN" = true ]; then
-    echo -e "  ${GREEN}✓${NC} IMPLEMENTATION_PLAN.md (will use this)"
+    echo -e "  ${GREEN}✓${NC} docs/planning/implementation-plan.md (will use this)"
 else
-    echo -e "  ${YELLOW}○${NC} IMPLEMENTATION_PLAN.md (not found, that's OK)"
+    echo -e "  ${YELLOW}○${NC} docs/planning/implementation-plan.md (not found, that's OK)"
 fi
 if [ "$HAS_SPECS" = true ]; then
     echo -e "  ${GREEN}✓${NC} specs/ folder ($SPEC_COUNT specs, $INCOMPLETE_SPEC_COUNT incomplete)"
@@ -383,7 +383,7 @@ while true; do
                 echo ""
                 echo -e "${GREEN}Planning complete!${NC}"
                 echo -e "${CYAN}Run './scripts/ralph-loop.sh' to start building.${NC}"
-                echo -e "${CYAN}Or delete IMPLEMENTATION_PLAN.md to work directly from specs.${NC}"
+                echo -e "${CYAN}Or delete docs/planning/implementation-plan.md to work directly from specs.${NC}"
                 break
             fi
         else

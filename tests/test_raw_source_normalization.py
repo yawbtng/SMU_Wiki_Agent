@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from src.scrape_planner.raw_source_normalizer import (
+from src.scrape_planner.sources.raw_source_normalizer import (
     normalize_pdf_pages,
     normalize_scraped_markdown,
     normalize_tabular_sources,
 )
-from src.scrape_planner.site_layout import ensure_site_layout
-from src.scrape_planner.source_registry import read_registry_rows, stable_source_id
-from src.scrape_planner.storage import write_json
+from src.scrape_planner.core.site_layout import ensure_site_layout
+from src.scrape_planner.sources.source_registry import read_registry_rows, stable_source_id
+from src.scrape_planner.core.storage import write_json
 
 
 NOW = "2026-05-21T00:00:00+00:00"
@@ -576,3 +578,41 @@ def test_incremental_normalization_reports_unchanged_then_changed(tmp_path: Path
     assert row["markdown_path"] != first_row["markdown_path"]
     assert first_raw_path.read_text(encoding="utf-8") == "# Home\n\nVersion 1.\n"
     assert (site_root / row["markdown_path"]).read_text(encoding="utf-8") == "# Home\n\nVersion 2.\n"
+
+
+def test_raw_source_normalizer_cli_runs_without_input_and_writes_report(tmp_path: Path) -> None:
+    site_root = tmp_path / "site"
+    run_root = site_root / "run-001"
+    markdown = run_root / "markdown" / "home.md"
+    markdown.parent.mkdir(parents=True)
+    markdown.write_text("# Home\n\nAdmissions info.\n", encoding="utf-8")
+    (run_root / "scrape_manifest.json").write_text(
+        json.dumps([{"url": "https://example.edu/", "status": "success", "markdown_path": str(markdown)}]),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "src.scrape_planner.sources.raw_source_normalizer",
+            "--site-root",
+            str(site_root),
+            "--kind",
+            "web",
+            "--run-root",
+            str(run_root),
+            "--no-input",
+        ],
+        input="",
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert (site_root / "raw_sources" / "registry.jsonl").exists()
+    assert json.loads(result.stdout)["mode"] == "web"
+    assert json.loads(result.stdout)["no_input"] is True
+    assert "input(" not in result.stderr.lower()

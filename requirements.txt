@@ -1,6 +1,10 @@
-streamlit>=1.38.0
-streamlit-autorefresh>=1.0.1
-altair>=5.0.0
+# Webapp (primary operator UI)
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.0.0
+httpx>=0.27.0
+pytest>=8.0.0
+# Shared backend
 redis>=5.0.0
 requests>=2.31.0
 scrapling>=0.2.99

@@ -11,12 +11,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.scrape_planner.llm_wiki_builder import build_wiki
-from src.scrape_planner.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
-from src.scrape_planner.raw_source_normalizer import normalize_pdf_pages, normalize_scraped_markdown
-from src.scrape_planner.site_layout import ensure_site_layout
-from src.scrape_planner.source_registry import build_source_row, checksum_text, read_registry_rows, write_registry_rows
-from src.scrape_planner.storage import write_json
+from src.scrape_planner.wiki.llm_wiki_builder import build_wiki
+from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_llm_wiki_index
+from src.scrape_planner.sources.raw_source_normalizer import normalize_pdf_pages, normalize_scraped_markdown
+from src.scrape_planner.core.site_layout import ensure_site_layout
+from src.scrape_planner.sources.source_registry import build_source_row, checksum_text, read_registry_rows, write_registry_rows
+from src.scrape_planner.core.storage import write_json
 
 
 NOW = "2026-05-22T00:00:00+00:00"

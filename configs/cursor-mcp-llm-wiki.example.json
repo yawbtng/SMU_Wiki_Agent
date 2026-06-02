@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "llm-wiki-www.smu.edu": {
+      "command": "/absolute/path/to/ultra-fast-rag/.venv/bin/python",
+      "args": [
+        "-m",
+        "mcp_servers.llm_wiki_mcp",
+        "--site-root",
+        "/absolute/path/to/ultra-fast-rag/data/sites/www.smu.edu"
+      ],
+      "cwd": "/absolute/path/to/ultra-fast-rag",
+      "env": {
+        "PYTHONPATH": "/absolute/path/to/ultra-fast-rag",
+        "LLM_WIKI_SITE_ROOT": "/absolute/path/to/ultra-fast-rag/data/sites/www.smu.edu"
+      }
+    }
+  }
+}

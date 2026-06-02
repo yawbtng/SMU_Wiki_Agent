@@ -4,9 +4,9 @@ This file is the human-readable checkpoint for Ralph loop work.
 
 ## UI Stack Decision (2026-05-28)
 
-**Primary operator UI:** FastAPI + React/Vite in the `ultra-fast-rag-webapp` worktree (`migrate-fastapi-react` branch). See `specs/006-fastapi-react-realtime-app.md`.
+**Primary operator UI:** FastAPI + React/Vite in this repo (`frontend/`, `src/scrape_planner/webapp/`). See `specs/006-fastapi-react-realtime-app.md`.
 
-**Legacy reference:** Streamlit (`app.py`) — parity reference only; do not add major new Streamlit UI unless explicitly for compatibility.
+**Legacy reference:** Streamlit was removed; see `docs/migration/streamlit-to-fastapi-react-audit.md` for parity notes only.
 
 Future UI acceptance criteria for specs 002 and 005 target the webapp, not Streamlit.
 

@@ -24,7 +24,7 @@ def embedding_config_from_env() -> EmbeddingClientConfig:
         provider="ollama",
         model=os.getenv("OLLAMA_EMBED_MODEL", DEFAULT_OLLAMA_EMBED_MODEL).strip() or DEFAULT_OLLAMA_EMBED_MODEL,
         base_url=os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL).strip() or DEFAULT_OLLAMA_BASE_URL,
-        timeout_seconds=_float_env("OLLAMA_EMBED_TIMEOUT", 0.5),
+        timeout_seconds=_float_env("OLLAMA_EMBED_TIMEOUT", 10.0),
     )
 
 

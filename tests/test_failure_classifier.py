@@ -1,4 +1,4 @@
-from src.scrape_planner.failure_classifier import classify_failure
+from src.scrape_planner.scrape.failure_classifier import classify_failure
 
 
 def test_http_blocked():
