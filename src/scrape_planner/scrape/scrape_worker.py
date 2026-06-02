@@ -20,7 +20,7 @@ from ..core.models import DiscoveredURL, PageResult
 from ..pdf.pdf_ingest import PdfIngestConfig, ingest_pdfs
 from ..runtime.run_persistence import read_page_states, upsert_page_state, write_page_states, write_run_status
 from ..runtime.state import RunStateStore
-from ..core.storage import ensure_run_dirs, write_json
+from ..core.storage import ensure_run_dirs, read_jsonl, write_json
 
 try:
     from scrapling.fetchers import Fetcher, PlayWrightFetcher
@@ -62,7 +62,7 @@ def _duration_ms(start_iso: str | None) -> int:
     try:
         start_dt = datetime.fromisoformat(start_iso)
         return int((datetime.now(timezone.utc) - start_dt).total_seconds() * 1000)
-    except Exception:
+    except ValueError:
         return 0
 
 
@@ -174,7 +174,7 @@ class ScrapeRunner:
             return False
         try:
             raw = json.loads(selected_urls_path.read_text(encoding="utf-8"))
-        except Exception:
+        except json.JSONDecodeError:
             self.unpause(site_id, run_id)
             return False
 
@@ -298,7 +298,9 @@ class ScrapeRunner:
         browser_mode: str | None = None,
         lightpanda_cdp_url: str | None = None,
     ) -> None:
-        selected_urls = [item for item in urls if item.selected and not item.excluded_reason]
+        from .scrape_url_selection import filter_urls_for_scrape
+
+        selected_urls = filter_urls_for_scrape([item for item in urls if item.selected and not item.excluded_reason])
         run_root = self.base_data_dir / "sites" / site_id / run_id
         dirs = ensure_run_dirs(run_root)
         write_json(run_root / "selected_urls.json", [item.to_dict() for item in selected_urls])
@@ -661,11 +663,7 @@ class ScrapeRunner:
                                     "fetch_mode": mode,
                                 },
                             )
-                            try:
-                                response = self._fetch_with_mode(mode, item.url, lightpanda_cdp_url)
-                            except TypeError:
-                                # Backward-compatible for tests/extensions monkeypatching _fetch_with_mode(mode, url).
-                                response = self._fetch_with_mode(mode, item.url)  # type: ignore[misc]
+                            response = self._fetch_with_mode(mode, item.url, lightpanda_cdp_url)
                             http_status, content_type, html = _extract_response_parts(response)
                             if mode == "fetcher":
                                 body = self._read_response_body(response, site_id=site_id, run_id=run_id)
@@ -916,25 +914,9 @@ class ScrapeRunner:
         write_json(run_root / "failures.json", failures)
 
 
-def _read_jsonl_rows(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            rows.append(value)
-    return rows
-
-
 def _merge_jsonl_rows(path: Path, rows: list[dict[str, Any]], *, key: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    merged = {str(row.get(key) or ""): row for row in _read_jsonl_rows(path) if row.get(key)}
+    merged = {str(row.get(key) or ""): row for row in read_jsonl(path) if row.get(key)}
     for row in rows:
         row_key = str(row.get(key) or "")
         if row_key:

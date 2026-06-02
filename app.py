@@ -62,6 +62,7 @@ from src.scrape_planner.run_analytics import (
     summarize_output_volume,
     summarize_pages,
 )
+from src.scrape_planner.scrape.scrape_url_selection import urls_for_site_scrape
 from src.scrape_planner.scrape_worker import ScrapeRunner
 from src.scrape_planner.sitemap_discovery import apply_manual_urls, discover_site_urls, normalize_site_url
 from src.scrape_planner.site_layout import site_layout
@@ -3496,7 +3497,10 @@ if active_tab == WORKFLOW_TABS[2]:
             )
             st.session_state["scrape_concurrency"] = int(runs_concurrency)
             if runs_controls[1].button("Start New Scrape", type="primary", use_container_width=True, key="runs_start_new_scrape"):
-                selected_urls = _rows_to_discovered_urls(st.session_state["selected_df"].to_dict("records"))
+                site_root_path = DATA_ROOT / "sites" / runs_site_id
+                selected_urls = urls_for_site_scrape(site_root_path, prefer_approved=True)
+                if not selected_urls:
+                    selected_urls = _rows_to_discovered_urls(st.session_state["selected_df"].to_dict("records"))
                 selected_urls = [
                     item
                     for item in selected_urls

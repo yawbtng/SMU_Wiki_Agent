@@ -5,7 +5,7 @@ import threading
 import time
 
 from src.scrape_planner.models import DiscoveredURL
-from src.scrape_planner.scrape_worker import ScrapeRunner, _extract_response_parts
+from src.scrape_planner.scrape.scrape_worker import ScrapeRunner, _extract_response_parts
 from src.scrape_planner.state import RunStateStore
 
 
@@ -48,9 +48,11 @@ def test_extract_response_parts_supports_scrapling_response_shape():
 def test_execute_success_path(monkeypatch, tmp_path: Path):
     runner, state = _make_runner(tmp_path)
 
-    monkeypatch.setattr(runner, "_fetch_with_mode", lambda mode, url: _FakeResponse())
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.extract_content",
+        runner, "_fetch_with_mode", lambda mode, url, lightpanda_cdp_url=None: _FakeResponse()
+    )
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape.scrape_worker.extract_content",
         lambda html: ("text", "# title\nbody", 1200, 0.02),
     )
 
@@ -69,6 +71,31 @@ def test_execute_success_path(monkeypatch, tmp_path: Path):
     assert (tmp_path / "sites" / "site-a" / "run-1" / "scrape_manifest.json").exists()
 
 
+def test_execute_skips_policy_rejected_urls(monkeypatch, tmp_path: Path):
+    runner, state = _make_runner(tmp_path)
+
+    monkeypatch.setattr(
+        runner, "_fetch_with_mode", lambda mode, url, lightpanda_cdp_url=None: _FakeResponse()
+    )
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape.scrape_worker.extract_content",
+        lambda html: ("text", "# title\nbody", 1200, 0.02),
+    )
+
+    urls = [
+        DiscoveredURL(url="https://www.smu.edu/giving/donate", source_sitemap="manual", selected=True),
+        DiscoveredURL(url="https://example.com/good-page", source_sitemap="manual", selected=True),
+    ]
+    runner._execute("site-a", "run-policy", urls)
+
+    status = state.get_status("site-a", "run-policy")
+    pages = state.get_pages("site-a", "run-policy")
+
+    assert status["success"] == 1
+    assert len(pages) == 1
+    assert pages[0]["url"] == "https://example.com/good-page"
+
+
 def test_execute_pdf_url_downloads_and_writes_pdf_chunks(monkeypatch, tmp_path: Path):
     runner, state = _make_runner(tmp_path)
     item = DiscoveredURL(
@@ -79,7 +106,7 @@ def test_execute_pdf_url_downloads_and_writes_pdf_chunks(monkeypatch, tmp_path: 
     )
 
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.requests.get",
+        "src.scrape_planner.scrape.scrape_worker.requests.get",
         lambda url, timeout, stream=False: _FakeResponse(text="%PDF-1.7", content_type="application/pdf"),
     )
 
@@ -96,7 +123,7 @@ def test_execute_pdf_url_downloads_and_writes_pdf_chunks(monkeypatch, tmp_path: 
             return {"chunk_id": "chunk-1", "pdf_source_id": "pdf-1", "text": "PDF catalog content", "char_count": 19}
 
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.ingest_pdfs",
+        "src.scrape_planner.scrape.scrape_worker.ingest_pdfs",
         lambda paths, config: SimpleNamespace(sources=[Source()], chunks=[Chunk()], quarantine=[]),
     )
 
@@ -119,9 +146,10 @@ def test_execute_retry_then_success(monkeypatch, tmp_path: Path):
     runner, state = _make_runner(tmp_path)
     monkeypatch.setenv("SCRAPE_BROWSER_MODE", "lightpanda")
     monkeypatch.setenv("LIGHTPANDA_CDP_URL", "ws://127.0.0.1:9222")
+    monkeypatch.setattr(runner, "_fetch_modes", lambda *args, **kwargs: ("fetcher", "lightpanda"))
     calls: list[str] = []
 
-    def fake_fetch(mode: str, url: str):
+    def fake_fetch(mode: str, url: str, lightpanda_cdp_url=None):
         calls.append(mode)
         if mode == "fetcher":
             return _FakeResponse(status_code=403)
@@ -129,7 +157,12 @@ def test_execute_retry_then_success(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr(runner, "_fetch_with_mode", fake_fetch)
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.extract_content",
+        runner,
+        "_fetch_modes",
+        lambda browser_mode=None, lightpanda_cdp_url=None: ("fetcher", "lightpanda"),
+    )
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape.scrape_worker.extract_content",
         lambda html: ("text", "# ok", 900, 0.03),
     )
 
@@ -145,9 +178,13 @@ def test_execute_retry_then_success(monkeypatch, tmp_path: Path):
 def test_execute_failed_path_and_grouped_failures(monkeypatch, tmp_path: Path):
     runner, state = _make_runner(tmp_path)
 
-    monkeypatch.setattr(runner, "_fetch_with_mode", lambda mode, url: _FakeResponse(status_code=500))
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.extract_content",
+        runner,
+        "_fetch_with_mode",
+        lambda mode, url, lightpanda_cdp_url=None: _FakeResponse(status_code=500),
+    )
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape.scrape_worker.extract_content",
         lambda html: ("", "", 0, 0.0),
     )
 
@@ -172,9 +209,11 @@ def test_execute_failed_path_and_grouped_failures(monkeypatch, tmp_path: Path):
 def test_cancel_before_run(monkeypatch, tmp_path: Path):
     runner, state = _make_runner(tmp_path)
     state.set_cancel("site-a", "run-4", True)
-    monkeypatch.setattr(runner, "_fetch_with_mode", lambda mode, url: _FakeResponse())
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.extract_content",
+        runner, "_fetch_with_mode", lambda mode, url, lightpanda_cdp_url=None: _FakeResponse()
+    )
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape.scrape_worker.extract_content",
         lambda html: ("text", "ok", 1000, 0.01),
     )
 
@@ -192,7 +231,7 @@ def test_cancel_mid_run(monkeypatch, tmp_path: Path):
     runner, state = _make_runner(tmp_path)
     seen = {"count": 0}
 
-    def fake_fetch(mode: str, url: str):
+    def fake_fetch(mode: str, url: str, lightpanda_cdp_url=None):
         seen["count"] += 1
         if seen["count"] == 1:
             state.set_cancel("site-a", "run-5", True)
@@ -200,7 +239,7 @@ def test_cancel_mid_run(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr(runner, "_fetch_with_mode", fake_fetch)
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.extract_content",
+        "src.scrape_planner.scrape.scrape_worker.extract_content",
         lambda html: ("text", "# ok", 1000, 0.01),
     )
 
@@ -224,7 +263,7 @@ def test_pause_then_unpause_blocks_new_queue_items(monkeypatch, tmp_path: Path):
     release = threading.Event()
     seen: list[str] = []
 
-    def fake_fetch(mode: str, url: str):
+    def fake_fetch(mode: str, url: str, lightpanda_cdp_url=None):
         seen.append(url)
         if url.endswith("/1"):
             runner.pause("site-a", "run-6")
@@ -233,7 +272,7 @@ def test_pause_then_unpause_blocks_new_queue_items(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr(runner, "_fetch_with_mode", fake_fetch)
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.extract_content",
+        "src.scrape_planner.scrape.scrape_worker.extract_content",
         lambda html: ("text", "# ok", 1000, 0.01),
     )
 
@@ -284,13 +323,13 @@ def test_resume_reuses_existing_success_pages(monkeypatch, tmp_path: Path):
 
     seen: list[str] = []
 
-    def fake_fetch(mode: str, url: str):
+    def fake_fetch(mode: str, url: str, lightpanda_cdp_url=None):
         seen.append(url)
         return _FakeResponse()
 
     monkeypatch.setattr(runner, "_fetch_with_mode", fake_fetch)
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.extract_content",
+        "src.scrape_planner.scrape.scrape_worker.extract_content",
         lambda html: ("text", "# ok", 1000, 0.01),
     )
 
@@ -312,13 +351,13 @@ def test_has_live_run_reflects_background_thread_liveness(monkeypatch, tmp_path:
     runner, _state = _make_runner(tmp_path)
     release = threading.Event()
 
-    def fake_fetch(mode: str, url: str):
+    def fake_fetch(mode: str, url: str, lightpanda_cdp_url=None):
         release.wait(timeout=2.0)
         return _FakeResponse()
 
     monkeypatch.setattr(runner, "_fetch_with_mode", fake_fetch)
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.extract_content",
+        "src.scrape_planner.scrape.scrape_worker.extract_content",
         lambda html: ("text", "# ok", 1000, 0.01),
     )
 
@@ -336,17 +375,19 @@ def test_execute_batches_durable_page_state_writes(monkeypatch, tmp_path: Path):
     page_state_writes: list[int] = []
     run_status_writes: list[str] = []
 
-    monkeypatch.setattr(runner, "_fetch_with_mode", lambda mode, url: _FakeResponse())
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.extract_content",
+        runner, "_fetch_with_mode", lambda mode, url, lightpanda_cdp_url=None: _FakeResponse()
+    )
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape.scrape_worker.extract_content",
         lambda html: ("text", "# ok", 1000, 0.01),
     )
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.write_page_states",
+        "src.scrape_planner.scrape.scrape_worker.write_page_states",
         lambda run_root, pages: page_state_writes.append(len(pages)),
     )
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.write_run_status",
+        "src.scrape_planner.scrape.scrape_worker.write_run_status",
         lambda run_root, status: run_status_writes.append(str(status.get("state") or "")),
     )
 
@@ -392,9 +433,9 @@ def test_pause_interrupts_inflight_request_and_resume_finishes(monkeypatch, tmp_
             return _StreamingResponse([b"<html>", b"body</html>"])
         return _StreamingResponse([b"<html>body</html>"])
 
-    monkeypatch.setattr("src.scrape_planner.scrape_worker.requests.get", fake_get)
+    monkeypatch.setattr("src.scrape_planner.scrape.scrape_worker.requests.get", fake_get)
     monkeypatch.setattr(
-        "src.scrape_planner.scrape_worker.extract_content",
+        "src.scrape_planner.scrape.scrape_worker.extract_content",
         lambda html: ("text", "# ok", 1000, 0.01),
     )
 

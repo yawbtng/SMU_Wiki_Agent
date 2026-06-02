@@ -69,6 +69,13 @@ def answer_question(
             "metadata": metadata,
         }
 
+    record_confidence_gap(
+        layout.site_root,
+        question=question,
+        confidence=confidence,
+        evidence=local.get("evidence", []) if isinstance(local.get("evidence"), list) else [],
+    )
+
     guard = LoopGuard(layout.site_root)
     job_status = _resolve_pending_job(guard, question, now=current)
     if job_status.get("action") == "retry_local":
@@ -306,6 +313,79 @@ def record_rejection(site_root: Path, candidate: dict[str, Any], decision: dict[
         layout.indexes_dir / "self_improving_rejections.jsonl",
         {"ts": int(time.time()), "candidate": candidate, "quality_gate": decision},
     )
+
+
+def record_confidence_gap(
+    site_root: Path,
+    *,
+    question: str,
+    confidence: dict[str, Any],
+    evidence: list[Any],
+) -> None:
+    layout = ensure_layout_for_site_root(Path(site_root))
+    _append_jsonl(
+        layout.indexes_dir / "self_improving_gaps.jsonl",
+        {
+            "ts": int(time.time()),
+            "question": question,
+            "confidence": confidence,
+            "suggested_groups": _suggest_refresh_groups(question, evidence),
+            "recommended_action": "re_discovery_and_rebuild",
+        },
+    )
+
+
+def read_confidence_gaps(site_root: Path, *, limit: int = 50) -> list[dict[str, Any]]:
+    layout = ensure_layout_for_site_root(Path(site_root))
+    path = layout.indexes_dir / "self_improving_gaps.jsonl"
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    return rows[-limit:] if limit > 0 else rows
+
+
+def _suggest_refresh_groups(question: str, evidence: list[Any]) -> list[str]:
+    groups: list[str] = []
+    haystack = str(question or "").lower()
+    keyword_map = {
+        "registrar": ["/registrar", "/enrollment-services"],
+        "schedule": ["/registrar", "/academic-calendar", "/course-schedule"],
+        "course": ["/catalog", "/course", "/program"],
+        "tuition": ["/tuition", "/financial-aid", "/bursar"],
+        "housing": ["/housing", "/student-life"],
+        "admission": ["/admission", "/apply"],
+    }
+    for keyword, paths in keyword_map.items():
+        if keyword in haystack:
+            groups.extend(paths)
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or item.get("source_url") or "")
+        if not url:
+            continue
+        parsed = urlparse(url)
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 2:
+            groups.append(f"/{parts[0]}/{parts[1]}")
+        elif parts:
+            groups.append(f"/{parts[0]}")
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        if group not in seen:
+            seen.add(group)
+            deduped.append(group)
+    return deduped[:12]
 
 
 def record_accepted_ingest(

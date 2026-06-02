@@ -10,13 +10,13 @@ from typing import Any, Callable
 from .content_extract import extract_content
 from ..wiki.llm_wiki_builder import build_wiki
 from ..wiki.llm_wiki_index import build_llm_wiki_index
-from ..wiki.index_lock import site_index_write_lock
 from ..wiki.ingest_safety import canonicalize_url, safe_fetch
 from ..wiki.self_improving import assess_candidate_source, enforce_manual_run_retention, find_registry_row_for_url
 from ..sources.raw_source_normalizer import normalize_scraped_markdown
 from ..sources.source_registry import checksum_text
 from ..core.site_layout import ensure_layout_for_site_root
 from .sitemap_discovery import apply_manual_urls
+from .url_policy import classify_url_for_student_wiki
 from ..core.storage import ensure_run_dirs, write_json
 from ..runtime.run_persistence import _write_json_atomic
 
@@ -58,10 +58,15 @@ def run_manual_url_pipeline(
 
     try:
         accepted = apply_manual_urls(site_url, [normalized_url]) if site_url else []
-        if not accepted or accepted[0].excluded_reason:
+        if not accepted or accepted[0].excluded_reason or not accepted[0].selected:
             reason = str(accepted[0].excluded_reason if accepted else "invalid_url") or "invalid_url"
             _write_status("failed", reason=reason)
             return {"status": "rejected", "reason": reason, "url": normalized_url}
+
+        policy = classify_url_for_student_wiki(normalized_url)
+        if not policy.selected:
+            _write_status("failed", reason=policy.reason)
+            return {"status": "rejected", "reason": policy.reason, "url": normalized_url, "policy": policy.reason}
 
         existing = find_registry_row_for_url(layout.site_root, normalized_url)
         if existing and str(existing.get("checksum") or ""):
@@ -74,104 +79,103 @@ def run_manual_url_pipeline(
                 "reason": "pre_fetch_short_circuit",
             }
 
-        with site_index_write_lock(layout.site_root):
-            run_id = f"manual-{_safe_timestamp(timestamp)}-{_slug_from_url(normalized_url)}"
-            run_root = layout.site_root / run_id
-            dirs = ensure_run_dirs(run_root)
-            write_json(run_root / "selected_urls.json", [accepted[0].to_dict()])
+        run_id = f"manual-{_safe_timestamp(timestamp)}-{_slug_from_url(normalized_url)}"
+        run_root = layout.site_root / run_id
+        dirs = ensure_run_dirs(run_root)
+        write_json(run_root / "selected_urls.json", [accepted[0].to_dict()])
 
-            if fetcher is None:
-                response = _default_fetch(normalized_url, site_root=layout.site_root)
-            else:
-                response = fetcher(normalized_url)
-            http_status, content_type, html = _response_parts(response)
-            _raw_title, markdown, text_length, link_density = extract_content(html)
+        if fetcher is None:
+            response = _default_fetch(normalized_url, site_root=layout.site_root)
+        else:
+            response = fetcher(normalized_url)
+        http_status, content_type, html = _response_parts(response)
+        _raw_title, markdown, text_length, link_density = extract_content(html)
 
-            quality = assess_candidate_source(
-                {"url": normalized_url, "title": _raw_title or normalized_url, "snippet": markdown[:500]},
-                site_root=layout.site_root,
-                markdown=markdown,
-            )
-            if not quality.accepted:
-                _write_status("failed", reason=",".join(quality.reasons) or "quality_gate_failed")
-                return {
-                    "status": "rejected",
-                    "reason": ",".join(quality.reasons) or "quality_gate_failed",
-                    "url": normalized_url,
-                    "quality_gate": quality.to_dict(),
-                }
-
-            slug = _slug_from_url(normalized_url)
-            raw_html_path = dirs["raw_html"] / f"{slug}.html"
-            markdown_path = dirs["markdown"] / f"{slug}.md"
-            metadata_path = dirs["metadata"] / f"{slug}.json"
-            raw_html_path.write_text(html, encoding="utf-8")
-            markdown_path.write_text(markdown, encoding="utf-8")
-            write_json(
-                metadata_path,
-                {
-                    "url": normalized_url,
-                    "http_status": http_status,
-                    "content_type": content_type,
-                    "text_length": text_length,
-                    "link_density": link_density,
-                    "fetch_mode": "manual-url-pipeline",
-                    "worker_id": "manual-url-pipeline",
-                    "attempt": 1,
-                    "content_checksum": checksum_text(markdown),
-                },
-            )
-            page_row = {
+        quality = assess_candidate_source(
+            {"url": normalized_url, "title": _raw_title or normalized_url, "snippet": markdown[:500]},
+            site_root=layout.site_root,
+            markdown=markdown,
+        )
+        if not quality.accepted:
+            _write_status("failed", reason=",".join(quality.reasons) or "quality_gate_failed")
+            return {
+                "status": "rejected",
+                "reason": ",".join(quality.reasons) or "quality_gate_failed",
                 "url": normalized_url,
-                "status": "success",
+                "quality_gate": quality.to_dict(),
+            }
+
+        slug = _slug_from_url(normalized_url)
+        raw_html_path = dirs["raw_html"] / f"{slug}.html"
+        markdown_path = dirs["markdown"] / f"{slug}.md"
+        metadata_path = dirs["metadata"] / f"{slug}.json"
+        raw_html_path.write_text(html, encoding="utf-8")
+        markdown_path.write_text(markdown, encoding="utf-8")
+        write_json(
+            metadata_path,
+            {
+                "url": normalized_url,
+                "http_status": http_status,
+                "content_type": content_type,
+                "text_length": text_length,
+                "link_density": link_density,
                 "fetch_mode": "manual-url-pipeline",
                 "worker_id": "manual-url-pipeline",
                 "attempt": 1,
-                "http_status": http_status,
-                "failure_reason": None,
-                "text_length": text_length,
-                "link_density": link_density,
-                "raw_html_path": str(raw_html_path),
-                "markdown_path": str(markdown_path),
-                "metadata_path": str(metadata_path),
+                "content_checksum": checksum_text(markdown),
+            },
+        )
+        page_row = {
+            "url": normalized_url,
+            "status": "success",
+            "fetch_mode": "manual-url-pipeline",
+            "worker_id": "manual-url-pipeline",
+            "attempt": 1,
+            "http_status": http_status,
+            "failure_reason": None,
+            "text_length": text_length,
+            "link_density": link_density,
+            "raw_html_path": str(raw_html_path),
+            "markdown_path": str(markdown_path),
+            "metadata_path": str(metadata_path),
+            "started_at": timestamp,
+            "finished_at": timestamp,
+        }
+        write_json(run_root / "scrape_manifest.json", [page_row])
+        write_json(run_root / "failures.json", [])
+        write_json(
+            run_root / "run_status.json",
+            {
+                "state": "completed",
+                "total": 1,
+                "queued": 0,
+                "running": 0,
+                "success": 1,
+                "failed": 0,
+                "cancelled": 0,
+                "current_url": None,
+                "concurrency": 1,
                 "started_at": timestamp,
                 "finished_at": timestamp,
-            }
-            write_json(run_root / "scrape_manifest.json", [page_row])
-            write_json(run_root / "failures.json", [])
-            write_json(
-                run_root / "run_status.json",
-                {
-                    "state": "completed",
-                    "total": 1,
-                    "queued": 0,
-                    "running": 0,
-                    "success": 1,
-                    "failed": 0,
-                    "cancelled": 0,
-                    "current_url": None,
-                    "concurrency": 1,
-                    "started_at": timestamp,
-                    "finished_at": timestamp,
-                },
-            )
+            },
+        )
 
-            raw_report = normalize_scraped_markdown(layout.site_root, run_root, now=timestamp)
-            wiki_report = build_wiki(layout.site_root, no_input=True, resume=True, now=timestamp)
-            index_report = build_llm_wiki_index(layout.site_root, now=timestamp)
-            source_ids = [str(row.get("source_id") or "") for row in raw_report.sources if str(row.get("source_id") or "")]
-            _write_status("succeeded", source_ids=source_ids)
-            enforce_manual_run_retention(layout.site_root)
-            return {
-                "status": "complete",
-                "url": normalized_url,
-                "run_id": run_id,
-                "run_root": str(run_root.relative_to(layout.site_root)),
-                "raw_report": _report_dict(raw_report),
-                "wiki_report": wiki_report,
-                "index_report": index_report,
-                "source_ids": source_ids,
-            }
+        raw_report = normalize_scraped_markdown(layout.site_root, run_root, now=timestamp)
+        wiki_report = build_wiki(layout.site_root, no_input=True, resume=True, now=timestamp)
+        index_report = build_llm_wiki_index(layout.site_root, now=timestamp)
+        source_ids = [str(row.get("source_id") or "") for row in raw_report.sources if str(row.get("source_id") or "")]
+        _write_status("succeeded", source_ids=source_ids)
+        enforce_manual_run_retention(layout.site_root)
+        return {
+            "status": "complete",
+            "url": normalized_url,
+            "run_id": run_id,
+            "run_root": str(run_root.relative_to(layout.site_root)),
+            "raw_report": _report_dict(raw_report),
+            "wiki_report": wiki_report,
+            "index_report": index_report,
+            "source_ids": source_ids,
+        }
     except Exception as exc:
         _write_status("failed", reason=str(exc))
         return {"status": "failed", "url": normalized_url, "reason": str(exc)}

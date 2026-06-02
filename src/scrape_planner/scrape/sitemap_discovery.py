@@ -10,6 +10,7 @@ from urllib.parse import urljoin, urlparse, urlunparse
 import requests
 
 from ..core.models import DiscoveredURL
+from .scrape_url_selection import apply_policy_to_discovered_url
 
 COMMON_SITEMAP_PATHS = (
     "/sitemap.xml",
@@ -155,13 +156,15 @@ def discover_site_urls(site_url: str, timeout: int = 15) -> DiscoveryResult:
                 parsed = urlparse(loc)
                 if loc in discovered_map:
                     continue
-                discovered_map[loc] = DiscoveredURL(
-                    url=loc,
-                    source_sitemap=sitemap_url,
-                    lastmod=lastmod,
-                    path_category=category_from_path(parsed.path),
-                    content_type_guess="html",
-                    selected=True,
+                discovered_map[loc] = apply_policy_to_discovered_url(
+                    DiscoveredURL(
+                        url=loc,
+                        source_sitemap=sitemap_url,
+                        lastmod=lastmod,
+                        path_category=category_from_path(parsed.path),
+                        content_type_guess="html",
+                        selected=True,
+                    )
                 )
         except ET.ParseError:
             notes.append(f"Sitemap {sitemap_url} was not valid XML.")
@@ -172,12 +175,14 @@ def discover_site_urls(site_url: str, timeout: int = 15) -> DiscoveryResult:
     if (seed_parsed.path not in ("", "/") or seed_parsed.query) and _same_domain(seed_url, root_host):
         discovered_map.setdefault(
             seed_url,
-            DiscoveredURL(
-                url=seed_url,
-                source_sitemap="seed",
-                path_category=category_from_path(seed_parsed.path),
-                content_type_guess="html",
-                selected=True,
+            apply_policy_to_discovered_url(
+                DiscoveredURL(
+                    url=seed_url,
+                    source_sitemap="seed",
+                    path_category=category_from_path(seed_parsed.path),
+                    content_type_guess="html",
+                    selected=True,
+                )
             ),
         )
 
@@ -200,14 +205,25 @@ def apply_manual_urls(site_url: str, urls: Iterable[str]) -> list[DiscoveredURL]
         if not candidate.startswith(("http://", "https://")):
             candidate = urljoin(normalized, candidate)
         parsed = urlparse(candidate)
-        excluded = None if _same_domain(candidate, host) else "off_domain"
+        if not _same_domain(candidate, host):
+            items.append(
+                DiscoveredURL(
+                    url=candidate,
+                    source_sitemap="manual",
+                    selected=False,
+                    excluded_reason="off_domain",
+                    path_category=category_from_path(parsed.path),
+                )
+            )
+            continue
         items.append(
-            DiscoveredURL(
-                url=candidate,
-                source_sitemap="manual",
-                selected=excluded is None,
-                excluded_reason=excluded,
-                path_category=category_from_path(parsed.path),
+            apply_policy_to_discovered_url(
+                DiscoveredURL(
+                    url=candidate,
+                    source_sitemap="manual",
+                    selected=True,
+                    path_category=category_from_path(parsed.path),
+                )
             )
         )
     deduped: dict[str, DiscoveredURL] = {}
