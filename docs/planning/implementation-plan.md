@@ -83,7 +83,7 @@ cd frontend && npm run build
 
 ```bash
 python -m py_compile app.py src/scrape_planner/wiki/llm_wiki_builder.py src/scrape_planner/wiki/llm_wiki_index.py src/scrape_planner/wiki/wiki_ingestion_pipeline.py mcp_servers/llm_wiki_mcp.py
-pytest -q tests/test_llm_wiki_builder.py tests/test_llm_wiki_index.py tests/test_wiki_ingestion_pipeline.py tests/test_wiki_ui.py tests/test_llm_wiki_mcp.py tests/test_wiki_graph_artifacts.py
+pytest -q tests/test_llm_wiki_builder.py tests/test_llm_wiki_index.py tests/test_wiki_ingestion_pipeline.py tests/test_wiki_ui.py tests/test_llm_wiki_mcp.py
 ```
 
 Webapp (worktree):

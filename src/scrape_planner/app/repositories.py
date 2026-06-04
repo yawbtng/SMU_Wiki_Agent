@@ -16,7 +16,7 @@ from .artifact_contracts import (
     WorkspaceContract,
 )
 from ..runtime.run_persistence import read_run_status
-from ..core.site_layout import SiteLayout, site_layout
+from ..core.site_layout import SiteLayout, site_layout, site_root_for
 from ..sources.source_registry import read_registry_rows
 from ..wiki.stepper_status import (
     load_embedding_status,
@@ -28,16 +28,12 @@ from ..wiki.stepper_status import (
 from ..core.storage import read_json, write_json
 
 
-def _site_root(data_root: Path, site_id: str) -> Path:
-    return Path(data_root) / "sites" / str(site_id)
-
-
 def _run_root(data_root: Path, site_id: str, run_id: str) -> Path:
-    return _site_root(data_root, site_id) / str(run_id)
+    return site_root_for(data_root, site_id) / str(run_id)
 
 
 def _site_layout(data_root: Path, site_id: str) -> SiteLayout:
-    return site_layout(_site_root(data_root, site_id))
+    return site_layout(site_root_for(data_root, site_id))
 
 
 def _is_scalar_stringish(value: Any) -> bool:
@@ -130,10 +126,6 @@ def _normalize_string_mapping(value: Any) -> dict[str, str]:
             continue
         normalized[str(key)] = str(item)
     return normalized
-
-
-def _normalize_provider(value: Any = None, default: str = "openrouter") -> str:
-    return "openrouter"
 
 
 def _normalize_browser_mode(value: Any, default: str = "none") -> str:
@@ -298,7 +290,7 @@ class SiteArtifactRepository:
         self.data_root = Path(data_root)
 
     def site_root(self, site_id: str) -> Path:
-        return _site_root(self.data_root, site_id)
+        return site_root_for(self.data_root, site_id)
 
     def run_root(self, site_id: str, run_id: str) -> Path:
         return _run_root(self.data_root, site_id, run_id)

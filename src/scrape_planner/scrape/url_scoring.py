@@ -167,10 +167,3 @@ def score_url(url_item: dict[str, Any], *, target_year: int = TARGET_YEAR) -> di
         "scrape_value": scrape_value,
     }
 
-
-def select_scored_urls(scored: list[dict[str, Any]], *, threshold: int = DEFAULT_THRESHOLD) -> list[dict[str, Any]]:
-    return [
-        {"url": item["url"], "priority": item["score"], "reason": item["reason"]}
-        for item in scored
-        if int(item.get("score") or 0) >= threshold
-    ]

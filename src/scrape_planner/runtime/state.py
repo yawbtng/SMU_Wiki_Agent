@@ -119,10 +119,3 @@ class RunStateStore:
 
     def get_pause(self, site_id: str, run_id: str) -> bool:
         return self._get(f"site:{site_id}:run:{run_id}:pause") == "1"
-
-    def clear_run(self, site_id: str, run_id: str) -> None:
-        self._delete(f"site:{site_id}:run:{run_id}:status")
-        self._delete(f"site:{site_id}:run:{run_id}:events")
-        self._delete(f"site:{site_id}:run:{run_id}:pages")
-        self._delete(f"site:{site_id}:run:{run_id}:cancel")
-        self._delete(f"site:{site_id}:run:{run_id}:pause")

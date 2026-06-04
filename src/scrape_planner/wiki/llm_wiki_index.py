@@ -18,7 +18,7 @@ import requests
 from ..runtime.run_persistence import _append_jsonl, _write_json_atomic
 from ..runtime.agent_run_metrics import AgentRunMetricsRepository, build_embedding_metric_event
 from ..core.site_layout import ensure_layout_for_site_root, site_layout
-from ..sources.source_registry import checksum_file, read_registry_rows, utc_now_iso
+from ..sources.source_registry import checksum_file, checksum_text, read_registry_rows, utc_now_iso
 from ..core.wiki_common import parse_markdown_frontmatter, site_relative, strip_markdown_frontmatter, timestamp_slug
 from ..index.embedding_client import embed_text, embedding_config_from_env
 from .confidence import assess_confidence
@@ -890,7 +890,7 @@ def _raw_documents(site_root: Path, *, chunk_chars: int, overlap: int) -> tuple[
         except OSError as exc:
             invalid.append({"source_id": source_id, "path": rel_path, "reason": f"raw_source_unreadable:{exc}"})
             continue
-        checksum = _checksum_text(text)
+        checksum = checksum_text(text)
         registry_checksum = str(row.get("checksum") or "")
         parser_metadata, parser_metadata_checksum, parser_metadata_error = _read_parser_metadata(
             site_root,
@@ -1982,11 +1982,6 @@ def _token_counts(text: str) -> dict[str, int]:
     return counts
 
 
-def _embedding_vector(text: str, *, dimensions: int = EMBEDDING_DIMENSIONS) -> list[float]:
-    vector, _space = _embedding_vector_and_space(text, dimensions=dimensions)
-    return vector
-
-
 def _embedding_vector_and_space(
     text: str,
     *,
@@ -2113,10 +2108,6 @@ def _resolve_site_path(site_root: Path, rel_path: str) -> tuple[Path | None, str
     except (OSError, ValueError):
         return None, "path_escapes_site_root"
     return resolved, ""
-
-
-def _checksum_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
 def _keyword_score(tokens: list[str], title: str, text: str) -> float:

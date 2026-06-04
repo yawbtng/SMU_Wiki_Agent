@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,6 +13,8 @@ from ..wiki.self_improving import assess_candidate_source, enforce_manual_run_re
 from ..sources.raw_source_normalizer import normalize_scraped_markdown
 from ..sources.source_registry import checksum_text
 from ..core.site_layout import ensure_layout_for_site_root
+from ..core.time import utc_now_iso, utc_now_timestamp
+from ..core.url_utils import slug_from_url
 from .sitemap_discovery import apply_manual_urls
 from .url_policy import classify_url_for_student_wiki
 from ..core.storage import ensure_run_dirs, write_json
@@ -35,7 +35,7 @@ def run_manual_url_pipeline(
     job_status_file: Path | None = None,
     question: str = "",
 ) -> dict[str, Any]:
-    timestamp = now or datetime.now(timezone.utc).isoformat()
+    timestamp = now or utc_now_iso()
     layout = ensure_layout_for_site_root(Path(site_root))
     normalized_url = canonicalize_url(str(url or "").strip())
     status_path = Path(job_status_file) if job_status_file else None
@@ -50,7 +50,7 @@ def run_manual_url_pipeline(
             "question": question,
             "reason": reason,
             "source_ids": list(source_ids or []),
-            "updated_at": int(datetime.now(timezone.utc).timestamp()),
+            "updated_at": int(utc_now_timestamp()),
         }
         if extra:
             payload.update(extra)
@@ -79,7 +79,7 @@ def run_manual_url_pipeline(
                 "reason": "pre_fetch_short_circuit",
             }
 
-        run_id = f"manual-{_safe_timestamp(timestamp)}-{_slug_from_url(normalized_url)}"
+        run_id = f"manual-{_safe_timestamp(timestamp)}-{slug_from_url(normalized_url)}"
         run_root = layout.site_root / run_id
         dirs = ensure_run_dirs(run_root)
         write_json(run_root / "selected_urls.json", [accepted[0].to_dict()])
@@ -105,7 +105,7 @@ def run_manual_url_pipeline(
                 "quality_gate": quality.to_dict(),
             }
 
-        slug = _slug_from_url(normalized_url)
+        slug = slug_from_url(normalized_url)
         raw_html_path = dirs["raw_html"] / f"{slug}.html"
         markdown_path = dirs["markdown"] / f"{slug}.md"
         metadata_path = dirs["metadata"] / f"{slug}.json"
@@ -206,10 +206,6 @@ def _report_dict(report: Any) -> dict[str, Any]:
         "report_path": str(report.report_path),
         "sources": list(report.sources),
     }
-
-
-def _slug_from_url(url: str) -> str:
-    return hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
 
 
 def _safe_timestamp(value: str) -> str:

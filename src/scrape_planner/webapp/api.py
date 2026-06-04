@@ -495,17 +495,6 @@ def scrape_runner() -> ScrapeRunner:
         return _scrape_runner
 
 
-def _url_selection_guidance() -> str:
-    path = PROJECT_ROOT / "prompts" / "pi_url_selection_prompt.md"
-    if not path.exists():
-        return ""
-    text = path.read_text(encoding="utf-8")
-    marker = "<URLs>"
-    if marker in text:
-        return text.split(marker)[0].strip()
-    return text.strip()
-
-
 def start_scrape_payload(
     site_id: str,
     *,

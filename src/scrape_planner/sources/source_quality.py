@@ -230,7 +230,3 @@ def _looks_like_chrome_line(line: str) -> bool:
     if " | " in normalized and sum(1 for part in normalized.split("|") if part.strip()) >= 4:
         return True
     return bool(re.fullmatch(r"(home|about|academics|admissions?|apply|search|menu)(\s+/\s+.*)?", normalized))
-
-
-def _has_useful_short_signal(text: str) -> bool:
-    return bool(CONTACT_SIGNAL_RE.search(text))

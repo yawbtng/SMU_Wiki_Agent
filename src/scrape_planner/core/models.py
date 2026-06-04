@@ -1,10 +1,7 @@
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from typing import Any, Optional
 
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from .time import utc_now_iso
 
 
 @dataclass

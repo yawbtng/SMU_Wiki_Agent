@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, MutableMapping
 
-from .artifact_contracts import AppStateContract
 from .repositories import AppStateRepository, SiteArtifactRepository, SiteStatusReadModel
 
 
@@ -35,21 +34,3 @@ class AppContext:
     app_state: AppStateRepository
     site_artifacts: SiteArtifactRepository
     site_status: SiteStatusReadModel
-
-    @classmethod
-    def build(
-        cls,
-        *,
-        data_root: Path,
-        session_state: MutableMapping[str, Any],
-        app_state_path: Path | None = None,
-        app_state_defaults: AppStateContract | None = None,
-    ) -> "AppContext":
-        root = Path(data_root)
-        return cls(
-            data_root=root,
-            session=SessionAdapter(session_state),
-            app_state=AppStateRepository(app_state_path or (root / "app_state.json"), defaults=app_state_defaults),
-            site_artifacts=SiteArtifactRepository(root),
-            site_status=SiteStatusReadModel(root),
-        )

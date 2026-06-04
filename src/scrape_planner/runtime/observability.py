@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ..core.storage import read_json, write_json
+from ..core.time import utc_now_iso
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now_iso()
 
 
 def append_event(run_root: Path, event: dict[str, Any]) -> None:

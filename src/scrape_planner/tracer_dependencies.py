@@ -9,12 +9,6 @@ STALE_REASON_SOURCE_HASH_CHANGED: Literal["source_hash_changed"] = "source_hash_
 
 
 @dataclass(frozen=True)
-class SourceHashState:
-    source_id: str
-    content_hash: str
-
-
-@dataclass(frozen=True)
 class StaleTransitionRecord:
     source_id: str
     old_hash: str

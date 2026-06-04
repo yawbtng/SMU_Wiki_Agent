@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import os
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from ..core.env import float_env
 from .leadership import extract_leadership_from_evidence
 from .query_intent import is_person_lookup_query
 
@@ -33,12 +33,12 @@ class ConfidenceDecision:
 def confidence_thresholds_for_mode(mode: str) -> tuple[float, float]:
     if mode == "reranked":
         return (
-            _float_env("RAG_CONFIDENCE_MIN_SCORE_RERANKED", DEFAULT_MIN_SCORE_RERANKED),
-            _float_env("RAG_CONFIDENCE_MIN_GAP_RERANKED", DEFAULT_MIN_GAP_RERANKED),
+            float_env("RAG_CONFIDENCE_MIN_SCORE_RERANKED", DEFAULT_MIN_SCORE_RERANKED),
+            float_env("RAG_CONFIDENCE_MIN_GAP_RERANKED", DEFAULT_MIN_GAP_RERANKED),
         )
     return (
-        _float_env("RAG_CONFIDENCE_MIN_SCORE_FUSED", DEFAULT_MIN_SCORE_FUSED),
-        _float_env("RAG_CONFIDENCE_MIN_GAP_FUSED", DEFAULT_MIN_GAP_FUSED),
+        float_env("RAG_CONFIDENCE_MIN_SCORE_FUSED", DEFAULT_MIN_SCORE_FUSED),
+        float_env("RAG_CONFIDENCE_MIN_GAP_FUSED", DEFAULT_MIN_GAP_FUSED),
     )
 
 
@@ -164,13 +164,3 @@ def _has_citation(item: dict[str, Any]) -> bool:
         return True
     provenance = metadata.get("provenance") if isinstance(metadata.get("provenance"), dict) else {}
     return bool(str(provenance.get("url") or provenance.get("source_url") or "").strip())
-
-
-def _float_env(name: str, default: float) -> float:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default

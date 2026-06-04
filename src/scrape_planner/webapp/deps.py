@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +10,7 @@ from ..app import APP_STATE_DEFAULTS
 from ..app.repositories import AppStateRepository, SiteArtifactRepository, SiteStatusReadModel
 from ..runtime.agent_run_metrics import AgentRunMetricsRepository
 from ..core.data_root import resolve_data_root
+from ..core.time import utc_now_iso
 from ..wiki.stepper_status import read_jsonl_rows
 from ..infra.tmux_runner import TmuxRunner
 
@@ -26,7 +26,7 @@ def app_state_path() -> Path:
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now_iso()
 
 
 def to_jsonable(value: Any) -> Any:

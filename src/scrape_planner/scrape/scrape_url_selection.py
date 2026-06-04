@@ -1,29 +1,15 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from ..core.models import DiscoveredURL
 from ..core.storage import read_json
+from ..core.url_utils import parse_approved_urls_markdown
 from .url_policy import classify_url_for_student_wiki
 
 APPROVED_URLS_MARKER = "scrape-planner:approved-urls:v1"
-URL_RE = re.compile(r"https?://[^\s)\]}>\"']+")
-
-
-def parse_approved_urls_markdown(markdown: str) -> list[str]:
-    urls: list[str] = []
-    seen: set[str] = set()
-    for match in URL_RE.finditer(markdown or ""):
-        url = match.group(0).rstrip(".,;")
-        if url not in seen:
-            seen.add(url)
-            urls.append(url)
-    return urls
-
-
 def approved_urls_path(site_root: Path) -> Path:
     return Path(site_root) / "approved_urls.md"
 

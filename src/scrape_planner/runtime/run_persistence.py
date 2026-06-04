@@ -42,10 +42,6 @@ def read_run_status(run_root: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def append_run_event(run_root: Path, event: dict[str, Any]) -> None:
-    _append_jsonl(run_root / "events.jsonl", event)
-
-
 def read_run_events(run_root: Path, limit: int | None = None) -> list[dict[str, Any]]:
     events = read_jsonl(run_root / "events.jsonl")
     if limit is None or limit <= 0:

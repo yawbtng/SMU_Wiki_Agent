@@ -6,6 +6,8 @@ from typing import Any
 
 import requests
 
+from ..core.env import float_env
+
 
 DEFAULT_OPENROUTER_EMBED_MODEL = "openai/text-embedding-3-small"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -25,7 +27,7 @@ def embedding_config_from_env() -> EmbeddingClientConfig:
         provider="openrouter",
         model=os.getenv("OPENROUTER_EMBED_MODEL", DEFAULT_OPENROUTER_EMBED_MODEL).strip() or DEFAULT_OPENROUTER_EMBED_MODEL,
         base_url=os.getenv("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL).strip() or DEFAULT_OPENROUTER_BASE_URL,
-        timeout_seconds=_float_env("OPENROUTER_EMBED_TIMEOUT", 30.0),
+        timeout_seconds=float_env("OPENROUTER_EMBED_TIMEOUT", 30.0),
         api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
     )
 
@@ -67,13 +69,3 @@ def _float_vector(values: Any) -> list[float]:
     if not isinstance(values, list):
         raise ValueError("embedding vector is not a list")
     return [float(value) for value in values]
-
-
-def _float_env(name: str, default: float) -> float:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default

@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
-
-from .models import DiscoveredURL
 
 
 def ensure_run_dirs(base: Path) -> dict[str, Path]:
@@ -73,7 +70,3 @@ def read_json(path: Path, default: Any) -> Any:
             return value
         except json.JSONDecodeError:
             return default
-
-
-def persist_discovered(path: Path, discovered: list[DiscoveredURL]) -> None:
-    write_json(path, [asdict(item) for item in discovered])

@@ -6,11 +6,12 @@ import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
+
+from ..core.time import utc_now_iso
 
 
 REGISTRY_STATUSES = {"ready", "failed", "needs-review"}
@@ -28,10 +29,6 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 class RegistryMergeResult:
     rows: list[dict[str, Any]]
     counts: dict[str, int]
-
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def checksum_text(text: str) -> str:

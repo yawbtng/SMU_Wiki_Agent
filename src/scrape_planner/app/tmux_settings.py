@@ -10,7 +10,6 @@ from .artifact_contracts import APP_STATE_DEFAULTS, AppStateContract
 from .repositories import _normalize_app_state_payload
 
 DEFAULT_GRACE_SECONDS = 30 * 60
-DEFAULT_ARCHIVE_SUBDIR = "wiki/reports/tmux-archives"
 VALID_WIKI_RUNTIMES = frozenset({"pi", "python"})
 
 
@@ -82,13 +81,6 @@ def pi_cmd(*, override: str | None = None) -> str:
         return str(override).strip() or "pi"
     stored = str(load_app_state().get("pi_cmd") or "pi").strip()
     return stored or "pi"
-
-
-def tmux_archive_subdir(*, override: str | None = None) -> str:
-    if override:
-        return str(override).strip() or DEFAULT_ARCHIVE_SUBDIR
-    stored = str(load_app_state().get("tmux_archive_subdir") or DEFAULT_ARCHIVE_SUBDIR).strip()
-    return stored or DEFAULT_ARCHIVE_SUBDIR
 
 
 def _normalize_wiki_runtime(value: str) -> str:

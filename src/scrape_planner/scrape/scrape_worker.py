@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -17,6 +16,8 @@ import requests
 from .content_extract import extract_content
 from .failure_classifier import classify_failure, to_failure_record
 from ..core.models import DiscoveredURL, PageResult
+from ..core.time import utc_now_iso
+from ..core.url_utils import slug_from_url
 from ..pdf.pdf_ingest import PdfIngestConfig, ingest_pdfs
 from ..runtime.run_persistence import read_page_states, upsert_page_state, write_page_states, write_run_status
 from ..runtime.state import RunStateStore
@@ -35,15 +36,11 @@ class ScrapeInterrupted(RuntimeError):
         self.reason = reason
 
 
-def _slug_from_url(url: str) -> str:
-    return hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
-
-
 def _safe_pdf_filename(url: str) -> str:
-    path_name = Path(urlparse(url).path).name or f"{_slug_from_url(url)}.pdf"
+    path_name = Path(urlparse(url).path).name or f"{slug_from_url(url)}.pdf"
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", path_name).strip(".-")
     if not cleaned.lower().endswith(".pdf"):
-        cleaned = f"{cleaned or _slug_from_url(url)}.pdf"
+        cleaned = f"{cleaned or slug_from_url(url)}.pdf"
     return cleaned[:160]
 
 
@@ -53,7 +50,7 @@ def _is_pdf_url(item: DiscoveredURL) -> bool:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now_iso()
 
 
 def _duration_ms(start_iso: str | None) -> int:
@@ -122,9 +119,6 @@ class ScrapeRunner:
         )
         self._threads[key] = thread
         thread.start()
-
-    def cancel(self, site_id: str, run_id: str) -> None:
-        self.state.set_cancel(site_id, run_id, True)
 
     def pause(self, site_id: str, run_id: str) -> None:
         self.state.set_pause(site_id, run_id, True)
@@ -458,7 +452,7 @@ class ScrapeRunner:
                     )
                     break
 
-                slug = _slug_from_url(item.url)
+                slug = slug_from_url(item.url)
                 raw_html_path = dirs["raw_html"] / f"{slug}.html"
                 md_path = dirs["markdown"] / f"{slug}.md"
                 meta_path = dirs["metadata"] / f"{slug}.json"

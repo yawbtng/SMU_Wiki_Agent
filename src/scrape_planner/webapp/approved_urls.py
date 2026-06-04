@@ -10,27 +10,16 @@ from urllib.parse import urlparse
 from fastapi import HTTPException
 
 from ..core.storage import read_json, write_json
+from ..core.url_utils import APPROVED_URL_RE, parse_approved_urls_markdown
 from ..scrape.url_policy import classify_url_for_student_wiki
 from .deps import site_root, to_jsonable, utc_now
 from .schemas import ApprovedUrlsChatRequest, ApprovedUrlsCommitRequest
 
 APPROVED_URLS_HEADER = "# Approved URLs\n\n<!-- scrape-planner:approved-urls:v1 -->\n"
-URL_RE = re.compile(r"https?://[^\s)\]}>\"']+")
 
 
 def approved_urls_path(site_id: str) -> Path:
     return site_root(site_id) / "approved_urls.md"
-
-
-def parse_approved_urls_markdown(markdown: str) -> list[str]:
-    urls: list[str] = []
-    seen: set[str] = set()
-    for match in URL_RE.finditer(markdown or ""):
-        url = match.group(0).rstrip(".,;")
-        if url not in seen:
-            seen.add(url)
-            urls.append(url)
-    return urls
 
 
 SCHOOL_PATH_ROOTS = {"cox", "dedman", "dedmanlaw", "lyle", "meadows", "simmons", "perkins"}
@@ -161,7 +150,7 @@ def _append_approval_chat_event(site_id: str, event: dict[str, Any]) -> None:
 def _approved_url_lines(markdown: str) -> dict[str, str]:
     lines: dict[str, str] = {}
     for line in (markdown or "").splitlines():
-        match = URL_RE.search(line)
+        match = APPROVED_URL_RE.search(line)
         if not match:
             continue
         url = match.group(0).rstrip(".,;")
@@ -185,7 +174,7 @@ def _render_approved_urls_markdown(lines_by_url: dict[str, str], *, note: str = 
 def _message_urls(message: str) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
-    for match in URL_RE.finditer(message or ""):
+    for match in APPROVED_URL_RE.finditer(message or ""):
         url = match.group(0).rstrip(".,;")
         if url not in seen:
             seen.add(url)

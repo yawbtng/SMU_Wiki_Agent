@@ -5,11 +5,10 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from ..pdf.pdf_ingest import PdfIngestConfig, ingest_pdfs
-from ..core.storage import read_json, write_json
-from .embedding_client import EmbeddingClientConfig, embed_text, embedding_config_from_env
+from ..core.storage import read_json
 
 
 @dataclass(frozen=True)
@@ -46,85 +45,6 @@ def load_index_docs(run_root: Path, *, ingest_uploaded_pdfs: bool = True) -> lis
     docs.extend(_load_wiki_docs(run_root))
     docs.extend(_load_pdf_chunk_docs(run_root, ingest_uploaded_pdfs=ingest_uploaded_pdfs))
     return _dedupe_docs(docs)
-
-
-def build_zvec_index(
-    run_root: Path,
-    *,
-    db_path: Path | None = None,
-    model: str = "openai/text-embedding-3-small",
-    chunk_chars: int = 1800,
-    embed_fn: Callable[[str], list[float]] | None = None,
-) -> dict[str, Any]:
-    try:
-        import zvec
-    except Exception as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError(
-            "zvec is not installed. Use Python 3.10+ and install optional dependencies with: "
-            "pip install -r requirements.txt. "
-            f"Error: {exc}"
-        ) from exc
-
-    run_root = run_root.resolve()
-    db_path = (db_path or (run_root / "zvec_index")).resolve()
-    docs = load_index_docs(run_root)
-    if not docs:
-        raise ValueError(f"No raw scrape, wiki, or PDF docs found under {run_root}")
-
-    cfg = embedding_config_from_env()
-    embed_config = EmbeddingClientConfig(
-        provider="openrouter",
-        model=model or cfg.model,
-        base_url=cfg.base_url,
-        timeout_seconds=max(cfg.timeout_seconds, 120),
-        api_key=cfg.api_key,
-    )
-    embed = embed_fn or (lambda text: embed_text(text, embed_config))
-    first_text = docs[0].text[:chunk_chars]
-    first_embedding = embed(first_text)
-    schema = _create_schema(zvec, dimension=len(first_embedding))
-    collection = zvec.create_and_open(path=str(db_path), schema=schema)
-
-    zdocs = []
-    count = 0
-    by_kind: dict[str, int] = {}
-    for doc in docs:
-        by_kind[doc.source_kind] = by_kind.get(doc.source_kind, 0) + 1
-        for idx, chunk in enumerate(chunks(doc.text, chunk_chars=chunk_chars), start=1):
-            embedding = first_embedding if count == 0 else embed(chunk)
-            doc_id = hashlib.sha1(f"{doc.source_kind}:{doc.source_id}:{idx}".encode("utf-8")).hexdigest()
-            zdocs.append(
-                zvec.Doc(
-                    id=doc_id,
-                    vectors={"embedding": embedding},
-                    fields={
-                        "text": chunk,
-                        "title": doc.title,
-                        "url": doc.url,
-                        "path": doc.path,
-                        "source_kind": doc.source_kind,
-                        "source_id": doc.source_id,
-                    },
-                )
-            )
-            count += 1
-            if len(zdocs) >= 64:
-                _write_docs(collection, zdocs)
-                zdocs = []
-    if zdocs:
-        _write_docs(collection, zdocs)
-    collection.optimize()
-
-    out = {
-        "db_path": str(db_path),
-        "docs": len(docs),
-        "chunks": count,
-        "docs_by_kind": by_kind,
-        "embedding_model": model,
-        "dimension": len(first_embedding),
-    }
-    write_json(run_root / "zvec_index_manifest.json", out)
-    return out
 
 
 def _load_raw_scrape_docs(run_root: Path) -> list[IndexDoc]:
@@ -221,32 +141,6 @@ def _materialize_uploaded_pdf_chunks(run_root: Path) -> None:
     _merge_jsonl(s05 / "pdf_sources.jsonl", [row.to_dict() for row in result.sources], key="pdf_source_id")
     _merge_jsonl(s05 / "pdf_chunks.jsonl", [row.to_dict() for row in result.chunks], key="chunk_id")
     _merge_jsonl(s05 / "pdf_quarantine.jsonl", [row.to_dict() for row in result.quarantine], key="pdf_source_id")
-
-
-def _create_schema(zvec: Any, *, dimension: int) -> Any:
-    return zvec.CollectionSchema(
-        name="smu_wiki",
-        fields=[
-            zvec.FieldSchema(name="text", data_type=zvec.DataType.STRING),
-            zvec.FieldSchema(name="title", data_type=zvec.DataType.STRING),
-            zvec.FieldSchema(name="url", data_type=zvec.DataType.STRING),
-            zvec.FieldSchema(name="path", data_type=zvec.DataType.STRING),
-            zvec.FieldSchema(name="source_kind", data_type=zvec.DataType.STRING),
-            zvec.FieldSchema(name="source_id", data_type=zvec.DataType.STRING),
-        ],
-        vectors=[
-            zvec.VectorSchema(
-                name="embedding",
-                data_type=zvec.DataType.VECTOR_FP32,
-                dimension=dimension,
-                index_param=zvec.HnswIndexParam(metric_type=zvec.MetricType.COSINE),
-            )
-        ],
-    )
-
-
-def _write_docs(collection: Any, docs: list[Any]) -> None:
-    collection.upsert(docs) if hasattr(collection, "upsert") else collection.insert(docs)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
