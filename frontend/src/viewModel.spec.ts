@@ -4,6 +4,11 @@ import {
   buildMetricsModel,
   buildMetricsRollupPoints,
   buildMetricsRunTrendPoints,
+  chartBarHeightPercent,
+  formatChartMetricValue,
+  metricsChartRangeLabel,
+  metricsRollupCostAmount,
+  metricsRunCostAmount,
   buildOverviewModel,
   buildScrapeModel,
   formatCost,
@@ -196,8 +201,41 @@ if (vectorOnlyTrend[0]?.tokens !== 42) {
   throw new Error('metrics trend should fall back to embedding vectors when tokens are missing');
 }
 
-if (vectorOnlyTrend[0]?.label !== '1' || vectorOnlyTrend[0]?.detail !== 'embedding-manual-1') {
-  throw new Error('metrics trend labels should use run sequence numbers with run id in detail');
+if (!vectorOnlyTrend[0]?.label.includes('manual-1') || vectorOnlyTrend[0]?.detail !== 'embedding-manual-1') {
+  throw new Error('metrics trend labels should shorten run ids with full id in detail');
+}
+
+const estimatedCostTrend = buildMetricsRunTrendPoints([
+  {
+    run_id: 'embed-run-a',
+    embedding_usage: { input_tokens: 1_000_000, vector_count: 62 },
+    cost: { amount_usd: null, source: 'unknown' },
+  },
+]);
+
+if (estimatedCostTrend[0]?.cost !== 0.02) {
+  throw new Error('metrics trend should estimate embedding cost from input tokens when run cost is unknown');
+}
+
+if (chartBarHeightPercent(62, [62, 62, 62]) !== 72) {
+  throw new Error('equal bar values should use a stable medium height instead of all maxed out');
+}
+
+if (metricsChartRangeLabel([62, 62], 'tokens') !== 'Each: 62') {
+  throw new Error('chart range label should explain uniform values');
+}
+
+if (formatChartMetricValue(0.02, 'cost') !== '$0.0200') {
+  throw new Error('chart cost formatting should show micro-dollar precision');
+}
+
+const rollupCost = metricsRollupCostAmount({
+  total_cost: { amount_usd: null, source: 'unknown' },
+  embedding_tokens: 500_000,
+});
+
+if (rollupCost !== 0.01) {
+  throw new Error('rollup chart should estimate cost from embedding tokens when total cost is unknown');
 }
 
 const vectorRollups = buildMetricsRollupPoints({

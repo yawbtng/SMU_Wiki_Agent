@@ -150,8 +150,71 @@ export function metricCostAmount(cost: MetricCost | null | undefined): number {
   return Number.isFinite(amount) ? amount : 0;
 }
 
-export function shortMetricsRunLabel(_value: unknown, index: number): string {
-  return String(index + 1);
+/** OpenRouter list price for default embedding model (USD per 1M input tokens). */
+const EMBEDDING_COST_PER_MILLION_INPUT = 0.02;
+
+function estimateEmbeddingCostUsd(inputTokens: number): number {
+  if (!Number.isFinite(inputTokens) || inputTokens <= 0) return 0;
+  return Math.round((inputTokens / 1_000_000) * EMBEDDING_COST_PER_MILLION_INPUT * 1e8) / 1e8;
+}
+
+export function metricsRunCostAmount(run: AgentRunSummary): number {
+  const top = metricCostAmount(run.cost);
+  if (top > 0) return top;
+  const llm = metricCostAmount(run.llm_usage?.cost as MetricCost | undefined);
+  const embedding = metricCostAmount(run.embedding_usage?.cost as MetricCost | undefined);
+  const combined = llm + embedding;
+  if (combined > 0) return combined;
+  const inputTokens = Number(run.embedding_usage?.input_tokens ?? 0);
+  return estimateEmbeddingCostUsd(inputTokens);
+}
+
+export function metricsRollupCostAmount(rollup?: MetricsRollup): number {
+  const total = metricCostAmount(rollup?.total_cost);
+  if (total > 0) return total;
+  const embedding = metricCostAmount(rollup?.embedding_cost);
+  if (embedding > 0) return embedding;
+  const tokens = Number(rollup?.embedding_tokens ?? 0);
+  return estimateEmbeddingCostUsd(tokens);
+}
+
+export function shortMetricsRunLabel(runId: unknown, index: number): string {
+  const id = String(runId ?? '').trim();
+  if (!id) return String(index + 1);
+  if (id.length <= 12) return id;
+  return `…${id.slice(-10)}`;
+}
+
+export function chartBarHeightPercent(value: number, values: number[]): number {
+  const positives = values.filter((entry) => entry > 0);
+  const max = Math.max(...positives, 0);
+  if (value <= 0 || max <= 0) return 0;
+  if (positives.length <= 1 || positives.every((entry) => entry === max)) return 72;
+  const min = Math.min(...positives);
+  const floor = min > 0 ? min * 0.92 : 0;
+  const span = Math.max(max - floor, max * 0.08);
+  const normalized = (value - floor) / span;
+  return Math.min(92, Math.max(16, normalized * 92));
+}
+
+export function formatChartMetricValue(value: number, valueKey: keyof MetricsChartPoint): string {
+  if (valueKey === 'cost') {
+    if (value >= 1) return `$${value.toFixed(2)}`;
+    if (value > 0) return `$${value.toFixed(4)}`;
+    return '$0';
+  }
+  return formatCompact(value);
+}
+
+export function metricsChartRangeLabel(values: number[], valueKey: keyof MetricsChartPoint): string {
+  const positives = values.filter((value) => value > 0);
+  if (!positives.length) return '';
+  const min = Math.min(...positives);
+  const max = Math.max(...positives);
+  if (min === max) {
+    return `Each: ${formatChartMetricValue(max, valueKey)}`;
+  }
+  return `Low ${formatChartMetricValue(min, valueKey)} · High ${formatChartMetricValue(max, valueKey)}`;
 }
 
 export function buildMetricsRunTrendPoints(runs: AgentRunSummary[]): MetricsChartPoint[] {
@@ -163,7 +226,7 @@ export function buildMetricsRunTrendPoints(runs: AgentRunSummary[]): MetricsChar
       detail: String(run.run_id ?? '').trim() || undefined,
       tokens: metricsRunChartValue(run),
       vectors: metricsRunVectors(run),
-      cost: metricCostAmount(run.cost),
+      cost: metricsRunCostAmount(run),
       runs: 1,
     }));
 }
@@ -176,7 +239,7 @@ export function buildMetricsRollupPoints(rollups: Record<string, MetricsRollup |
         label: label === '365d' ? '1y' : label.replace('_', ' '),
         tokens: metricsRollupChartValue(rollup),
         vectors: metricsRollupVectors(rollup),
-        cost: metricCostAmount(rollup.total_cost),
+        cost: metricsRollupCostAmount(rollup),
         runs: Number(rollup.run_count ?? 0) || 0,
       };
     })

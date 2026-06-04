@@ -25,8 +25,11 @@ import {
   buildMetricsRunTrendPoints,
   buildOverviewModel,
   buildScrapeModel,
+  chartBarHeightPercent,
+  formatChartMetricValue,
   formatCount,
   formatCompact,
+  metricsChartRangeLabel,
   metricsTokenMixSegments,
   resolveWikiJobStatus,
   scrapeStartPayload,
@@ -2620,33 +2623,39 @@ function MiniBarChart({
   valueLabel: string;
 }) {
   const values = points.map((point) => chartMetricValue(point, valueKey));
-  const max = Math.max(...values, 0);
   const hasValues = values.some((value) => value > 0);
+  const rangeLabel = metricsChartRangeLabel(values, valueKey);
   return (
     <article className="metric-chart-card">
-      <div className="metric-chart-title">{title}</div>
+      <div className="metric-chart-head">
+        <div className="metric-chart-title">{title}</div>
+        {rangeLabel ? <div className="metric-chart-range">{rangeLabel}</div> : null}
+      </div>
       {points.length && hasValues ? (
         <div className="metric-bars" role="img" aria-label={title}>
-          {points.map((point) => {
+          {points.map((point, index) => {
             const value = chartMetricValue(point, valueKey);
-            const share = max > 0 && value > 0 ? value / max : 0;
-            const height = share > 0 ? Math.max(share * 100, 10) : 0;
-            const markerValue = value > 0 ? formatCompact(value) : null;
+            const height = chartBarHeightPercent(value, values);
+            const formatted = formatChartMetricValue(value, valueKey);
             const tooltipLead = point.detail?.trim() || point.label;
             return (
               <div
                 className="metric-bar-column"
                 key={`${title}-${point.label}-${point.detail ?? ''}`}
-                title={`${tooltipLead}: ${formatCount(value)} ${valueLabel}`}
+                title={`${tooltipLead}: ${formatted} ${valueLabel}`}
               >
                 <div className="metric-bar-track">
                   {height > 0 ? (
-                    <div className="metric-bar-fill" style={{ height: `${height}%` }}>
-                      {markerValue ? <span className="metric-bar-marker">{markerValue}</span> : null}
-                    </div>
+                    <div
+                      className="metric-bar-fill"
+                      style={{ height: `${height}%`, opacity: 0.72 + (index % 3) * 0.08 }}
+                    />
                   ) : null}
                 </div>
-                <small className="metric-bar-label">{point.label}</small>
+                <div className="metric-bar-foot">
+                  <strong className="metric-bar-value">{formatted}</strong>
+                  <small className="metric-bar-label">{point.label}</small>
+                </div>
               </div>
             );
           })}
@@ -2670,37 +2679,75 @@ function MiniLineChart({
   valueLabel: string;
 }) {
   const values = points.map((point) => chartMetricValue(point, valueKey));
-  const max = Math.max(...values, 0);
-  const hasValues = values.some((value) => value > 0);
+  const positives = values.filter((value) => value > 0);
+  const max = Math.max(...positives, 0);
+  const min = positives.length ? Math.min(...positives) : 0;
+  const hasValues = positives.length > 0;
+  const rangeLabel = metricsChartRangeLabel(values, valueKey);
+  const plotY = (value: number) => {
+    if (max <= 0) return 92;
+    if (max === min) return 42;
+    const floor = min > 0 ? min * 0.9 : 0;
+    const span = Math.max(max - floor, max * 0.08);
+    return 92 - ((value - floor) / span) * 78;
+  };
   const path = points
     .map((point, index) => {
       const x = points.length <= 1 ? 50 : (index / (points.length - 1)) * 100;
-      const y = max > 0 ? 92 - (chartMetricValue(point, valueKey) / max) * 78 : 92;
+      const y = plotY(chartMetricValue(point, valueKey));
       return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
     })
     .join(' ');
+  const yTicks =
+    max > 0
+      ? max === min
+        ? [max]
+        : [max, (max + min) / 2, min].filter((tick, index, ticks) => index === 0 || tick !== ticks[index - 1])
+      : [];
   return (
     <article className="metric-chart-card">
-      <div className="metric-chart-title">{title}</div>
+      <div className="metric-chart-head">
+        <div className="metric-chart-title">{title}</div>
+        {rangeLabel ? <div className="metric-chart-range">{rangeLabel}</div> : null}
+      </div>
       {points.length && hasValues ? (
-        <div className="metric-line-wrap" role="img" aria-label={title}>
-          <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-            <path className="metric-line-fill" d={`${path} L 100 100 L 0 100 Z`} />
-            <path className="metric-line" d={path} />
-          </svg>
-          <div className="metric-line-labels">
-            {points.map((point) => (
-              <small
-                key={`${title}-${point.label}`}
-                title={`${point.label}: ${chartMetricValue(point, valueKey).toFixed(valueKey === 'cost' ? 4 : 0)} ${valueLabel}`}
-              >
-                {point.label}
-              </small>
-            ))}
+        <div className="metric-line-panel" role="img" aria-label={title}>
+          <div className="metric-line-yaxis">
+            {yTicks
+              .slice()
+              .reverse()
+              .map((tick) => (
+                <span key={`${title}-tick-${tick}`}>{formatChartMetricValue(tick, valueKey)}</span>
+              ))}
+          </div>
+          <div className="metric-line-wrap">
+            <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+              {[25, 50, 75].map((gridY) => (
+                <line key={gridY} className="metric-line-grid" x1="0" y1={gridY} x2="100" y2={gridY} />
+              ))}
+              <path className="metric-line-fill" d={`${path} L 100 100 L 0 100 Z`} />
+              <path className="metric-line" d={path} />
+              {points.map((point, index) => {
+                const x = points.length <= 1 ? 50 : (index / (points.length - 1)) * 100;
+                const y = plotY(chartMetricValue(point, valueKey));
+                return <circle key={`${title}-dot-${point.label}`} className="metric-line-dot" cx={x} cy={y} r="2.4" />;
+              })}
+            </svg>
+            <div className="metric-line-points">
+              {points.map((point) => {
+                const value = chartMetricValue(point, valueKey);
+                return (
+                  <div className="metric-line-point" key={`${title}-${point.label}`} title={`${point.detail ?? point.label}: ${formatChartMetricValue(value, valueKey)}`}>
+                    <strong>{formatChartMetricValue(value, valueKey)}</strong>
+                    <small>{point.label}</small>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </div>
       ) : (
-        <EmptyState message="No cost metrics available yet." />
+        <EmptyState message="No cost data yet. Rebuild the embedding index or run Pi to record spend." />
       )}
     </article>
   );
@@ -2714,9 +2761,13 @@ function TokenMixChart({
   segments: { label: string; value: number; tone: 'llm' | 'embeddings' }[];
 }) {
   const total = segments.reduce((sum, segment) => sum + segment.value, 0);
+  const rangeLabel = total > 0 ? `Total ${formatCount(total)}` : '';
   return (
     <article className="metric-chart-card">
-      <div className="metric-chart-title">{title}</div>
+      <div className="metric-chart-head">
+        <div className="metric-chart-title">{title}</div>
+        {rangeLabel ? <div className="metric-chart-range">{rangeLabel}</div> : null}
+      </div>
       {total > 0 ? (
         <>
           <div className="token-mix-bar">
@@ -2724,8 +2775,8 @@ function TokenMixChart({
               <span
                 key={segment.label}
                 className={`token-mix-${segment.tone}`}
-                style={{ width: `${(segment.value / total) * 100}%` }}
-                title={`${segment.label}: ${formatCount(segment.value)}`}
+                style={{ width: `${Math.max((segment.value / total) * 100, segment.value > 0 ? 8 : 0)}%` }}
+                title={`${segment.label}: ${formatCount(segment.value)} (${Math.round((segment.value / total) * 100)}%)`}
               />
             ))}
           </div>
@@ -2733,7 +2784,7 @@ function TokenMixChart({
             {segments.map((segment) => (
               <span key={segment.label} className={`token-mix-${segment.tone}`}>
                 <i />
-                {segment.label} · {formatCount(segment.value)}
+                {segment.label} · {formatCount(segment.value)} ({Math.round((segment.value / total) * 100)}%)
               </span>
             ))}
           </div>
