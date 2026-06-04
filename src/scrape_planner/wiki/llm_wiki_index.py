@@ -11,16 +11,18 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
 from ..runtime.run_persistence import _append_jsonl, _write_json_atomic
 from ..runtime.agent_run_metrics import AgentRunMetricsRepository, build_embedding_metric_event
+from ..runtime.openrouter_pricing import embedding_price_per_million_input_tokens, resolve_embedding_metric_cost
 from ..core.site_layout import ensure_layout_for_site_root, site_layout
 from ..sources.source_registry import checksum_file, checksum_text, read_registry_rows, utc_now_iso
 from ..core.wiki_common import parse_markdown_frontmatter, site_relative, strip_markdown_frontmatter, timestamp_slug
-from ..index.embedding_client import embed_text, embedding_config_from_env
+from ..index.embedding_client import embed_text, embed_texts, embedding_config_from_env
+from ..index.zvec_store import ZvecStoreUnavailable, query_zvec_documents, replace_zvec_documents, zvec_ready
 from .confidence import assess_confidence
 from .index_lock import site_index_write_lock
 from .leadership import leadership_text_boost
@@ -31,6 +33,7 @@ INDEX_VERSION = "llm-wiki-hybrid-v2"
 EMBEDDING_PROVIDER = "openrouter"
 EMBEDDING_MODEL = os.getenv("OPENROUTER_EMBED_MODEL", "openai/text-embedding-3-small").strip() or "openai/text-embedding-3-small"
 EMBEDDING_DIMENSIONS = int(os.getenv("OPENROUTER_EMBED_DIMENSIONS", "1536") or "1536")
+EMBEDDING_TEXT_CHAR_LIMIT = 8000
 EMBEDDING_SPACE_DENSE = "dense-openrouter"
 EMBEDDING_SPACE_HASH = "hash-fallback"
 FALLBACK_EMBEDDING_PROVIDER = "hash"
@@ -44,6 +47,7 @@ _EMBEDDING_DEGRADED = False
 RAW_SUPPORT_SCORE_FACTOR = 0.05
 RAW_SUPPORT_SCORE_CAP = 0.25
 _LOGGER = logging.getLogger(__name__)
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 try:
     import bm25s as _BM25S_MODULE
@@ -119,6 +123,7 @@ def build_llm_wiki_index(
     chunk_chars: int = 1600,
     overlap: int = 200,
     now: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Build a deterministic dual-corpus index for raw sources and wiki pages."""
     started = time.monotonic()
@@ -139,6 +144,7 @@ def build_llm_wiki_index(
             overlap=overlap,
             timestamp=timestamp,
             started=started,
+            progress_callback=progress_callback,
         )
 
 
@@ -152,6 +158,7 @@ def _build_llm_wiki_index_locked(
     overlap: int,
     timestamp: str,
     started: float,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     previous_docs = _read_documents(docs_path)
     previous_manifest = _read_manifest(manifest_path)
@@ -168,27 +175,65 @@ def _build_llm_wiki_index_locked(
     changed_raw = 0
     changed_wiki = 0
     skipped = 0
+    ordered_doc_ids: list[str] = []
+    reused_rows_by_id: dict[str, dict[str, Any]] = {}
+    changed_docs: list[IndexedDocument] = []
+
     for doc in raw_docs + wiki_docs:
         old = previous_by_id.get(doc.id)
         if old and _document_row_current(old, doc, previous_manifest=previous_manifest):
-            current_docs.append(old)
+            reused_rows_by_id[doc.id] = old
+            ordered_doc_ids.append(doc.id)
             skipped += 1
             continue
-        as_row = _document_row(doc)
-        current_docs.append(as_row)
+        ordered_doc_ids.append(doc.id)
+        changed_docs.append(doc)
         if doc.corpus == "raw":
             changed_raw += 1
         else:
             changed_wiki += 1
-
-    postings = _build_postings(current_docs)
-    _write_documents_jsonl_atomic(docs_path, current_docs)
-    _write_json_atomic(postings_path, postings)
+    progress_plan = _embedding_progress_plan(
+        raw_docs=raw_docs,
+        wiki_docs=wiki_docs,
+        changed_docs=changed_docs,
+        changed_raw=changed_raw,
+        changed_wiki=changed_wiki,
+        skipped=skipped,
+    )
+    _emit_progress(progress_callback, {"stage": "embedding_plan", **progress_plan})
+    changed_rows = _document_rows(
+        changed_docs,
+        progress_callback=progress_callback,
+        progress_context=progress_plan,
+    )
+    changed_rows_by_id = {str(row.get("id") or ""): row for row in changed_rows}
+    for doc_id in ordered_doc_ids:
+        row = reused_rows_by_id.get(doc_id) or changed_rows_by_id.get(doc_id)
+        if row is not None:
+            current_docs.append(row)
 
     raw_count = sum(1 for doc in current_docs if doc.get("corpus") == "raw")
     wiki_count = sum(1 for doc in current_docs if doc.get("corpus") == "wiki")
     index_embedding_space = _index_embedding_space(current_docs)
     degraded = _embedding_degraded() or index_embedding_space == EMBEDDING_SPACE_HASH
+    postings = _build_postings(current_docs)
+    _emit_progress(progress_callback, {"stage": "writing_artifacts", **progress_plan, "document_count": len(current_docs)})
+    _write_documents_jsonl_atomic(docs_path, current_docs)
+    _write_json_atomic(postings_path, postings)
+    _emit_progress(progress_callback, {"stage": "documents_written", **progress_plan, "document_count": len(current_docs)})
+    _emit_progress(progress_callback, {"stage": "zvec_building", **progress_plan, "document_count": len(current_docs)})
+    zvec_report = _build_zvec_store(layout.site_root, current_docs, degraded=degraded)
+    _emit_progress(
+        progress_callback,
+        {
+            "stage": "zvec_ready" if zvec_report.get("ready") else "zvec_unavailable",
+            **progress_plan,
+            "document_count": len(current_docs),
+            "vector_store": zvec_report,
+        },
+    )
+    vector_leg_enabled = bool(current_docs) and bool(zvec_report.get("ready")) and not degraded
+
     manifest = {
         "version": INDEX_VERSION,
         "status": "ready" if current_docs else "empty",
@@ -210,7 +255,18 @@ def _build_llm_wiki_index_locked(
         "reranker_ready": _openrouter_rerank_ready(),
         "index_health": "ready" if current_docs else "empty",
         "embedding_space": index_embedding_space,
-        "vector_leg_enabled": bool(current_docs),
+        "vector_leg_enabled": vector_leg_enabled,
+        "vector_store": {
+            "backend": "zvec",
+            "ready": bool(zvec_report.get("ready")),
+            "path": str(zvec_report.get("path") or ""),
+            "collection": str(zvec_report.get("collection") or ""),
+            "documents": int(zvec_report.get("documents") or 0),
+            "vector_dimensions": int(zvec_report.get("vector_dimensions") or 0),
+            "error": str(zvec_report.get("error") or ""),
+        },
+        "zvec": zvec_report,
+        "query_modes_available": _query_modes_available(current_docs, vector_leg_enabled=vector_leg_enabled),
         "embedding": {
             "provider": EMBEDDING_PROVIDER,
             "model": EMBEDDING_MODEL,
@@ -219,6 +275,10 @@ def _build_llm_wiki_index_locked(
             "space": index_embedding_space,
         },
         "embedding_degraded": degraded,
+        "estimated_input_tokens": progress_plan.get("estimated_input_tokens"),
+        "estimated_embedding_cost_usd": progress_plan.get("estimated_embedding_cost_usd"),
+        "embedding_price_per_million_input_tokens": progress_plan.get("embedding_price_per_million_input_tokens"),
+        "embedding_price_source": progress_plan.get("embedding_price_source"),
         "reranker": {
             "provider": RERANK_PROVIDER if _openrouter_rerank_ready() else "",
             "model": _openrouter_rerank_model() if _openrouter_rerank_ready() else "",
@@ -240,8 +300,46 @@ def _build_llm_wiki_index_locked(
         changed_count=changed_raw + changed_wiki,
         skipped_count=skipped,
         duration_ms=int((time.monotonic() - started) * 1000),
+        progress_plan=progress_plan,
+    )
+    _emit_progress(
+        progress_callback,
+        {
+            "stage": "complete",
+            **progress_plan,
+            "document_count": len(current_docs),
+            "raw_index_count": raw_count,
+            "wiki_index_count": wiki_count,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        },
     )
     return report
+
+
+def _build_zvec_store(site_root: Path, rows: list[dict[str, Any]], *, degraded: bool) -> dict[str, Any]:
+    if degraded:
+        return {
+            "backend": "zvec",
+            "ready": False,
+            "path": str(zvec_ready(site_root).get("path") or ""),
+            "collection": "",
+            "documents": 0,
+            "vector_dimensions": EMBEDDING_DIMENSIONS,
+            "error": "embedding_degraded",
+        }
+    try:
+        return replace_zvec_documents(site_root, rows, dimensions=EMBEDDING_DIMENSIONS)
+    except ZvecStoreUnavailable as exc:
+        raise EmbeddingUnavailableError(f"zvec vector store unavailable: {exc}") from exc
+
+
+def _query_modes_available(rows: list[dict[str, Any]], *, vector_leg_enabled: bool) -> list[str]:
+    if not rows:
+        return ["page_only"]
+    modes = ["lexical", "page_only"]
+    if vector_leg_enabled:
+        modes.insert(0, "vector")
+    return modes
 
 
 def _record_embedding_metrics(
@@ -253,6 +351,7 @@ def _record_embedding_metrics(
     changed_count: int,
     skipped_count: int,
     duration_ms: int,
+    progress_plan: dict[str, Any] | None = None,
 ) -> None:
     run_id = os.environ.get("WIKI_AGENT_RUN_ID") or os.environ.get("RALPH_AGENT_RUN_ID")
     site_id = os.environ.get("WIKI_AGENT_SITE_ID") or site_root.name
@@ -262,6 +361,17 @@ def _record_embedding_metrics(
         data_root = Path(site_root).parents[1]
     except IndexError:
         return
+    plan = progress_plan if isinstance(progress_plan, dict) else {}
+    raw_tokens = plan.get("estimated_input_tokens")
+    try:
+        input_tokens = int(raw_tokens) if raw_tokens not in (None, "") else None
+    except (TypeError, ValueError):
+        input_tokens = None
+    metric_cost = resolve_embedding_metric_cost(
+        input_tokens=input_tokens,
+        model=EMBEDDING_MODEL,
+        estimated_cost_usd=plan.get("estimated_embedding_cost_usd"),
+    )
     try:
         AgentRunMetricsRepository(data_root).append_event(
             build_embedding_metric_event(
@@ -272,7 +382,7 @@ def _record_embedding_metrics(
                 operation="build_llm_wiki_index",
                 provider=EMBEDDING_PROVIDER,
                 model=EMBEDDING_MODEL,
-                input_tokens=None,
+                input_tokens=input_tokens,
                 document_count=raw_count + wiki_count,
                 chunk_count=raw_count + wiki_count,
                 vector_count=raw_count + wiki_count,
@@ -280,13 +390,14 @@ def _record_embedding_metrics(
                 skipped_chunk_count=skipped_count,
                 failed_chunk_count=0,
                 duration_ms=duration_ms,
-                cost_usd=None,
-                cost_source="unknown",
+                cost_usd=metric_cost.amount_usd,
+                cost_source=metric_cost.source,
                 raw_provider_usage={
                     "changed_document_count": changed_count,
                     "raw_index_count": raw_count,
                     "wiki_index_count": wiki_count,
                     "vector_dimensions": EMBEDDING_DIMENSIONS,
+                    "embedding_price_source": plan.get("embedding_price_source"),
                 },
             )
         )
@@ -351,6 +462,7 @@ def query_llm_wiki_index(
             max_candidates=max_candidates,
             retrieval_strategy=retrieval_strategy,
             manifest=manifest,
+            site_root=layout.site_root,
         )
         candidates = retrieval["candidates"]
         lexical_scores = retrieval["lexical_scores"]
@@ -500,16 +612,45 @@ def query_mcp_wiki_index(
 def _embedding_manifest_error(manifest: dict[str, Any]) -> dict[str, str] | None:
     if _allow_hash_embedding_fallback():
         return None
+    version = str(manifest.get("version") or "")
     space = str(manifest.get("embedding_space") or "")
+    embedding = manifest.get("embedding") if isinstance(manifest.get("embedding"), dict) else {}
+    vector_store = manifest.get("vector_store") if isinstance(manifest.get("vector_store"), dict) else {}
+    if version and version != INDEX_VERSION:
+        return {
+            "reason": "index_version_mismatch",
+            "message": f"Index version is {version}; expected {INDEX_VERSION}. Rebuild the index.",
+        }
     if bool(manifest.get("embedding_degraded")):
         return {
             "reason": "embedding_degraded",
             "message": "Index was built with degraded embeddings. Rebuild the index after OpenRouter embeddings are available.",
         }
+    dimensions = int(embedding.get("vector_dimensions") or 0) if embedding else 0
+    if dimensions and dimensions != EMBEDDING_DIMENSIONS:
+        return {
+            "reason": "embedding_dimension_mismatch",
+            "message": f"Index vector dimensions are {dimensions}; expected {EMBEDDING_DIMENSIONS}. Rebuild the index.",
+        }
     if space and space != EMBEDDING_SPACE_DENSE:
         return {
             "reason": "embedding_space_mismatch",
             "message": f"Index embedding space is {space}; expected {EMBEDDING_SPACE_DENSE}. Rebuild the index.",
+        }
+    if not vector_store and str(manifest.get("status") or "") == "ready":
+        return {
+            "reason": "vector_store_unavailable",
+            "message": "Index manifest does not declare a zvec vector store. Rebuild the index.",
+        }
+    if manifest.get("vector_leg_enabled") is False and str(manifest.get("status") or "") == "ready":
+        return {
+            "reason": "vector_store_unavailable",
+            "message": str(vector_store.get("error") or "Zvec vector store is not ready. Rebuild the index after zvec is available."),
+        }
+    if vector_store and not bool(vector_store.get("ready")) and str(manifest.get("status") or "") == "ready":
+        return {
+            "reason": "vector_store_unavailable",
+            "message": str(vector_store.get("error") or "Zvec vector store is not ready. Rebuild the index."),
         }
     return None
 
@@ -536,6 +677,7 @@ def _embedding_error_response(
             "embedding_degraded": bool(manifest.get("embedding_degraded")),
             "embedding_space": str(manifest.get("embedding_space") or ""),
             "vector_leg_enabled": False,
+            "vector_store": manifest.get("vector_store") if isinstance(manifest.get("vector_store"), dict) else {},
         },
     }
 
@@ -849,8 +991,34 @@ def index_info(site_root: Path) -> dict[str, Any]:
         "wiki_index_count": int(manifest.get("wiki_index_count") or 0),
         "last_build_time": str(manifest.get("built_at") or ""),
         "index_health": str(manifest.get("index_health") or manifest.get("status") or "missing"),
+        "query_modes_available": [str(value) for value in manifest.get("query_modes_available", []) or [] if str(value)],
+        "vector_store": manifest.get("vector_store") if isinstance(manifest.get("vector_store"), dict) else {},
         "manifest": manifest,
         "config_snippet": generate_mcp_config_snippet(layout.site_root),
+    }
+
+
+def site_mcp_query_readiness(site_root: Path) -> dict[str, Any]:
+    """Return the same query gate used by MCP index_info/query_wiki for registry readiness."""
+    info = index_info(site_root)
+    ready = bool(info.get("ready"))
+    reason = str(info.get("error") or "")
+    message = str(info.get("message") or "")
+    if ready:
+        return {
+            "query_ready": True,
+            "mcp_block_reason": "",
+            "reason": "",
+            "message": "",
+            "index_ready": True,
+        }
+    block = message or reason or "Index is not query-ready."
+    return {
+        "query_ready": False,
+        "mcp_block_reason": block,
+        "reason": reason,
+        "message": message,
+        "index_ready": False,
     }
 
 
@@ -997,6 +1165,114 @@ def _wiki_documents(site_root: Path, *, chunk_chars: int, overlap: int) -> tuple
 
 def _document_row(doc: IndexedDocument) -> dict[str, Any]:
     vector, space = _embedding_vector_and_space(f"{doc.title}\n{doc.text}")
+    return _document_row_with_embedding(doc, vector=vector, space=space)
+
+
+def _document_rows(
+    docs: list[IndexedDocument],
+    *,
+    progress_callback: ProgressCallback | None = None,
+    progress_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    batch_size = _embedding_batch_size()
+    batch_count = math.ceil(len(docs) / batch_size) if docs else 0
+    embedded = 0
+    started = time.monotonic()
+    for start in range(0, len(docs), batch_size):
+        batch = docs[start : start + batch_size]
+        batch_index = (start // batch_size) + 1
+        vectors, space = _embedding_vectors_and_space([_embedding_text(doc) for doc in batch])
+        rows.extend(_document_row_with_embedding(doc, vector=vector, space=space) for doc, vector in zip(batch, vectors))
+        embedded += len(batch)
+        elapsed = max(0.001, time.monotonic() - started)
+        docs_per_second = embedded / elapsed
+        remaining = max(0, len(docs) - embedded)
+        estimated_seconds_remaining = remaining / docs_per_second if docs_per_second > 0 else None
+        _emit_progress(
+            progress_callback,
+            {
+                **(progress_context or {}),
+                "stage": "embedding_batch",
+                "batch_index": batch_index,
+                "batch_count": batch_count,
+                "batch_size": batch_size,
+                "embedded_document_count": embedded,
+                "remaining_document_count": remaining,
+                "elapsed_seconds": round(elapsed, 3),
+                "documents_per_second": round(docs_per_second, 6),
+                "estimated_seconds_remaining": round(estimated_seconds_remaining, 3)
+                if estimated_seconds_remaining is not None
+                else None,
+            },
+        )
+    return rows
+
+
+def _embedding_text(doc: IndexedDocument) -> str:
+    return f"{doc.title}\n{doc.text}"
+
+
+def _embedding_progress_plan(
+    *,
+    raw_docs: list[IndexedDocument],
+    wiki_docs: list[IndexedDocument],
+    changed_docs: list[IndexedDocument],
+    changed_raw: int,
+    changed_wiki: int,
+    skipped: int,
+) -> dict[str, Any]:
+    total_changed = len(changed_docs)
+    estimated_tokens = _estimate_embedding_tokens_for_docs(changed_docs)
+    price = _embedding_price_per_million_input_tokens()
+    return {
+        "embedding_provider": EMBEDDING_PROVIDER,
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_dimensions": EMBEDDING_DIMENSIONS,
+        "embedding_price_per_million_input_tokens": price,
+        "embedding_price_source": "openrouter_catalog",
+        "estimated_input_tokens": estimated_tokens,
+        "estimated_embedding_cost_usd": round((estimated_tokens / 1_000_000) * price, 6),
+        "raw_document_count": len(raw_docs),
+        "wiki_document_count": len(wiki_docs),
+        "total_document_count": len(raw_docs) + len(wiki_docs),
+        "changed_raw_count": changed_raw,
+        "changed_wiki_count": changed_wiki,
+        "changed_document_count": total_changed,
+        "total_changed_document_count": total_changed,
+        "skipped_document_count": skipped,
+        "batch_size": _embedding_batch_size(),
+        "batch_count": math.ceil(total_changed / _embedding_batch_size()) if total_changed else 0,
+        "embedded_document_count": 0,
+        "remaining_document_count": total_changed,
+    }
+
+
+def _estimate_embedding_tokens_for_docs(docs: list[IndexedDocument]) -> int:
+    return sum(_estimate_embedding_tokens(_embedding_text(doc)) for doc in docs)
+
+
+def _estimate_embedding_tokens(text: str) -> int:
+    text = str(text or "")[:EMBEDDING_TEXT_CHAR_LIMIT]
+    if not text:
+        return 0
+    return max(1, math.ceil(len(text) / 4))
+
+
+def _embedding_price_per_million_input_tokens(model: str | None = None) -> float:
+    return embedding_price_per_million_input_tokens(model or EMBEDDING_MODEL)
+
+
+def _emit_progress(progress_callback: ProgressCallback | None, event: dict[str, Any]) -> None:
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(event)
+    except Exception as exc:
+        _LOGGER.warning("embedding progress callback failed: %s", exc)
+
+
+def _document_row_with_embedding(doc: IndexedDocument, *, vector: list[float], space: str) -> dict[str, Any]:
     provider = EMBEDDING_PROVIDER if space == EMBEDDING_SPACE_DENSE else FALLBACK_EMBEDDING_PROVIDER
     model = EMBEDDING_MODEL if space == EMBEDDING_SPACE_DENSE else FALLBACK_EMBEDDING_MODEL
     return {
@@ -1040,8 +1316,6 @@ def _document_row_current(
     expected_space = EMBEDDING_SPACE_DENSE
     if row_space != expected_space:
         return False
-    if previous_manifest and str(previous_manifest.get("version") or "") not in {"", INDEX_VERSION}:
-        return False
     vector = row.get("embedding_vector")
     if not isinstance(vector, list) or len(vector) != EMBEDDING_DIMENSIONS:
         return False
@@ -1061,12 +1335,13 @@ def _select_retrieval_candidates(
     max_candidates: int,
     retrieval_strategy: str,
     manifest: dict[str, Any] | None = None,
+    site_root: Path | None = None,
 ) -> dict[str, Any]:
     requested = _normalize_retrieval_strategy(retrieval_strategy)
     query_type, classifier_reason = _classify_query_type(query)
     if requested in {"auto", "mcp_auto"}:
         bm25 = _wiki_bm25_retrieval(docs, query, tokens, max_candidates=max_candidates)
-        vector = _vector_retrieval(docs, query, max_candidates=max_candidates, manifest=manifest)
+        vector = _vector_retrieval(docs, query, max_candidates=max_candidates, manifest=manifest, site_root=site_root)
         if query_type == "factual":
             fused = _fuse_retrievals(bm25, vector, leading_strategy="wiki_bm25", max_candidates=max_candidates)
         else:
@@ -1108,7 +1383,7 @@ def _select_retrieval_candidates(
         )
         return retrieval
     if requested in {"vector", "reasoning"}:
-        retrieval = _vector_retrieval(docs, query, max_candidates=max_candidates, manifest=manifest)
+        retrieval = _vector_retrieval(docs, query, max_candidates=max_candidates, manifest=manifest, site_root=site_root)
         retrieval.update(
             {
                 "requested_strategy": requested,
@@ -1239,9 +1514,13 @@ def _fuse_retrievals(
                     target[str(score_key)] = float(score)
                 except (TypeError, ValueError):
                     continue
+    vector_backend = str(primary.get("vector_backend") or secondary.get("vector_backend") or "")
+    vector_store_path = str(primary.get("vector_store_path") or secondary.get("vector_store_path") or "")
     return {
         "strategy": "hybrid_fused",
         "leading_strategy": leading_strategy,
+        "vector_backend": vector_backend,
+        "vector_store_path": vector_store_path,
         "candidates": candidates,
         "lexical_scores": lexical_scores,
         "reasons_by_id": reasons_by_id,
@@ -1333,7 +1612,9 @@ def _vector_retrieval(
     *,
     max_candidates: int,
     manifest: dict[str, Any] | None = None,
+    site_root: Path | None = None,
 ) -> dict[str, Any]:
+    vector_store = manifest.get("vector_store") if isinstance(manifest, dict) and isinstance(manifest.get("vector_store"), dict) else {}
     if not _vector_leg_enabled(manifest):
         return {
             "strategy": "vector",
@@ -1343,9 +1624,17 @@ def _vector_retrieval(
             "scores_by_id": {},
             "vector_leg_skipped": True,
         }
-    candidates, vector_scores = _retrieve_vector_candidates_by_corpus(docs, query, max_candidates=max_candidates, manifest=manifest)
+    candidates, vector_scores = _retrieve_vector_candidates_by_corpus(
+        docs,
+        query,
+        max_candidates=max_candidates,
+        manifest=manifest,
+        site_root=site_root,
+    )
     return {
         "strategy": "vector",
+        "vector_backend": "zvec",
+        "vector_store_path": str(vector_store.get("path") or ""),
         "candidates": candidates,
         "lexical_scores": {},
         "reasons_by_id": {str(row.get("id") or ""): "vector_candidate" for row in candidates},
@@ -1362,6 +1651,8 @@ def _retrieval_metadata(retrieval: dict[str, Any]) -> dict[str, Any]:
         "attempted_strategies": [str(value) for value in retrieval.get("attempted_strategies", []) or [] if str(value)],
         "fallback_reason": str(retrieval.get("fallback_reason") or ""),
         "bm25_backend": str(retrieval.get("bm25_backend") or ""),
+        "vector_backend": str(retrieval.get("vector_backend") or ""),
+        "vector_store_path": str(retrieval.get("vector_store_path") or ""),
     }
 
 
@@ -1438,28 +1729,58 @@ def _retrieve_vector_candidates_by_corpus(
     *,
     max_candidates: int,
     manifest: dict[str, Any] | None = None,
+    site_root: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     if not _vector_leg_enabled(manifest):
         return [], {}
+    if site_root is None:
+        raise EmbeddingUnavailableError("Zvec vector retrieval requires a site root.")
     query_text = " ".join(_content_tokens(query)) or query
     query_vector, query_space = _embedding_vector_and_space(query_text, manifest=manifest)
     if not _spaces_compatible(query_space, str(manifest.get("embedding_space") or query_space) if manifest else query_space, manifest):
         return [], {}
-    raw_candidates, raw_scores = _retrieve_vector_candidates_for_corpus(
-        docs,
-        query_vector,
-        corpus="raw",
-        max_candidates=max_candidates,
-        query_space=query_space,
-    )
-    wiki_candidates, wiki_scores = _retrieve_vector_candidates_for_corpus(
-        docs,
-        query_vector,
-        corpus="wiki",
-        max_candidates=max_candidates,
-        query_space=query_space,
-    )
-    return _dedupe_candidates(wiki_candidates + raw_candidates), {**raw_scores, **wiki_scores}
+    doc_map = {str(row.get("id") or ""): row for row in docs if row.get("id")}
+    try:
+        hits = query_zvec_documents(site_root, query_vector, top_k=max(max_candidates * 2, max_candidates))
+    except ZvecStoreUnavailable as exc:
+        raise EmbeddingUnavailableError(f"zvec vector store unavailable: {exc}") from exc
+    candidates: list[dict[str, Any]] = []
+    scores: dict[str, float] = {}
+    for hit in hits:
+        doc_id = str(hit.get("id") or "")
+        if not doc_id:
+            continue
+        score = _zvec_score(hit.get("score"))
+        if score < 0.05:
+            continue
+        row = doc_map.get(doc_id)
+        if row is None:
+            row = {
+                "id": doc_id,
+                "corpus": str(hit.get("corpus") or ""),
+                "source_kind": str(hit.get("source_kind") or ""),
+                "source_id": str(hit.get("source_id") or ""),
+                "source_ids": [str(value) for value in hit.get("source_ids", []) or [] if str(value)],
+                "path": str(hit.get("path") or ""),
+                "title": str(hit.get("title") or ""),
+                "checksum": str(hit.get("checksum") or ""),
+                "text": str(hit.get("text") or ""),
+                "embedding_space": EMBEDDING_SPACE_DENSE,
+                "embedding_vector": [],
+                "metadata": {},
+            }
+        candidates.append(row)
+        scores[doc_id] = score
+        if len(candidates) >= max_candidates:
+            break
+    return _dedupe_candidates(candidates), scores
+
+
+def _zvec_score(value: Any) -> float:
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _retrieve_vector_candidates_for_corpus(
@@ -2005,7 +2326,7 @@ def _embedding_vector_and_space(
         _EMBEDDING_DEGRADED = True
         raise EmbeddingUnavailableError("OpenRouter embeddings unavailable.")
     try:
-        vector = embed_text(text[:8000], embedding_config_from_env())
+        vector = embed_text(text[:EMBEDDING_TEXT_CHAR_LIMIT], embedding_config_from_env())
     except Exception as exc:
         if _allow_hash_embedding_fallback():
             _EMBEDDING_DEGRADED = True
@@ -2020,6 +2341,56 @@ def _embedding_vector_and_space(
         _EMBEDDING_DEGRADED = True
         raise EmbeddingUnavailableError("OpenRouter embedding response was empty.")
     return _normalize_embedding_dimensions(vector, dimensions), EMBEDDING_SPACE_DENSE
+
+
+def _embedding_vectors_and_space(
+    texts: list[str],
+    *,
+    dimensions: int = EMBEDDING_DIMENSIONS,
+    manifest: dict[str, Any] | None = None,
+) -> tuple[list[list[float]], str]:
+    global _DENSE_EMBEDDING_UNAVAILABLE, _EMBEDDING_DEGRADED
+    if not texts:
+        return [], EMBEDDING_SPACE_DENSE
+    manifest_space = str(manifest.get("embedding_space") or "") if manifest else ""
+    if manifest and manifest_space and manifest_space != EMBEDDING_SPACE_DENSE:
+        if _allow_hash_embedding_fallback() and manifest_space == EMBEDDING_SPACE_HASH:
+            return [_hash_embedding_vector(text, dimensions=dimensions) for text in texts], EMBEDDING_SPACE_HASH
+        _EMBEDDING_DEGRADED = True
+        raise EmbeddingUnavailableError(
+            f"Index embedding space is {manifest_space}; expected {EMBEDDING_SPACE_DENSE}. Rebuild the index."
+        )
+    if _dense_embeddings_disabled():
+        _DENSE_EMBEDDING_UNAVAILABLE = True
+        _EMBEDDING_DEGRADED = True
+        raise EmbeddingUnavailableError("OpenRouter embeddings are disabled by RAG_DISABLE_DENSE_EMBEDDING.")
+    if _DENSE_EMBEDDING_UNAVAILABLE:
+        _EMBEDDING_DEGRADED = True
+        raise EmbeddingUnavailableError("OpenRouter embeddings unavailable.")
+    try:
+        vectors = embed_texts([text[:EMBEDDING_TEXT_CHAR_LIMIT] for text in texts], embedding_config_from_env())
+    except Exception as exc:
+        if _allow_hash_embedding_fallback():
+            _EMBEDDING_DEGRADED = True
+            return [_hash_embedding_vector(text, dimensions=dimensions) for text in texts], EMBEDDING_SPACE_HASH
+        _DENSE_EMBEDDING_UNAVAILABLE = True
+        _EMBEDDING_DEGRADED = True
+        raise EmbeddingUnavailableError(
+            "OpenRouter embeddings unavailable. Set OPENROUTER_API_KEY or choose a reachable OpenRouter embedding model."
+        ) from exc
+    if len(vectors) != len(texts):
+        _DENSE_EMBEDDING_UNAVAILABLE = True
+        _EMBEDDING_DEGRADED = True
+        raise EmbeddingUnavailableError("OpenRouter embedding response row count did not match input count.")
+    return [_normalize_embedding_dimensions(vector, dimensions) for vector in vectors], EMBEDDING_SPACE_DENSE
+
+
+def _embedding_batch_size() -> int:
+    try:
+        value = int(os.getenv("OPENROUTER_EMBED_BATCH_SIZE", "64") or "64")
+    except ValueError:
+        value = 64
+    return max(1, min(value, 256))
 
 
 def _allow_hash_embedding_fallback() -> bool:

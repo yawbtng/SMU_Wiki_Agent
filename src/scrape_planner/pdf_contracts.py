@@ -34,7 +34,7 @@ class PdfChunkRow:
     text: str
     char_count: int
     created_at: str
-    parser: str = "docling"
+    parser: str = "markitdown"
     source_path: str = ""
 
     def to_dict(self) -> dict[str, object]:

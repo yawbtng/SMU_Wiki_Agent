@@ -1,3 +1,3 @@
 # PDF/document ingestion dependencies.
-# Docling is the only supported PDF parser for this project.
-docling>=2.31.0
+# MarkItDown is the only supported PDF parser for this project.
+markitdown[pdf]>=0.1.5

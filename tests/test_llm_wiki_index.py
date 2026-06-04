@@ -151,6 +151,10 @@ def test_build_query_prefers_relevant_wiki_and_includes_raw_support(tmp_path: Pa
     assert "fallback_provider" not in report["embedding"]
     assert report["embedding"]["degraded"] is False
     assert report["embedding"]["vector_dimensions"] > 0
+    assert report["vector_store"]["backend"] == "zvec"
+    assert report["vector_store"]["ready"] is True
+    assert report["zvec"]["documents"] == report["raw_index_count"] + report["wiki_index_count"]
+    assert "vector" in report["query_modes_available"]
 
     docs = [
         json.loads(line)
@@ -163,6 +167,7 @@ def test_build_query_prefers_relevant_wiki_and_includes_raw_support(tmp_path: Pa
     response = query_llm_wiki_index(site_root, "What is the admissions application deadline?", max_evidence=3)
     assert response["status"] == "ok"
     assert response["query"] == "What is the admissions application deadline?"
+    assert response["metadata"]["retrieval"]["vector_backend"] == "zvec"
     evidence = response["evidence"]
     assert evidence[0]["source_kind"] == "wiki"
     assert evidence[0]["path"] == "wiki/pages/admissions.md"
@@ -173,6 +178,39 @@ def test_build_query_prefers_relevant_wiki_and_includes_raw_support(tmp_path: Pa
     assert any("cites_raw_candidate" in row["ranking_reasons"] for row in evidence)
     assert any("cited_by_wiki_candidate" in row["ranking_reasons"] for row in evidence if row["source_kind"] != "wiki")
     assert evidence[0]["scores"]["vector"] > 0
+
+
+def test_build_batches_changed_document_embeddings(tmp_path: Path, monkeypatch) -> None:
+    import src.scrape_planner.wiki.llm_wiki_index as llm_wiki_index
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index
+
+    site_root = _fixture_site(tmp_path)
+    batch_sizes: list[int] = []
+    progress_events: list[dict[str, object]] = []
+
+    def fake_embed_texts(texts: list[str], *_args, **_kwargs) -> list[list[float]]:
+        batch_sizes.append(len(texts))
+        vectors: list[list[float]] = []
+        for idx, _text in enumerate(texts):
+            vector = [0.0] * 1536
+            vector[idx % 1536] = 1.0
+            vectors.append(vector)
+        return vectors
+
+    monkeypatch.setenv("OPENROUTER_EMBED_BATCH_SIZE", "2")
+    monkeypatch.setattr(llm_wiki_index, "embed_texts", fake_embed_texts)
+
+    report = build_llm_wiki_index(site_root, now=NOW, progress_callback=progress_events.append)
+
+    assert report["changed_document_count"] == 3
+    assert batch_sizes == [2, 1]
+    plan = next(event for event in progress_events if event["stage"] == "embedding_plan")
+    batches = [event for event in progress_events if event["stage"] == "embedding_batch"]
+    assert plan["total_changed_document_count"] == 3
+    assert plan["estimated_input_tokens"] > 0
+    assert plan["estimated_embedding_cost_usd"] > 0
+    assert [event["embedded_document_count"] for event in batches] == [2, 3]
+    assert progress_events[-1]["stage"] == "complete"
 
 
 def test_raw_source_fallback_when_wiki_is_weak(tmp_path: Path) -> None:
@@ -503,6 +541,7 @@ def test_build_fails_when_dense_embeddings_are_unavailable(tmp_path: Path, monke
     site_root = _fixture_site(tmp_path)
     monkeypatch.delenv("RAG_DISABLE_DENSE_EMBEDDING", raising=False)
     monkeypatch.setattr(llm_wiki_index, "embed_text", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
+    monkeypatch.setattr(llm_wiki_index, "embed_texts", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
 
     with pytest.raises(llm_wiki_index.EmbeddingUnavailableError, match="OpenRouter embeddings unavailable"):
         build_llm_wiki_index(site_root, now=NOW)
@@ -527,6 +566,24 @@ def test_mcp_query_fails_for_degraded_hash_index_manifest(tmp_path: Path) -> Non
     assert response["evidence"] == []
     assert response["metadata"]["reason"] == "embedding_degraded"
     assert response["metadata"]["embedding_space"] == "hash-fallback"
+
+
+def test_mcp_query_fails_for_stale_legacy_index_manifest(tmp_path: Path) -> None:
+    from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index, query_mcp_wiki_index
+
+    site_root = _fixture_site(tmp_path)
+    report = build_llm_wiki_index(site_root, now=NOW)
+    manifest_path = Path(report["report_path"]).parent.parent / "llm_wiki_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["version"] = "llm-wiki-hybrid-v1"
+    manifest["embedding"]["vector_dimensions"] = 64
+    manifest.pop("vector_store", None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    response = query_mcp_wiki_index(site_root, "When is the admissions application deadline?", max_evidence=2)
+
+    assert response["status"] == "embedding_unavailable"
+    assert response["metadata"]["reason"] == "index_version_mismatch"
 
 
 

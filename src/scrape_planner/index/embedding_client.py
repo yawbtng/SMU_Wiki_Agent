@@ -52,12 +52,58 @@ def openrouter_embed(text: str, *, model: str, base_url: str, api_key: str, time
     raise ValueError("OpenRouter embedding response did not include an embedding")
 
 
+def openrouter_embed_batch(
+    texts: list[str],
+    *,
+    model: str,
+    base_url: str,
+    api_key: str,
+    timeout_seconds: float = 30.0,
+) -> list[list[float]]:
+    if not texts:
+        return []
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY is required for embeddings")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {"model": model, "input": texts}
+    resp = requests.post(f"{base_url.rstrip('/')}/embeddings", json=payload, headers=headers, timeout=timeout_seconds)
+    resp.raise_for_status()
+    data: Any = resp.json()
+    rows = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("OpenRouter embedding response did not include data rows")
+    ordered = sorted(
+        [row for row in rows if isinstance(row, dict)],
+        key=lambda row: int(row.get("index") or 0),
+    )
+    vectors = [_float_vector(row.get("embedding")) for row in ordered]
+    if len(vectors) != len(texts):
+        raise ValueError("OpenRouter embedding response row count did not match input count")
+    return vectors
+
+
 def embed_text(text: str, config: EmbeddingClientConfig | None = None) -> list[float]:
     cfg = config or embedding_config_from_env()
     if cfg.provider != "openrouter":
         raise ValueError(f"unsupported embedding provider: {cfg.provider}")
     return openrouter_embed(
         text,
+        model=cfg.model,
+        base_url=cfg.base_url,
+        api_key=cfg.api_key,
+        timeout_seconds=cfg.timeout_seconds,
+    )
+
+
+def embed_texts(texts: list[str], config: EmbeddingClientConfig | None = None) -> list[list[float]]:
+    cfg = config or embedding_config_from_env()
+    if cfg.provider != "openrouter":
+        raise ValueError(f"unsupported embedding provider: {cfg.provider}")
+    return openrouter_embed_batch(
+        texts,
         model=cfg.model,
         base_url=cfg.base_url,
         api_key=cfg.api_key,

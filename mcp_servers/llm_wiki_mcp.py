@@ -40,6 +40,7 @@ from src.scrape_planner.wiki.llm_wiki_index import (  # noqa: E402
     index_info as _index_info,
     query_mcp_wiki_index,
     search_source_index,
+    site_mcp_query_readiness,
 )
 from src.scrape_planner.wiki.self_improving import (  # noqa: E402
     answer_question as _answer_question,
@@ -205,7 +206,8 @@ def _university_registry() -> list[dict[str, Any]]:
         url = str(summary.get("site_url") or "") if isinstance(summary, dict) else ""
         domain = urlparse(url).netloc or site_root.name
         wiki_ready = _site_has_markdown_pages(site_root)
-        index_ready = _site_has_query_index(site_root)
+        query_health = site_mcp_query_readiness(site_root)
+        index_ready = bool(query_health.get("query_ready"))
         rows.append(
             {
                 "site_id": site_root.name,
@@ -215,7 +217,8 @@ def _university_registry() -> list[dict[str, Any]]:
                 "site_root": str(site_root),
                 "wiki_ready": wiki_ready,
                 "index_ready": index_ready,
-                "mcp_enabled": wiki_ready or index_ready,
+                "mcp_enabled": index_ready,
+                "mcp_block_reason": str(query_health.get("mcp_block_reason") or ""),
             }
         )
     return rows

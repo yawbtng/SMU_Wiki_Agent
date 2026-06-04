@@ -45,6 +45,17 @@ def _ready_index(site_root: Path) -> None:
         "embedding_degraded": False,
         "vector_leg_enabled": True,
         "embedding_space": "dense-openrouter",
+        "vector_store": {
+            "backend": "zvec",
+            "ready": True,
+            "path": str(indexes / "zvec_llm_wiki"),
+            "collection": "llm_wiki_documents",
+            "documents": 4,
+            "vector_dimensions": 1536,
+            "error": "",
+        },
+        "query_modes_available": ["vector", "lexical", "page_only"],
+        "embedding": {"vector_dimensions": 1536},
     }
     (indexes / "llm_wiki_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (indexes / "llm_wiki_documents.jsonl").write_text("", encoding="utf-8")
@@ -510,6 +521,7 @@ def test_dense_embedding_failure_stops_index_build(tmp_path: Path, monkeypatch) 
         encoding="utf-8",
     )
     monkeypatch.setattr(llm_wiki_index, "embed_text", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
+    monkeypatch.setattr(llm_wiki_index, "embed_texts", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
     with pytest.raises(llm_wiki_index.EmbeddingUnavailableError, match="OpenRouter embeddings unavailable"):
         build_llm_wiki_index(site_root, now="2026-06-01T12:00:00+00:00")
     response = query_llm_wiki_index(site_root, "admissions deadline")

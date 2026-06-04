@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,7 +30,7 @@ class PdfIngestResult:
 class ParsedPdf:
     markdown: str
     page_count: int | None
-    parser: str = "docling"
+    parser: str = "markitdown"
     pages: list[tuple[int, str]] = field(default_factory=list)
 
 
@@ -90,7 +88,7 @@ def ingest_pdfs(paths: list[str | Path], config: PdfIngestConfig | None = None) 
             continue
 
         try:
-            parsed = _parse_pdf_with_docling(path)
+            parsed = _parse_pdf_with_markitdown(path)
             markdown = parsed.markdown.strip()
         except PdfParserUnavailableError:
             raise
@@ -142,58 +140,52 @@ def ingest_pdfs(paths: list[str | Path], config: PdfIngestConfig | None = None) 
     return PdfIngestResult(sources=sources, chunks=chunks, quarantine=quarantine)
 
 
-def _parse_pdf_with_docling(path: Path) -> ParsedPdf:
+def _parse_pdf_with_markitdown(path: Path) -> ParsedPdf:
     try:
-        from docling.datamodel.accelerator_options import AcceleratorOptions
-        from docling.datamodel.base_models import InputFormat
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
-        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from markitdown import MarkItDown
     except ImportError as exc:
-        raise PdfParserUnavailableError("Docling is not installed. Install requirements-pdf.txt.") from exc
+        raise PdfParserUnavailableError("MarkItDown is not installed. Install requirements-pdf.txt.") from exc
 
-    # Force CPU on Apple Silicon. Docling's auto device selection can choose MPS,
-    # but parts of the layout model still request float64 tensors that MPS rejects.
-    device = os.getenv("DOCLING_DEVICE", "cpu")
-    pipeline_options = PdfPipelineOptions(accelerator_options=AcceleratorOptions(device=device))
-    converter = DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
-    )
+    converter = MarkItDown(enable_plugins=False)
     result = converter.convert(str(path))
-    document = getattr(result, "document", None)
-    if document is None:
-        raise RuntimeError("Docling returned no document")
-    if not hasattr(document, "export_to_markdown"):
-        raise RuntimeError("Docling document cannot export markdown")
-    page_count = _docling_page_count(document)
-    markdown = str(document.export_to_markdown(page_break_placeholder="\n\n<!-- page break -->\n\n") or "")
-    pages: list[tuple[int, str]] = []
-    if page_count:
-        for page_no in range(1, int(page_count) + 1):
-            page_markdown = ""
-            # Per-page export is optional; some Docling builds only support whole-document export.
-            with contextlib.suppress(TypeError, ValueError, AttributeError, RuntimeError):
-                page_markdown = str(document.export_to_markdown(page_no=page_no) or "").strip()
-            if page_markdown:
-                pages.append((page_no, page_markdown))
-    if not pages and markdown.strip():
-        pages = [(0, markdown)]
-    return ParsedPdf(markdown, page_count, "docling", pages)
+    markdown = _markitdown_text(result)
+    if not markdown.strip():
+        raise RuntimeError("MarkItDown returned no markdown")
+    pages = _extract_pdf_pages(path)
+    return ParsedPdf(
+        markdown=markdown,
+        page_count=len(pages) if pages else None,
+        parser="markitdown",
+        pages=pages or [(0, markdown)],
+    )
 
 
-def _docling_page_count(document: object) -> int | None:
-    pages = getattr(document, "pages", None)
-    if pages is not None:
-        try:
-            return len(pages)
-        except TypeError:
-            pass
-
-    for attr in ("num_pages", "page_count"):
-        value = getattr(document, attr, None)
+def _markitdown_text(result: object) -> str:
+    for attr in ("text_content", "markdown"):
+        value = getattr(result, attr, None)
         if value is not None:
-            return int(value)
+            return str(value)
+    return str(result or "")
 
-    return None
+
+def _extract_pdf_pages(path: Path) -> list[tuple[int, str]]:
+    try:
+        import pdfplumber
+    except ImportError:
+        return []
+
+    pages: list[tuple[int, str]] = []
+    with pdfplumber.open(path) as pdf:
+        for index, page in enumerate(pdf.pages, start=1):
+            try:
+                text = str(page.extract_text() or "").strip()
+            finally:
+                close = getattr(page, "close", None)
+                if callable(close):
+                    close()
+            if text:
+                pages.append((index, text))
+    return pages
 
 
 def _write_page_markdown_files(source_id: str, path: Path, parsed: ParsedPdf, cfg: PdfIngestConfig) -> None:
