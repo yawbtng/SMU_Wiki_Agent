@@ -1,4 +1,19 @@
-import { buildEmbeddingModel, buildMcpModel, buildMetricsModel, buildOverviewModel, formatCost, formatCount, toneForStatus } from './viewModel';
+import {
+  buildEmbeddingModel,
+  buildMcpModel,
+  buildMetricsModel,
+  buildMetricsRollupPoints,
+  buildMetricsRunTrendPoints,
+  buildOverviewModel,
+  buildScrapeModel,
+  formatCost,
+  formatCount,
+  metricsTokenMixSegments,
+  resolveWikiJobStatus,
+  scrapeStartPayload,
+  summarizePiBuildEvents,
+  toneForStatus,
+} from './viewModel';
 
 const complete = buildOverviewModel({
   siteId: 'www.smu.edu',
@@ -72,6 +87,44 @@ if (queuedEmbeddings.stats[2].value !== '7') {
   throw new Error('embedding stats should expose pending change count');
 }
 
+const rerankerReadyEmbeddings = buildEmbeddingModel({
+  index_health: 'ready',
+  wiki_index_count: 15,
+  raw_index_count: 6,
+  reranker_ready: true,
+  job_state: { status: 'complete' },
+});
+
+if (rerankerReadyEmbeddings.stats.find((stat) => stat.label === 'Reranker')?.value !== 'On') {
+  throw new Error('embedding stats should expose reranker on state when the backend reports it ready');
+}
+
+const blockedEmbeddings = buildEmbeddingModel({
+  index_health: 'missing',
+  auto_rebuild_enabled: false,
+  auto_rebuild_reason: 'prerequisites_unhealthy',
+  job_state: { status: 'idle' },
+});
+
+if (blockedEmbeddings.canRebuild) {
+  throw new Error('embedding rebuild should be disabled when prerequisites are missing');
+}
+
+if (!blockedEmbeddings.disabledHint.includes('prerequisites')) {
+  throw new Error('embedding prerequisites should explain why rebuild is blocked');
+}
+
+const disabledEmbeddings = buildEmbeddingModel({
+  index_health: 'missing',
+  auto_rebuild_enabled: false,
+  auto_rebuild_reason: 'embedding_disabled',
+  job_state: { status: 'idle' },
+});
+
+if (disabledEmbeddings.canRebuild || !disabledEmbeddings.disabledHint.includes('Settings')) {
+  throw new Error('embedding disabled state should still point operators back to Settings');
+}
+
 const runningMcp = buildMcpModel({
   server_available: true,
   index_health: 'ready',
@@ -127,6 +180,98 @@ if (!metricsModel.healthWarnings.includes('unknown_cost')) {
   throw new Error('metrics health warnings should surface in the model');
 }
 
+if (!metricsModel.scopeNote.includes('Pi agent')) {
+  throw new Error('metrics model should explain Pi-only scope');
+}
+
+const vectorOnlyTrend = buildMetricsRunTrendPoints([
+  {
+    run_id: 'embedding-manual-1',
+    embedding_usage: { vector_count: 42, input_tokens: null },
+    total_model_tokens: 0,
+  },
+]);
+
+if (vectorOnlyTrend[0]?.tokens !== 42) {
+  throw new Error('metrics trend should fall back to embedding vectors when tokens are missing');
+}
+
+if (vectorOnlyTrend[0]?.label !== '1' || vectorOnlyTrend[0]?.detail !== 'embedding-manual-1') {
+  throw new Error('metrics trend labels should use run sequence numbers with run id in detail');
+}
+
+const vectorRollups = buildMetricsRollupPoints({
+  '30d': { window: '30d', run_count: 2, total_tokens: 0, vector_count: 90, llm_tokens: 0, embedding_tokens: null },
+});
+
+if (vectorRollups[0]?.tokens !== 90) {
+  throw new Error('rollup chart points should use vectors when token totals are zero');
+}
+
+const vectorMix = metricsTokenMixSegments({
+  window: '30d',
+  llm_tokens: 0,
+  embedding_tokens: null,
+  vector_count: 90,
+});
+
+if (vectorMix.length !== 1 || vectorMix[0].value !== 90) {
+  throw new Error('token mix should use vectors when embedding tokens are unavailable');
+}
+
+const vectorRollupModel = buildMetricsModel({
+  rollup: {
+    window: '30d',
+    run_count: 2,
+    total_tokens: 0,
+    llm_tokens: 0,
+    embedding_tokens: null,
+    vector_count: 90,
+  },
+});
+
+if (vectorRollupModel.aggregateMetrics[1].value !== '90') {
+  throw new Error('aggregate metric strip should fall back to embedding vectors for total tokens');
+}
+
+if (vectorRollupModel.aggregateMetrics[3].value !== '90') {
+  throw new Error('aggregate metric strip should fall back to embedding vectors for embedding tokens');
+}
+
 if (formatCost({ amount_usd: 0.02, source: 'estimated' }) !== '$0.02 estimated') {
   throw new Error('estimated cost provenance should survive formatting');
+}
+
+const scrapeReady = buildScrapeModel({ approvedCount: 5, scrapeConcurrency: 8, scrapeBrowserMode: 'lightpanda' });
+if (!scrapeReady.canStart || scrapeReady.approvedCount !== 5) {
+  throw new Error('scrape model should enable start when approved URLs exist');
+}
+
+const scrapePayload = scrapeStartPayload({ approvedCount: 5, scrapeConcurrency: 8, scrapeBrowserMode: 'lightpanda' });
+if (scrapePayload.prefer_approved !== true || scrapePayload.concurrency !== 8 || scrapePayload.browser_mode !== 'lightpanda') {
+  throw new Error('scrape payload should call the scrape API with settings-derived concurrency and browser mode');
+}
+
+const scrapeBlocked = buildScrapeModel({ approvedCount: 0 });
+if (scrapeBlocked.canStart || !scrapeBlocked.disabledHint.includes('Approve')) {
+  throw new Error('scrape model should block start when no approved URLs exist');
+}
+
+const archivedWiki = resolveWikiJobStatus({ liveStatus: 'running', reportStatus: 'archived', staleRunning: false });
+if (archivedWiki.label !== 'Archived') {
+  throw new Error('wiki hero status should prefer archived report status over stale live running');
+}
+
+const staleWiki = resolveWikiJobStatus({ liveStatus: 'running', reportStatus: 'running', staleRunning: true });
+if (staleWiki.label !== 'Stale') {
+  throw new Error('wiki hero status should reconcile stale running jobs when tmux is gone');
+}
+
+const buildSummary = summarizePiBuildEvents([
+  { type: 'message_update', text: 'token noise should be skipped' },
+  { type: 'tool_start', status: 'running', message: 'Compiling wiki pages' },
+  { type: 'tool_end', status: 'failed', message: 'No models match pattern "github-copilot/gpt-4o"' },
+]);
+if (!buildSummary.some((line) => line.includes('No models match pattern'))) {
+  throw new Error('build event summary should surface runtime failure lines without token noise');
 }

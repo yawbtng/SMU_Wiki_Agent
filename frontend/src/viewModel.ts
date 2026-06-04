@@ -49,6 +49,27 @@ export type EmbeddingModel = {
   disabledHint: string;
 };
 
+export type ScrapeModel = {
+  canStart: boolean;
+  buttonLabel: string;
+  disabledHint: string;
+  approvedCount: number;
+};
+
+export type ScrapeInput = {
+  approvedCount?: number;
+  scrapeConcurrency?: number;
+  scrapeBrowserMode?: string;
+  busy?: boolean;
+};
+
+export type WikiJobStatusInput = {
+  liveStatus?: unknown;
+  reportStatus?: unknown;
+  generationStatus?: unknown;
+  staleRunning?: boolean;
+};
+
 export type McpModel = {
   serverBand: StatusBandModel;
   serverMetrics: MetricModel[];
@@ -70,7 +91,7 @@ export type AgentRunSummary = AnyRecord & {
 };
 
 export type MetricsRollup = AnyRecord & {
-  window: string;
+  window?: string;
   run_count?: number;
   total_tokens?: number | null;
   llm_tokens?: number | null;
@@ -80,12 +101,99 @@ export type MetricsRollup = AnyRecord & {
   vector_count?: number;
 };
 
+export type MetricsChartPoint = {
+  label: string;
+  detail?: string;
+  tokens: number;
+  vectors: number;
+  cost: number;
+  runs: number;
+};
+
 export type MetricsModel = {
+  scopeNote: string;
   aggregateMetrics: MetricModel[];
   latestRunMetrics: MetricModel[];
   runRows: AnyRecord[];
   healthWarnings: string[];
 };
+
+export function metricsScopeNote(): string {
+  return 'Pi agent and embedding-index jobs only. Scrape runs and page outcomes stay on Runs and are not duplicated here.';
+}
+
+export function metricsRunVectors(run: AgentRunSummary): number {
+  const count = Number(run.embedding_usage?.vector_count ?? 0);
+  return Number.isFinite(count) ? count : 0;
+}
+
+export function metricsRunChartValue(run: AgentRunSummary): number {
+  const tokens = Number(run.total_model_tokens ?? NaN);
+  if (Number.isFinite(tokens) && tokens > 0) return tokens;
+  return metricsRunVectors(run);
+}
+
+export function metricsRollupVectors(rollup?: MetricsRollup): number {
+  const count = Number(rollup?.vector_count ?? 0);
+  return Number.isFinite(count) ? count : 0;
+}
+
+export function metricsRollupChartValue(rollup?: MetricsRollup): number {
+  const tokens = Number(rollup?.total_tokens ?? NaN);
+  if (Number.isFinite(tokens) && tokens > 0) return tokens;
+  return metricsRollupVectors(rollup);
+}
+
+export function metricCostAmount(cost: MetricCost | null | undefined): number {
+  if (!cost || cost.amount_usd === null || cost.amount_usd === undefined) return 0;
+  const amount = Number(cost.amount_usd);
+  return Number.isFinite(amount) ? amount : 0;
+}
+
+export function shortMetricsRunLabel(_value: unknown, index: number): string {
+  return String(index + 1);
+}
+
+export function buildMetricsRunTrendPoints(runs: AgentRunSummary[]): MetricsChartPoint[] {
+  return runs
+    .slice(0, 12)
+    .reverse()
+    .map((run, index) => ({
+      label: shortMetricsRunLabel(run.run_id, index),
+      detail: String(run.run_id ?? '').trim() || undefined,
+      tokens: metricsRunChartValue(run),
+      vectors: metricsRunVectors(run),
+      cost: metricCostAmount(run.cost),
+      runs: 1,
+    }));
+}
+
+export function buildMetricsRollupPoints(rollups: Record<string, MetricsRollup | undefined>): MetricsChartPoint[] {
+  return (['30d', '60d', '90d', '365d', 'all_time'] as const)
+    .map((label) => {
+      const rollup: MetricsRollup = rollups[label] ?? {};
+      return {
+        label: label === '365d' ? '1y' : label.replace('_', ' '),
+        tokens: metricsRollupChartValue(rollup),
+        vectors: metricsRollupVectors(rollup),
+        cost: metricCostAmount(rollup.total_cost),
+        runs: Number(rollup.run_count ?? 0) || 0,
+      };
+    })
+    .filter((point) => point.tokens > 0 || point.vectors > 0 || point.runs > 0 || point.cost > 0);
+}
+
+export function metricsTokenMixSegments(rollup?: MetricsRollup): { label: string; value: number; tone: 'llm' | 'embeddings' }[] {
+  const llm = Number(rollup?.llm_tokens ?? 0);
+  const embeddingRaw = rollup?.embedding_tokens;
+  const embedding =
+    embeddingRaw === null || embeddingRaw === undefined ? metricsRollupVectors(rollup) : Number(embeddingRaw);
+  const segments = [
+    { label: 'LLM', value: Number.isFinite(llm) ? llm : 0, tone: 'llm' as const },
+    { label: 'Embeddings', value: Number.isFinite(embedding) ? embedding : 0, tone: 'embeddings' as const },
+  ];
+  return segments.filter((segment) => segment.value > 0);
+}
 
 export function formatCount(value: unknown): string {
   const numeric = Number(value ?? 0);
@@ -103,6 +211,43 @@ export function formatCompact(value: unknown): string {
 export function formatOptionalCount(value: unknown): string {
   if (value === null || value === undefined || value === '') return 'Unknown';
   return formatCompact(value);
+}
+
+export function formatMetricsRollupTotalTokens(rollup?: MetricsRollup): string {
+  const vectors = metricsRollupVectors(rollup);
+  const raw = rollup?.total_tokens;
+  if ((raw === null || raw === undefined || Number(raw) === 0) && vectors > 0) {
+    return formatCount(vectors);
+  }
+  return formatOptionalCount(raw);
+}
+
+export function formatMetricsRollupEmbeddingTokens(rollup?: MetricsRollup): string {
+  const vectors = metricsRollupVectors(rollup);
+  const raw = rollup?.embedding_tokens;
+  if ((raw === null || raw === undefined) && vectors > 0) {
+    return formatCount(vectors);
+  }
+  return formatOptionalCount(raw);
+}
+
+export function formatMetricsRunTotalTokens(run: AgentRunSummary): string {
+  const vectors = metricsRunVectors(run);
+  const raw = run.total_model_tokens;
+  if ((raw === null || raw === undefined || Number(raw) === 0) && vectors > 0) {
+    return formatCount(vectors);
+  }
+  return formatOptionalCount(raw);
+}
+
+export function formatMetricsRunEmbeddingTokens(run: AgentRunSummary): string {
+  const embedding = run.embedding_usage ?? {};
+  const vectors = metricsRunVectors(run);
+  const raw = embedding.input_tokens;
+  if ((raw === null || raw === undefined) && vectors > 0) {
+    return formatCount(vectors);
+  }
+  return formatOptionalCount(raw);
 }
 
 export function formatCost(cost: MetricCost | null | undefined): string {
@@ -221,10 +366,13 @@ export function buildEmbeddingModel(embeddings: AnyRecord = {}): EmbeddingModel 
   const changedCount = Number(job.changed_document_count ?? embeddings.changed_document_count ?? 0);
   const wikiCount = Number(embeddings.wiki_index_count ?? 0);
   const rawCount = Number(embeddings.raw_index_count ?? 0);
-  const disabled = embeddings.auto_rebuild_enabled === false || embeddings.auto_rebuild_reason === 'embedding_disabled';
+  const rebuildReason = String(embeddings.auto_rebuild_reason ?? '');
+  const disabled = rebuildReason === 'embedding_disabled';
+  const blocked = !disabled && embeddings.auto_rebuild_enabled === false;
 
   let headline = 'Vectors are indexed and ready for search.';
   if (disabled) headline = 'Embeddings are disabled in Settings.';
+  else if (blocked) headline = 'Embedding rebuild is waiting for ready sources and wiki pages.';
   else if (indexHealth === 'stale') headline = 'Index may be stale — rebuild if answers look outdated.';
   else if (indexHealth === 'missing') headline = 'No index yet — run a rebuild after wiki sources are ready.';
 
@@ -245,10 +393,12 @@ export function buildEmbeddingModel(embeddings: AnyRecord = {}): EmbeddingModel 
     { label: 'Wiki vectors', value: formatCount(wikiCount) },
     { label: 'Source vectors', value: formatCount(rawCount) },
     { label: 'Pending changes', value: formatCount(changedCount) },
+    {
+      label: 'Reranker',
+      value: embeddings.reranker_ready ? 'On' : 'Off',
+      help: embeddings.reranker?.model || embeddings.reranker_model || undefined,
+    },
   ];
-  if (!embeddings.reranker_ready) {
-    stats.push({ label: 'Reranker', value: 'Off' });
-  }
 
   return {
     indexTone: toneForStatus(indexHealth),
@@ -258,9 +408,63 @@ export function buildEmbeddingModel(embeddings: AnyRecord = {}): EmbeddingModel 
     headline,
     lastRebuildLine,
     stats,
-    canRebuild: !disabled,
-    disabledHint: disabled ? 'Turn on embeddings in Settings to rebuild.' : '',
+    canRebuild: !disabled && !blocked,
+    disabledHint: disabled
+      ? 'Turn on embeddings in Settings to rebuild.'
+      : blocked
+        ? 'Missing wiki/index prerequisites — finish wiki build before rebuilding embeddings.'
+        : '',
   };
+}
+
+export function buildScrapeModel(input: ScrapeInput = {}): ScrapeModel {
+  const approvedCount = Number(input.approvedCount ?? 0);
+  const busy = Boolean(input.busy);
+  const canStart = approvedCount > 0 && !busy;
+  let disabledHint = '';
+  if (approvedCount <= 0) disabledHint = 'Approve URLs in Sources before starting a scrape.';
+  else if (busy) disabledHint = 'Scrape run is starting or already in progress.';
+  return {
+    canStart,
+    buttonLabel: busy ? 'Starting scrape…' : 'Start scrape',
+    disabledHint,
+    approvedCount,
+  };
+}
+
+export function scrapeStartPayload(input: ScrapeInput = {}): Record<string, unknown> {
+  const concurrency = Number(input.scrapeConcurrency ?? 4);
+  return {
+    concurrency: Number.isFinite(concurrency) ? Math.max(1, Math.min(16, Math.round(concurrency))) : 4,
+    prefer_approved: true,
+    browser_mode: String(input.scrapeBrowserMode ?? 'none').toLowerCase() === 'lightpanda' ? 'lightpanda' : 'none',
+  };
+}
+
+export function resolveWikiJobStatus(input: WikiJobStatusInput = {}): { label: string; tone: Tone } {
+  const candidates = [input.reportStatus, input.generationStatus, input.liveStatus]
+    .map((value) => String(value ?? '').trim().toLowerCase())
+    .filter(Boolean);
+  let status = candidates[0] || 'ready';
+  if (status === 'archived') status = 'archived';
+  else if (input.staleRunning && ['running', 'starting', 'initializing'].includes(status)) status = 'stale';
+  return { label: titleCase(status), tone: toneForStatus(status) };
+}
+
+export function summarizePiBuildEvents(events: AnyRecord[]): string[] {
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  for (const event of events.slice(-80)) {
+    const type = String(event.type ?? event.event ?? '').trim();
+    const status = String(event.status ?? '').trim();
+    const message = String(event.message ?? event.text ?? event.detail ?? '').trim();
+    const label = [type, status, message].filter(Boolean).join(' · ');
+    if (!label || seen.has(label)) continue;
+    seen.add(label);
+    if (type.startsWith('message_') || type === 'message_update') continue;
+    lines.push(label.slice(0, 240));
+  }
+  return lines.slice(-12);
 }
 
 export function buildMcpModel(mcp: AnyRecord = {}): McpModel {
@@ -295,21 +499,34 @@ export function buildMetricsModel({
   const latestLlm = latest.llm_usage ?? {};
   const latestEmbedding = latest.embedding_usage ?? {};
   const warnings = (latest.metrics_health?.warnings ?? []).map((item: unknown) => String(item));
+  const rollupVectors = metricsRollupVectors(rollup);
+  const tokensUnavailable = (rollup?.total_tokens === null || rollup?.total_tokens === undefined || rollup?.total_tokens === 0) && rollupVectors > 0;
+  const embeddingTokensUnavailable =
+    (rollup?.embedding_tokens === null || rollup?.embedding_tokens === undefined) && rollupVectors > 0;
   return {
+    scopeNote: metricsScopeNote(),
     aggregateMetrics: [
       { label: 'Runs', value: formatCount(rollup?.run_count) },
-      { label: 'Total Tokens', value: formatOptionalCount(rollup?.total_tokens) },
+      {
+        label: 'Total Tokens',
+        value: formatMetricsRollupTotalTokens(rollup),
+        help: tokensUnavailable ? 'Charts use embedding vectors when token totals are unavailable' : undefined,
+      },
       { label: 'LLM Tokens', value: formatOptionalCount(rollup?.llm_tokens) },
-      { label: 'Embedding Tokens', value: formatOptionalCount(rollup?.embedding_tokens) },
+      {
+        label: 'Embedding Tokens',
+        value: formatMetricsRollupEmbeddingTokens(rollup),
+        help: embeddingTokensUnavailable ? 'Vector counts shown in charts until token usage is recorded' : undefined,
+      },
       { label: 'Embedding Vectors', value: formatCount(rollup?.vector_count) },
       { label: 'Cost', value: formatCost(rollup?.total_cost) },
     ],
     latestRunMetrics: [
-      { label: 'Run Tokens', value: formatOptionalCount(latest.total_model_tokens) },
+      { label: 'Run Tokens', value: formatMetricsRunTotalTokens(latest) },
       { label: 'LLM Requests', value: formatCount(latestLlm.request_count) },
       { label: 'LLM Tokens', value: formatOptionalCount(latestLlm.total_tokens) },
       { label: 'Embedding Vectors', value: formatCount(latestEmbedding.vector_count) },
-      { label: 'Embedding Tokens', value: formatOptionalCount(latestEmbedding.input_tokens) },
+      { label: 'Embedding Tokens', value: formatMetricsRunEmbeddingTokens(latest) },
       { label: 'Cost', value: formatCost(latest.cost) },
     ],
     runRows: runs.map((run) => {
@@ -318,9 +535,9 @@ export function buildMetricsModel({
       return {
         run_id: run.run_id,
         status: titleCase(run.status ?? 'unknown'),
-        total_tokens: formatOptionalCount(run.total_model_tokens),
+        total_tokens: formatMetricsRunTotalTokens(run),
         llm_tokens: formatOptionalCount(llm.total_tokens),
-        embedding_tokens: formatOptionalCount(embedding.input_tokens),
+        embedding_tokens: formatMetricsRunEmbeddingTokens(run),
         vectors: formatCount(embedding.vector_count),
         cost: formatCost(run.cost),
         health: titleCase(run.metrics_health?.status ?? 'unknown'),

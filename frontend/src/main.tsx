@@ -1,4 +1,4 @@
-import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import ReactDOM from 'react-dom/client';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tan
 import {
   OPENROUTER_EMBEDDING_MODELS,
   OPENROUTER_LLM_MODELS,
+  SECRET_UNCHANGED,
   estimateOpenRouterCost,
   openRouterModelOption,
   settingsDraftFromState,
@@ -13,14 +14,24 @@ import {
   type OpenRouterModelOption,
 } from './settingsModel';
 import {
+  AgentRunSummary,
   AnyRecord,
   MetricModel,
   StatusBandModel,
   buildEmbeddingModel,
   buildMcpModel,
   buildMetricsModel,
+  buildMetricsRollupPoints,
+  buildMetricsRunTrendPoints,
   buildOverviewModel,
+  buildScrapeModel,
   formatCount,
+  formatCompact,
+  metricsTokenMixSegments,
+  resolveWikiJobStatus,
+  scrapeStartPayload,
+  summarizePiBuildEvents,
+  type MetricsChartPoint,
   titleCase,
   toneForStatus,
 } from './viewModel';
@@ -51,6 +62,18 @@ async function apiJson<T>(path: string, method: string, body: unknown): Promise<
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+async function apiForm<T>(path: string, method: string, body: FormData): Promise<T> {
+  const res = await fetch(path, { method, body });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+async function apiDelete<T>(path: string): Promise<T> {
+  const res = await fetch(path, { method: 'DELETE' });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
 }
@@ -350,7 +373,7 @@ const AreaGroupList = memo(function AreaGroupList({
 
 function approveMessageForSubpaths(subpaths: string[]): string {
   const terms = subpaths
-    .map((subpath) => subpath.replace(/^\//, '').replace(/\//g, ' ').trim())
+    .map((subpath) => `path:${normalizeSubpath(subpath)}`)
     .filter(Boolean);
   return `approve ${terms.join(' ')}`;
 }
@@ -392,12 +415,68 @@ function siteDisplay(siteId: string, appState?: AnyRecord): { name: string; url:
   };
 }
 
-function workspaceCardStatus(site: AnyRecord): { sources: string; wiki: string; runs: string } {
+function workspaceCardMeta(site: AnyRecord): { hasSources: boolean; hasWiki: boolean; runLabel: string } {
+  const runs = Number(site.run_count ?? 0);
+  const runLabel = runs === 1 ? '1 run' : `${formatCount(runs)} runs`;
   return {
-    sources: site.has_sources ? 'Sources ready' : 'No sources yet',
-    wiki: site.has_wiki ? 'Wiki present' : 'No wiki yet',
-    runs: `${formatCount(site.run_count ?? 0)} artifact runs`,
+    hasSources: Boolean(site.has_sources),
+    hasWiki: Boolean(site.has_wiki),
+    runLabel,
   };
+}
+
+function WorkspaceStrokeIcon({ className, children }: { className?: string; children: React.ReactNode }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {children}
+    </svg>
+  );
+}
+
+function WorkspaceSourcesIcon() {
+  return (
+    <WorkspaceStrokeIcon className="workspace-ui-icon workspace-ui-icon-inline">
+      <path d="M12 3 3 7.5 12 12l9-4.5L12 3z" />
+      <path d="M3 12.5 12 17l9-4.5" />
+      <path d="M3 17.5 12 22l9-4.5" />
+    </WorkspaceStrokeIcon>
+  );
+}
+
+function WorkspaceWikiIcon() {
+  return (
+    <WorkspaceStrokeIcon className="workspace-ui-icon workspace-ui-icon-inline">
+      <path d="M5 4h6a3.5 3.5 0 0 1 3.5 3.5V20H9.5A3.5 3.5 0 0 1 6 16.5V4z" />
+      <path d="M13 4h6v16h-6a3.5 3.5 0 0 1-3.5-3.5V7.5A3.5 3.5 0 0 1 13 4z" />
+    </WorkspaceStrokeIcon>
+  );
+}
+
+function WorkspaceRunsIcon() {
+  return (
+    <WorkspaceStrokeIcon className="workspace-ui-icon workspace-ui-icon-inline">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3 2" />
+    </WorkspaceStrokeIcon>
+  );
+}
+
+function formatDataRootDisplay(path: string): string {
+  const trimmed = path.trim().replace(/\/$/, '');
+  if (!trimmed) return '';
+  const parts = trimmed.split(/[/\\]/).filter(Boolean);
+  if (parts.length === 0) return 'data';
+  if (parts.length === 1) return parts[0];
+  return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
 }
 
 function activeWorkspaceStatus(runId: string, liveSnapshot: AnyRecord | null, activeTab: string): { label: string; detail: string } {
@@ -513,6 +592,35 @@ function App() {
     setSiteId('');
     setActiveTab('Overview');
   }, []);
+  const handleWorkspaceDeleted = useCallback((deletedSiteId: string) => {
+    if (siteId === deletedSiteId) {
+      setSiteId('');
+      setActiveTab('Overview');
+    }
+    queryClientHook.setQueryData(['sites'], (current: AnyRecord | undefined) => {
+      const sites = Array.isArray(current?.sites)
+        ? current.sites.filter((site: AnyRecord) => site.id !== deletedSiteId)
+        : [];
+      return { ...(current ?? {}), sites };
+    });
+    queryClientHook.setQueryData(['app-state'], (current: AnyRecord | undefined) => {
+      const state = current?.state;
+      if (!state || typeof state !== 'object') return current;
+      const workspaces = Array.isArray(state.workspaces)
+        ? state.workspaces.filter((item: AnyRecord) => item.id !== deletedSiteId)
+        : [];
+      const nextState = { ...state, workspaces };
+      if (state.active_workspace_id === deletedSiteId) nextState.active_workspace_id = '';
+      if (state.last_site_id === deletedSiteId) nextState.last_site_id = '';
+      return { ...(current ?? {}), state: nextState };
+    });
+    queryClientHook.removeQueries({ predicate: (query) => {
+      const key = query.queryKey;
+      return key.length > 1 && key[1] === deletedSiteId;
+    }});
+    queryClientHook.invalidateQueries({ queryKey: ['sites'] });
+    queryClientHook.invalidateQueries({ queryKey: ['app-state'] });
+  }, [queryClientHook, siteId]);
   const handleSiteDiscovered = useCallback((payload: AnyRecord) => {
     const nextSiteId = String(payload.site_id ?? '');
     if (!nextSiteId) return;
@@ -553,7 +661,7 @@ function App() {
   const selectedSite = sites.find((site: AnyRecord) => site.id === siteId);
   const activeStatus = workspaceOpen
     ? activeWorkspaceStatus(activeDisplay.runId, stream.snapshot ?? overviewHeader.data ?? null, activeTab)
-    : { label: 'Workspace', detail: 'Choose a workspace to begin' };
+    : { label: 'Status', detail: '—' };
 
   let bootstrapMessage: string | null = null;
   if (sitesQuery.isPending) {
@@ -573,8 +681,9 @@ function App() {
           connected={workspaceOpen ? stream.connected : false}
           dataRoot={sitesQuery.data?.data_root}
           siteCount={sites.length}
-          siteName={workspaceOpen ? activeDisplay.name : 'Workspace dashboard'}
-          siteUrl={workspaceOpen ? activeDisplay.url : 'Open or add a university workspace'}
+          siteName={workspaceOpen ? activeDisplay.name : 'Workspaces'}
+          siteUrl={workspaceOpen ? activeDisplay.url : 'Select a site below'}
+          dashboardMode={!workspaceOpen}
         />
         {bootstrapMessage ? (
           <EmptyState message={bootstrapMessage} />
@@ -584,18 +693,18 @@ function App() {
             appState={appState.data}
             onOpen={handleSiteSelected}
             onSiteDiscovered={handleSiteDiscovered}
+            onDeleted={handleWorkspaceDeleted}
           />
         ) : (
           <>
             <WorkspaceToolbar
+              siteId={siteId}
               siteName={activeDisplay.name}
               siteUrl={activeDisplay.url}
               activeStatus={activeStatus}
-              sites={sites}
-              siteId={siteId}
-              onSiteId={handleSiteSelected}
               onSiteDiscovered={handleSiteDiscovered}
               onReturnToDashboard={handleReturnToDashboard}
+              onDeleted={handleWorkspaceDeleted}
             />
             <WorkflowNav activeTab={activeTab} onTab={setActiveTab} />
             <TabView
@@ -624,16 +733,21 @@ const WorkspaceDashboard = memo(function WorkspaceDashboard({
   appState,
   onOpen,
   onSiteDiscovered,
+  onDeleted,
 }: {
   sites: AnyRecord[];
   appState?: AnyRecord;
   onOpen: (siteId: string) => void;
   onSiteDiscovered: (payload: AnyRecord) => void;
+  onDeleted: (siteId: string) => void;
 }) {
   const [showAdd, setShowAdd] = useState(false);
   const [discoverUrl, setDiscoverUrl] = useState('');
   const [discoverMessage, setDiscoverMessage] = useState('');
   const [discoverBusy, setDiscoverBusy] = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState('');
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteMessage, setDeleteMessage] = useState('');
 
   const runDiscovery = useCallback(async () => {
     const target = discoverUrl.trim();
@@ -652,12 +766,27 @@ const WorkspaceDashboard = memo(function WorkspaceDashboard({
     }
   }, [discoverUrl, onSiteDiscovered]);
 
+  const runDelete = useCallback(async (targetSiteId: string) => {
+    setDeleteBusy(true);
+    setDeleteMessage('');
+    try {
+      await apiDelete<AnyRecord>(`/api/sites/${encodeURIComponent(targetSiteId)}`);
+      onDeleted(targetSiteId);
+      setConfirmDeleteId('');
+      setDeleteMessage(`Removed workspace ${targetSiteId}.`);
+    } catch (error) {
+      setDeleteMessage(error instanceof Error ? error.message : 'Delete failed');
+    } finally {
+      setDeleteBusy(false);
+    }
+  }, [onDeleted]);
+
   return (
     <section className="workspace-dashboard" aria-label="Workspace dashboard">
       <div className="workspace-dashboard-head">
         <div>
-          <h2>Workspaces</h2>
-          <p className="workspace-dashboard-copy">Select a university workspace or discover a new site to begin operator workflows.</p>
+          <h2>All workspaces</h2>
+          <p className="workspace-dashboard-copy">Open a site or add a new university URL.</p>
         </div>
         <button type="button" className="ghost workspace-add-toggle" onClick={() => setShowAdd((value) => !value)}>
           {showAdd ? 'Cancel' : 'Add workspace'}
@@ -681,27 +810,64 @@ const WorkspaceDashboard = memo(function WorkspaceDashboard({
           {discoverMessage && <p className="inline-status">{discoverMessage}</p>}
         </div>
       )}
+      {deleteMessage && <p className="inline-status">{deleteMessage}</p>}
       {sites.length ? (
         <div className="workspace-card-grid">
           {sites.map((site) => {
             const display = siteDisplay(String(site.id), appState);
             const cardUrl = String(site.url ?? display.url);
-            const status = workspaceCardStatus(site);
+            const meta = workspaceCardMeta(site);
             const domain = cardUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
             return (
               <article className="workspace-card" key={String(site.id)}>
-                <div className="workspace-card-top">
-                  <div>
-                    <div className="workspace-card-id">{site.id}</div>
-                    <div className="workspace-card-name">{display.name}</div>
+                <div className="workspace-card-body">
+                  <h3 className="workspace-card-title">{display.name}</h3>
+                  {String(site.id) !== display.name && (
+                    <p className="workspace-card-slug">{site.id}</p>
+                  )}
+                  <p className="workspace-card-host" title={cardUrl}>{domain || cardUrl}</p>
+                  <div className="workspace-card-meta" aria-label="Workspace status">
+                  <span className={`workspace-meta-chip ${meta.hasSources ? 'on' : 'off'}`}>
+                    <WorkspaceSourcesIcon />
+                    Sources
+                  </span>
+                  <span className={`workspace-meta-chip ${meta.hasWiki ? 'on' : 'off'}`}>
+                    <WorkspaceWikiIcon />
+                    Wiki
+                  </span>
+                  <span className="workspace-meta-chip">
+                    <WorkspaceRunsIcon />
+                    {meta.runLabel}
+                  </span>
                   </div>
-                  <button type="button" onClick={() => onOpen(String(site.id))}>Open</button>
                 </div>
-                <div className="workspace-card-url" title={cardUrl}>{domain || cardUrl}</div>
-                <div className="workspace-card-status">
-                  <span className={site.has_sources ? 'ready' : 'muted'}>{status.sources}</span>
-                  <span className={site.has_wiki ? 'ready' : 'muted'}>{status.wiki}</span>
-                  <span>{status.runs}</span>
+                <div className="workspace-card-footer">
+                  <button type="button" className="workspace-card-open" onClick={() => onOpen(String(site.id))}>
+                    Open
+                  </button>
+                  {confirmDeleteId === String(site.id) ? (
+                    <div className="workspace-delete-confirm">
+                      <button
+                        type="button"
+                        className="danger"
+                        disabled={deleteBusy}
+                        onClick={() => void runDelete(String(site.id))}
+                      >
+                        {deleteBusy ? 'Deleting…' : 'Confirm'}
+                      </button>
+                      <button type="button" className="ghost" disabled={deleteBusy} onClick={() => setConfirmDeleteId('')}>
+                        Cancel
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      className="ghost workspace-card-delete"
+                      onClick={() => setConfirmDeleteId(String(site.id))}
+                    >
+                      Delete
+                    </button>
+                  )}
                 </div>
               </article>
             );
@@ -717,6 +883,7 @@ const WorkspaceDashboard = memo(function WorkspaceDashboard({
 const Hero = memo(function Hero({
   activeStatus,
   connected,
+  dashboardMode,
   dataRoot,
   siteCount,
   siteName,
@@ -724,65 +891,81 @@ const Hero = memo(function Hero({
 }: {
   activeStatus: { label: string; detail: string };
   connected: boolean;
+  dashboardMode: boolean;
   dataRoot?: string;
   siteCount: number;
   siteName: string;
   siteUrl: string;
 }) {
   return (
-    <section className="design-shell">
+    <section className={`design-shell${dashboardMode ? ' design-shell-dashboard' : ''}`}>
       <div className="design-shell-copy">
         <div>
-          <div className="design-kicker">Knowledge Operations Platform</div>
-          <h1>University Knowledge Ops</h1>
-          <p>Coordinate source intake, scrape operations, document review, wiki production, embeddings, and metrics from one operator workspace.</p>
+          <div className="design-kicker">Ultra-fast RAG</div>
+          <h1>{dashboardMode ? 'Workspaces' : siteName}</h1>
+          <p>
+            {dashboardMode
+              ? 'Build and query student wiki indexes from university sources.'
+              : 'Sources, wiki, embeddings, and metrics for this site.'}
+          </p>
         </div>
         <div className="design-stat-row">
           <div className="design-stat">
-            <div className="design-stat-label">Workflow</div>
-            <div className="design-stat-value">{tabs.length} stages</div>
+            <div className="design-stat-label">Tabs</div>
+            <div className="design-stat-value">{tabs.length}</div>
           </div>
           <div className="design-stat">
-            <div className="design-stat-label">Workspaces</div>
+            <div className="design-stat-label">Sites</div>
             <div className="design-stat-value">{formatCount(siteCount)}</div>
           </div>
-          <div className="design-stat wide">
-            <div className="design-stat-label">{activeStatus.label}</div>
-            <div className="design-stat-value mono">{activeStatus.detail}</div>
-          </div>
+          {!dashboardMode && (
+            <div className="design-stat wide">
+              <div className="design-stat-label">{activeStatus.label}</div>
+              <div className="design-stat-value mono">{activeStatus.detail}</div>
+            </div>
+          )}
         </div>
       </div>
-      <div className="hero-foot">
-        <span>{siteName}</span>
-        <span>{siteUrl}</span>
+      <div className={`hero-foot${dashboardMode ? ' hero-foot-dashboard' : ''}`}>
+        {!dashboardMode && (
+          <>
+            <span className="hero-foot-site">{siteName}</span>
+            <span className="hero-foot-url">{siteUrl}</span>
+          </>
+        )}
         <span className={connected ? 'live-pill' : 'live-pill muted'}>{connected ? 'Live' : 'Connecting'}</span>
-        <span className="data-root">{dataRoot}</span>
+        {dataRoot ? (
+          <span className="data-root">
+            <span className="data-root-path">{formatDataRootDisplay(dataRoot)}</span>
+          </span>
+        ) : null}
       </div>
     </section>
   );
 });
 
 const WorkspaceToolbar = memo(function WorkspaceToolbar({
+  siteId,
   siteName,
   siteUrl,
   activeStatus,
-  sites,
-  siteId,
-  onSiteId,
   onSiteDiscovered,
   onReturnToDashboard,
+  onDeleted,
 }: {
+  siteId: string;
   siteName: string;
   siteUrl: string;
   activeStatus: { label: string; detail: string };
-  sites: AnyRecord[];
-  siteId: string;
-  onSiteId: (siteId: string) => void;
   onSiteDiscovered: (payload: AnyRecord) => void;
   onReturnToDashboard: () => void;
+  onDeleted: (siteId: string) => void;
 }) {
   const [discoverUrl, setDiscoverUrl] = useState(siteUrl || '');
   const [discoverMessage, setDiscoverMessage] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteMessage, setDeleteMessage] = useState('');
   const autoDiscoverUrl = useRef(siteUrl || '');
   useEffect(() => {
     if (siteUrl && (!discoverUrl || discoverUrl === autoDiscoverUrl.current)) {
@@ -802,6 +985,20 @@ const WorkspaceToolbar = memo(function WorkspaceToolbar({
       setDiscoverMessage(error instanceof Error ? error.message : 'Discovery failed');
     }
   }, [discoverUrl, onSiteDiscovered]);
+  const runDelete = useCallback(async () => {
+    if (!siteId) return;
+    setDeleteBusy(true);
+    setDeleteMessage('');
+    try {
+      await apiDelete<AnyRecord>(`/api/sites/${encodeURIComponent(siteId)}`);
+      onDeleted(siteId);
+      setConfirmDelete(false);
+    } catch (error) {
+      setDeleteMessage(error instanceof Error ? error.message : 'Delete failed');
+    } finally {
+      setDeleteBusy(false);
+    }
+  }, [onDeleted, siteId]);
   return (
     <section className="workspace-row">
       <div className="workspace-toolbar">
@@ -811,7 +1008,7 @@ const WorkspaceToolbar = memo(function WorkspaceToolbar({
             type="button"
             className="icon-button workspace-close"
             onClick={onReturnToDashboard}
-            aria-label="Return to workspaces"
+            aria-label="Exit workspace"
           >
             ×
           </button>
@@ -823,19 +1020,34 @@ const WorkspaceToolbar = memo(function WorkspaceToolbar({
         </div>
       </div>
       <div className="workspace-actions">
-        <button type="button" className="ghost workspace-dashboard-link" onClick={onReturnToDashboard}>
-          Workspaces
-        </button>
-        <select value={siteId} onChange={(event) => onSiteId(event.target.value)} aria-label="Workspace">
-          {sites.map((site: AnyRecord) => (
-            <option key={site.id} value={site.id}>
-              {site.id}
-            </option>
-          ))}
-        </select>
-        <input value={discoverUrl} onChange={(event) => setDiscoverUrl(event.target.value)} placeholder="https://university.edu" aria-label="University URL" />
-        <button type="button" onClick={runDiscovery}>Discover university</button>
-        {discoverMessage && <span className="inline-status">{discoverMessage}</span>}
+        <div className="workspace-actions-bar">
+          <button type="button" className="ghost workspace-dashboard-link" onClick={onReturnToDashboard}>
+            Exit workspace
+          </button>
+          {confirmDelete ? (
+            <div className="workspace-delete-confirm">
+              <span className="inline-status">Delete {siteId} and all site data?</span>
+              <button type="button" className="danger" disabled={deleteBusy} onClick={() => void runDelete()}>
+                {deleteBusy ? 'Deleting…' : 'Confirm delete'}
+              </button>
+              <button type="button" className="ghost" disabled={deleteBusy} onClick={() => setConfirmDelete(false)}>
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <button type="button" className="ghost danger workspace-delete" onClick={() => setConfirmDelete(true)}>
+              Delete workspace
+            </button>
+          )}
+        </div>
+        <div className="workspace-discover-row">
+          <input value={discoverUrl} onChange={(event) => setDiscoverUrl(event.target.value)} placeholder="https://university.edu" aria-label="University URL" />
+          <button type="button" className="workspace-discover-btn" onClick={runDiscovery}>
+            Discover
+          </button>
+        </div>
+        {discoverMessage && <span className="inline-status workspace-actions-status">{discoverMessage}</span>}
+        {deleteMessage && <span className="inline-status danger workspace-actions-status">{deleteMessage}</span>}
       </div>
     </section>
   );
@@ -881,9 +1093,9 @@ const TabView = memo(function TabView({
   onClearPiEvents: () => void;
   appState?: AnyRecord;
 }) {
-  if (tab === 'Overview') return <Overview siteId={siteId} siteName={siteName} siteUrl={siteUrl} runId={runId} liveSnapshot={liveSnapshot} streamConnected={streamConnected} />;
+  if (tab === 'Overview') return <Overview siteId={siteId} siteName={siteName} siteUrl={siteUrl} runId={runId} liveSnapshot={liveSnapshot} streamConnected={streamConnected} appState={appState} />;
   if (tab === 'Sources') return <Sources siteId={siteId} hasSources={Boolean(site?.has_sources)} siteLabel={siteName} />;
-  if (tab === 'Runs') return <Runs siteId={siteId} runId={runId} />;
+  if (tab === 'Runs') return <Runs siteId={siteId} runId={runId} appState={appState} />;
   if (tab === 'Documents') return <Documents siteId={siteId} />;
   if (tab === 'Wiki') return <Wiki siteId={siteId} liveSnapshot={liveSnapshot} piEvents={piEvents} piSkill={piSkill} onClearPiEvents={onClearPiEvents} />;
   if (tab === 'Embeddings') return <Embeddings siteId={siteId} liveSnapshot={liveSnapshot} />;
@@ -893,6 +1105,23 @@ const TabView = memo(function TabView({
   return <EmptyState message={`${tab} is unavailable.`} />;
 });
 
+function scrapeSettingsFromAppState(appState?: AnyRecord) {
+  const state = appState?.state ?? {};
+  return {
+    scrapeConcurrency: Number(state.scrape_concurrency ?? 4),
+    scrapeBrowserMode: String(state.scrape_browser_mode ?? 'none'),
+  };
+}
+
+function invalidateScrapeQueries(queryClientHook: ReturnType<typeof useQueryClient>, siteId: string) {
+  queryClientHook.invalidateQueries({ queryKey: ['overview', siteId] });
+  queryClientHook.invalidateQueries({ queryKey: ['overview-header', siteId] });
+  queryClientHook.invalidateQueries({ queryKey: ['runs', siteId] });
+  queryClientHook.invalidateQueries({ queryKey: ['sources', siteId] });
+  queryClientHook.invalidateQueries({ queryKey: ['document-sources', siteId] });
+  queryClientHook.invalidateQueries({ queryKey: ['approved-urls', siteId] });
+}
+
 const Overview = memo(function Overview({
   siteId,
   siteName,
@@ -900,6 +1129,7 @@ const Overview = memo(function Overview({
   runId,
   liveSnapshot,
   streamConnected,
+  appState,
 }: {
   siteId: string;
   siteName: string;
@@ -907,7 +1137,12 @@ const Overview = memo(function Overview({
   runId: string;
   liveSnapshot: AnyRecord | null;
   streamConnected: boolean;
+  appState?: AnyRecord;
 }) {
+  const queryClientHook = useQueryClient();
+  const [scrapeBusy, setScrapeBusy] = useState(false);
+  const [scrapeMessage, setScrapeMessage] = useState('');
+  const scrapeSettings = scrapeSettingsFromAppState(appState);
   const overview = useQuery({
     queryKey: ['overview', siteId],
     queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/overview`),
@@ -937,11 +1172,39 @@ const Overview = memo(function Overview({
     approvedCount: approved.data?.count,
     run: activeRun,
   });
+  const scrapeModel = buildScrapeModel({
+    approvedCount: approved.data?.count,
+    ...scrapeSettings,
+    busy: scrapeBusy,
+  });
+  const startScrape = useCallback(async () => {
+    if (!siteId || !scrapeModel.canStart) return;
+    setScrapeBusy(true);
+    setScrapeMessage('Starting scrape…');
+    try {
+      const payload = scrapeStartPayload({ approvedCount: scrapeModel.approvedCount, ...scrapeSettings });
+      const result = await apiJson<AnyRecord>(`/api/sites/${encodeURIComponent(siteId)}/scrape`, 'POST', payload);
+      setScrapeMessage(`Scrape started · run ${String(result.run_id ?? 'unknown')} · ${formatCount(result.url_count)} URLs`);
+      invalidateScrapeQueries(queryClientHook, siteId);
+    } catch (error) {
+      setScrapeMessage(error instanceof Error ? error.message : 'Scrape failed');
+    } finally {
+      setScrapeBusy(false);
+    }
+  }, [queryClientHook, scrapeModel.approvedCount, scrapeModel.canStart, scrapeSettings, siteId]);
   return (
     <section>
       <h2>Overview</h2>
       <StatusBand band={model.statusBand} />
       <MetricStrip metrics={model.essentialMetrics} />
+      <div className="action-row embeddings-actions">
+        <button type="button" className="primary" disabled={!scrapeModel.canStart} onClick={() => void startScrape()}>
+          {scrapeModel.buttonLabel}
+        </button>
+        {(scrapeMessage || scrapeModel.disabledHint) && (
+          <span className="inline-status">{scrapeMessage || scrapeModel.disabledHint}</span>
+        )}
+      </div>
       <div className="two-col overview-grid">
         <Panel title="Source status">
           <DataTable columns={[["status", "Status"], ["count", "Count"]]} rows={model.sourceStatusRows} />
@@ -1046,6 +1309,14 @@ const Sources = memo(function Sources({ siteId, hasSources = true, siteLabel }: 
     () => effectiveAreaGroups(pendingProposal?.rejected_groups ?? []),
     [pendingProposal?.rejected_groups],
   );
+  const filteredRejectedUrlDetail = useCallback((payload: AnyRecord) => {
+    const filtered = Array.isArray(payload.filtered_rejected_urls) ? payload.filtered_rejected_urls : [];
+    const firstFiltered = filtered[0] as AnyRecord | undefined;
+    if (!firstFiltered) return '';
+    const reason = String(firstFiltered.reason ?? 'policy_rejected');
+    const detail = firstFiltered.detail ? `; first detail: ${String(firstFiltered.detail)}` : '';
+    return ` Filtered ${formatCount(filtered.length)} noisy URL${filtered.length === 1 ? '' : 's'}; first reason: ${reason}${detail}.`;
+  }, []);
   const draftApproved = useCallback(async () => {
     setApprovalMessage('Asking LLM to draft approved URLs…');
     const payload = await apiJson<AnyRecord>(`/api/sites/${siteId}/approved-urls/chat`, 'POST', {
@@ -1070,8 +1341,8 @@ const Sources = memo(function Sources({ siteId, hasSources = true, siteLabel }: 
     setApprovedMarkdown(String(payload.markdown ?? nextMarkdown));
     setPendingProposal(null);
     queryClientHook.setQueryData(['approved-urls', siteId], payload);
-    setApprovalMessage(`Saved ${formatCount(payload.count)} approved URLs. Future scrapes will use only this file.`);
-  }, [approvedMarkdown, queryClientHook, siteId]);
+    setApprovalMessage(`Saved ${formatCount(payload.count)} approved URLs.${filteredRejectedUrlDetail(payload)} Future scrapes will use only this file.`);
+  }, [approvedMarkdown, filteredRejectedUrlDetail, queryClientHook, siteId]);
   const sendApprovalChat = useCallback(async () => {
     const message = chatInput.trim();
     if (!message || chatPending) return;
@@ -1138,7 +1409,7 @@ const Sources = memo(function Sources({ siteId, hasSources = true, siteLabel }: 
         queryClientHook.setQueryData(['approved-urls', siteId], payload);
         queryClientHook.removeQueries({ queryKey: ['approved-urls-preview', siteId] });
         setSelectedAvailableSubpaths((current) => current.filter((item) => !subpaths.includes(item)));
-        setAreaActionStatus(`Saved ${formatCount(payload.count)} approved URLs (${formatCount(subpaths.length)} area${subpaths.length === 1 ? '' : 's'}).`);
+        setAreaActionStatus(`Saved ${formatCount(payload.count)} approved URLs (${formatCount(subpaths.length)} area${subpaths.length === 1 ? '' : 's'}).${filteredRejectedUrlDetail(payload)}`);
       } else {
         setPendingProposal(payload);
         queryClientHook.setQueryData(['approved-urls-preview', siteId], payload);
@@ -1152,7 +1423,7 @@ const Sources = memo(function Sources({ siteId, hasSources = true, siteLabel }: 
     } finally {
       setAreaActionPending(false);
     }
-  }, [approvalPrompt, approvedMarkdown, areaActionPending, queryClientHook, siteId]);
+  }, [approvalPrompt, approvedMarkdown, areaActionPending, filteredRejectedUrlDetail, queryClientHook, siteId]);
   const loadError = sources.isError || approved.isError;
   const loadErrorDetail = [
     sources.isError ? `sources (${sources.error instanceof Error ? sources.error.message : 'failed'})` : '',
@@ -1419,8 +1690,17 @@ const Sources = memo(function Sources({ siteId, hasSources = true, siteLabel }: 
   );
 });
 
-const Runs = memo(function Runs({ siteId, runId }: { siteId: string; runId: string }) {
+const Runs = memo(function Runs({ siteId, runId, appState }: { siteId: string; runId: string; appState?: AnyRecord }) {
+  const queryClientHook = useQueryClient();
   const [openRun, setOpenRun] = useState(runId);
+  const [scrapeBusy, setScrapeBusy] = useState(false);
+  const [scrapeMessage, setScrapeMessage] = useState('');
+  const scrapeSettings = scrapeSettingsFromAppState(appState);
+  const approved = useQuery({
+    queryKey: ['approved-urls', siteId],
+    queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/approved-urls`),
+    enabled: !!siteId,
+  });
   const runs = useQuery({
     queryKey: ['runs', siteId],
     queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/runs`),
@@ -1433,6 +1713,27 @@ const Runs = memo(function Runs({ siteId, runId }: { siteId: string; runId: stri
     enabled: Boolean(siteId && openRun && !['wiki', 'indexes', 'raw_sources', 'sources'].includes(openRun)),
   });
   const active = (runs.data?.runs ?? []).find((run: AnyRecord) => run.run_id === openRun) ?? (runs.data?.runs ?? [])[0];
+  const scrapeModel = buildScrapeModel({
+    approvedCount: approved.data?.count,
+    ...scrapeSettings,
+    busy: scrapeBusy,
+  });
+  const startScrape = useCallback(async () => {
+    if (!siteId || !scrapeModel.canStart) return;
+    setScrapeBusy(true);
+    setScrapeMessage('Starting scrape…');
+    try {
+      const payload = scrapeStartPayload({ approvedCount: scrapeModel.approvedCount, ...scrapeSettings });
+      const result = await apiJson<AnyRecord>(`/api/sites/${encodeURIComponent(siteId)}/scrape`, 'POST', payload);
+      setScrapeMessage(`Scrape started · run ${String(result.run_id ?? 'unknown')} · ${formatCount(result.url_count)} URLs`);
+      if (result.run_id) setOpenRun(String(result.run_id));
+      invalidateScrapeQueries(queryClientHook, siteId);
+    } catch (error) {
+      setScrapeMessage(error instanceof Error ? error.message : 'Scrape failed');
+    } finally {
+      setScrapeBusy(false);
+    }
+  }, [queryClientHook, scrapeModel.approvedCount, scrapeModel.canStart, scrapeSettings, siteId]);
   return (
     <section>
       <h2>Runs</h2>
@@ -1445,6 +1746,14 @@ const Runs = memo(function Runs({ siteId, runId }: { siteId: string; runId: stri
           actionLabel: active?.status?.state === 'completed' ? 'Review results' : 'Monitor run',
         }}
       />
+      <div className="action-row embeddings-actions">
+        <button type="button" className="primary" disabled={!scrapeModel.canStart} onClick={() => void startScrape()}>
+          {scrapeModel.buttonLabel}
+        </button>
+        {(scrapeMessage || scrapeModel.disabledHint) && (
+          <span className="inline-status">{scrapeMessage || scrapeModel.disabledHint}</span>
+        )}
+      </div>
       <MetricStrip
         metrics={[
           { label: 'Runs', value: formatCount(runs.data?.runs?.length) },
@@ -1473,9 +1782,23 @@ const Runs = memo(function Runs({ siteId, runId }: { siteId: string; runId: stri
 });
 
 const Documents = memo(function Documents({ siteId }: { siteId: string }) {
+  const queryClientHook = useQueryClient();
   const [group, setGroup] = useState('PDF pages');
   const [query, setQuery] = useState('');
   const [selectedPath, setSelectedPath] = useState('');
+  const [uploadFiles, setUploadFiles] = useState<File[]>([]);
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState('');
+  const [uploadError, setUploadError] = useState('');
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadInputId = useId();
+  const uploadFileSummary = useMemo(() => {
+    if (!uploadFiles.length) return 'PDF only · select one or more files';
+    if (uploadFiles.length === 1) return uploadFiles[0].name;
+    const names = uploadFiles.map((file) => file.name);
+    const preview = names.slice(0, 2).join(', ');
+    return names.length > 2 ? `${preview} + ${formatCount(names.length - 2)} more` : preview;
+  }, [uploadFiles]);
   const sources = useQuery({
     queryKey: ['document-sources', siteId],
     queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/sources?limit=1000`),
@@ -1494,10 +1817,71 @@ const Documents = memo(function Documents({ siteId }: { siteId: string }) {
     queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/document-preview?path=${encodeURIComponent(selectedPath)}`),
     enabled: Boolean(siteId && selectedPath),
   });
+  const uploadDocuments = useCallback(async () => {
+    if (!siteId || !uploadFiles.length || uploadBusy) return;
+    setUploadBusy(true);
+    setUploadError('');
+    setUploadStatus('Extracting documents...');
+    const form = new FormData();
+    uploadFiles.forEach((file) => form.append('files', file));
+    try {
+      const payload = await apiForm<AnyRecord>(`/api/sites/${encodeURIComponent(siteId)}/documents/upload`, 'POST', form);
+      setUploadStatus(
+        `Uploaded ${formatCount(payload.uploaded_count)} document${Number(payload.uploaded_count) === 1 ? '' : 's'} · ${formatCount(payload.accepted_count)} accepted · ${formatCount(payload.chunk_count)} chunks`,
+      );
+      setUploadFiles([]);
+      if (uploadInputRef.current) uploadInputRef.current.value = '';
+      await queryClientHook.invalidateQueries({ queryKey: ['document-sources', siteId] });
+      await queryClientHook.invalidateQueries({ queryKey: ['sources', siteId] });
+      await queryClientHook.invalidateQueries({ queryKey: ['overview', siteId] });
+      await queryClientHook.invalidateQueries({ queryKey: ['wiki-generation', siteId] });
+      await queryClientHook.invalidateQueries({ queryKey: ['wiki-pages', siteId] });
+      setGroup('PDF pages');
+      setSelectedPath('');
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : 'Upload failed');
+      setUploadStatus('');
+    } finally {
+      setUploadBusy(false);
+    }
+  }, [queryClientHook, siteId, uploadBusy, uploadFiles]);
   return (
     <section>
       <h2>Documents</h2>
       <div className="review-shell">
+        <Panel title="Add documents">
+          <div className="document-upload">
+            <p className="document-upload-lede">Upload PDFs to extract page markdown for wiki builds.</p>
+            <div className="document-upload-zone">
+              <input
+                id={uploadInputId}
+                ref={uploadInputRef}
+                className="document-upload-input"
+                type="file"
+                accept="application/pdf,.pdf"
+                multiple
+                onChange={(event) => setUploadFiles(Array.from(event.target.files ?? []))}
+              />
+              <label htmlFor={uploadInputId} className="document-upload-picker">
+                {uploadFiles.length ? 'Change PDFs' : 'Choose PDFs'}
+              </label>
+              <span className="document-upload-files" title={uploadFileSummary}>
+                {uploadFileSummary}
+              </span>
+            </div>
+            <div className="document-upload-actions">
+              <button type="button" className="primary" disabled={!uploadFiles.length || uploadBusy} onClick={() => void uploadDocuments()}>
+                {uploadBusy ? 'Extracting...' : 'Upload & extract'}
+              </button>
+              <span className={uploadError ? 'inline-status alert-inline' : 'inline-status'}>
+                {uploadError || uploadStatus || (uploadFiles.length ? `${formatCount(uploadFiles.length)} ready` : 'No files selected')}
+              </span>
+            </div>
+            <p className="document-upload-help">
+              Extracted pages appear below as PDF pages. Use Wiki {'>'} Build wiki after upload to generate or refresh wiki pages.
+            </p>
+          </div>
+        </Panel>
         <div className="document-toolbar">
           <Segmented options={groups} value={group} onChange={(next) => { setGroup(next); setSelectedPath(''); }} />
           <ToolbarInput value={query} onChange={setQuery} placeholder="Search title, path, source ID" />
@@ -1567,11 +1951,17 @@ const Wiki = memo(function Wiki({
     enabled: !!siteId,
     refetchInterval: 4000,
   });
+  const overview = liveSnapshot ?? {};
   const wikiReport = (wikiJob.data?.report ?? {}) as AnyRecord;
+  const wikiStatus = resolveWikiJobStatus({
+    liveStatus: overview.wiki?.job_status,
+    reportStatus: wikiReport.job_status ?? wikiReport.status,
+    generationStatus: wikiGeneration.data?.job_status,
+    staleRunning: Boolean(wikiJob.data?.stale_running ?? wikiReport.stale_running),
+  });
   const wikiJobRunning = ['running', 'starting', 'initializing'].includes(
     String(wikiReport.job_status ?? wikiReport.status ?? '').toLowerCase(),
-  );
-  const overview = liveSnapshot ?? {};
+  ) && !['archived', 'stale', 'failed'].includes(wikiStatus.label.toLowerCase());
   useEffect(() => {
     if (!selectedPath && pages.data?.pages?.[0]?.path) setSelectedPath(`wiki/${pages.data.pages[0].path}`);
   }, [pages.data, selectedPath]);
@@ -1618,6 +2008,8 @@ const Wiki = memo(function Wiki({
   }, [piEvents, wikiJob.data?.pi_events]);
 
   const buildText = useMemo(() => {
+    const summary = summarizePiBuildEvents(displayBuildEvents);
+    if (summary.length) return summary.join('\n');
     const chunks: string[] = [];
     for (const event of displayBuildEvents) {
       const label = piEventLabel(event);
@@ -1643,6 +2035,9 @@ const Wiki = memo(function Wiki({
     );
     await queryClientHook.invalidateQueries({ queryKey: ['tmux-sessions', siteId] });
     await queryClientHook.invalidateQueries({ queryKey: ['wiki-job', siteId] });
+    await queryClientHook.invalidateQueries({ queryKey: ['wiki-generation', siteId] });
+    await queryClientHook.invalidateQueries({ queryKey: ['overview-header', siteId] });
+    await queryClientHook.invalidateQueries({ queryKey: ['overview', siteId] });
   }, [queryClientHook, siteId]);
 
   return (
@@ -1651,10 +2046,10 @@ const Wiki = memo(function Wiki({
       <StatusBand
         band={{
           title: 'Wiki build',
-          subtitle: 'Keep generated wiki pages synchronized with prepared web, PDF, and document sources.',
-          statusLabel: titleCase(overview.wiki?.job_status ?? 'Ready'),
-          tone: toneForStatus(overview.wiki?.job_status ?? 'ready'),
-          actionLabel: String(overview.wiki?.job_status ?? '').toLowerCase().includes('complete') ? 'Wiki current' : 'Monitor wiki',
+          subtitle: String(wikiReport.last_error || 'Keep generated wiki pages synchronized with prepared web, PDF, and document sources.'),
+          statusLabel: wikiStatus.label,
+          tone: wikiStatus.tone,
+          actionLabel: wikiStatus.label.toLowerCase().includes('complete') ? 'Wiki current' : 'Monitor wiki',
         }}
       />
       <MetricStrip
@@ -1729,10 +2124,13 @@ const Wiki = memo(function Wiki({
           </p>
         )}
         {buildStructured.length > 0 && (
-          <details className="operator-details" open>
+          <details className="operator-details">
             <summary>Structured events (latest {buildStructured.length})</summary>
             <pre className="json">{JSON.stringify(buildStructured, null, 2)}</pre>
           </details>
+        )}
+        {String(wikiReport.last_error ?? '').trim() && (
+          <p className="embeddings-rebuild-line alert soft">{String(wikiReport.last_error)}</p>
         )}
       </Panel>
       <Panel title="Wiki generation status">
@@ -1827,6 +2225,23 @@ function embeddingPhaseLabel(phase: string): string {
   }
 }
 
+function formatProgressUsd(value: unknown): string {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) return '$0.00';
+  if (amount < 0.01) return `$${amount.toFixed(4)}`;
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(amount);
+}
+
+function formatProgressDuration(value: unknown): string {
+  const totalSeconds = Math.max(0, Math.round(Number(value) || 0));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return `${minutes}m ${seconds}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
 const Embeddings = memo(function Embeddings({ siteId, liveSnapshot }: { siteId: string; liveSnapshot: AnyRecord | null }) {
   const queryClientHook = useQueryClient();
   const embeddings = liveSnapshot?.embeddings ?? {};
@@ -1860,6 +2275,20 @@ const Embeddings = memo(function Embeddings({ siteId, liveSnapshot }: { siteId: 
   const phase = String(jobPoll.data?.phase ?? '');
   const phaseLabel = embeddingPhaseLabel(phase);
   const busy = ['Running', 'Queued'].includes(model.jobLabel);
+  const progress = ((jobPoll.data?.progress as AnyRecord | undefined) ?? (liveEmbeddings.job_state as AnyRecord | undefined)?.progress ?? {}) as AnyRecord;
+  const progressStage = String(progress.stage ?? '');
+  const progressPercent = Math.max(0, Math.min(100, Number(progress.percent_complete ?? 0) || 0));
+  const progressTotal = Number(progress.total_changed_document_count ?? progress.changed_document_count ?? 0) || 0;
+  const progressEmbedded = Number(progress.embedded_document_count ?? 0) || 0;
+  const hasProgress = Boolean(progressStage || progressTotal || progress.estimated_input_tokens);
+  const progressLabel = String(progress.label ?? phaseLabel ?? 'Embedding rebuild');
+  const progressMeta = [
+    progressTotal > 0 ? `${formatCount(progressEmbedded)} / ${formatCount(progressTotal)} chunks` : '',
+    progress.estimated_seconds_remaining != null && progressStage === 'embedding_batch' ? `ETA ${formatProgressDuration(progress.estimated_seconds_remaining)}` : '',
+    progress.estimated_input_tokens != null ? `${formatCount(progress.estimated_input_tokens)} est. input tokens` : '',
+    progress.estimated_embedding_cost_usd != null ? `${formatProgressUsd(progress.estimated_embedding_cost_usd)} est. cost` : '',
+    progress.embedding_model ? String(progress.embedding_model) : '',
+  ].filter(Boolean);
 
   useEffect(() => {
     if (initialActive) setWatchJob(true);
@@ -1924,6 +2353,16 @@ const Embeddings = memo(function Embeddings({ siteId, liveSnapshot }: { siteId: 
               <strong>{phaseLabel || (jobPoll.isFetching ? 'Checking status…' : 'Rebuild activity')}</strong>
               {jobPoll.isFetching && <span className="inline-status">Updating…</span>}
             </div>
+            {hasProgress && (
+              <div className="progress-line embedding-progress">
+                <div className="embedding-progress-head">
+                  <span>{progressLabel}</span>
+                  <strong>{progressPercent.toFixed(1)}%</strong>
+                </div>
+                <progress max={100} value={progressPercent} aria-label="Embedding rebuild progress" />
+                <div className="embedding-progress-meta">{progressMeta.join(' · ')}</div>
+              </div>
+            )}
             <pre className="embeddings-activity-log">
               {logTail.length ? logTail.join('\n') : 'Waiting for worker log output…'}
             </pre>
@@ -2031,12 +2470,14 @@ const McpServer = memo(function McpServer() {
             ['wiki_ready', 'Wiki'],
             ['index_ready', 'Index'],
             ['mcp_enabled', 'MCP'],
+            ['mcp_block_reason', 'Block reason'],
           ]}
           rows={universities.map((row) => ({
             ...row,
             wiki_ready: row.wiki_ready ? 'ready' : 'missing',
             index_ready: row.index_ready ? 'ready' : 'missing',
             mcp_enabled: row.mcp_enabled ? 'enabled' : 'not ready',
+            mcp_block_reason: row.mcp_enabled ? '—' : String(row.mcp_block_reason || 'rebuild index'),
           }))}
         />
       </Panel>
@@ -2053,36 +2494,49 @@ const Metrics = memo(function Metrics({ siteId }: { siteId: string }) {
   const [selectedRunId, setSelectedRunId] = useState('');
   const runs = useQuery({
     queryKey: ['agent-metrics-runs', siteId],
-    queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/metrics/runs`),
+    queryFn: () => api<AnyRecord>(`/api/sites/${encodeURIComponent(siteId)}/metrics/runs`),
     enabled: !!siteId,
     refetchInterval: 5000,
   });
   const rollups = useQuery({
     queryKey: ['agent-metrics-rollups', siteId],
-    queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/metrics/rollups?windows=30d,60d,90d,365d&include_all_time=true`),
+    queryFn: () =>
+      api<AnyRecord>(
+        `/api/sites/${encodeURIComponent(siteId)}/metrics/rollups?windows=30d,60d,90d,365d&include_all_time=true`,
+      ),
     enabled: !!siteId,
     refetchInterval: 5000,
   });
-  const rows = runs.data?.runs ?? [];
-  const selectedRun = selectedRunId ? rows.find((run: AnyRecord) => run.run_id === selectedRunId) : rows[0];
+  const rows: AgentRunSummary[] = Array.isArray(runs.data?.runs) ? (runs.data.runs as AgentRunSummary[]) : [];
+  const selectedRun = selectedRunId ? rows.find((run) => run.run_id === selectedRunId) : rows[0];
   const rollup = rollups.data?.rollups?.[windowLabel] ?? rollups.data?.rollups?.['30d'];
   const model = buildMetricsModel({ runs: rows, rollup });
   const selectedModel = buildMetricsModel({ runs: selectedRun ? [selectedRun] : [] });
-  const trendPoints = useMemo(() => buildRunTrendPoints(rows), [rows]);
-  const rollupPoints = useMemo(() => buildRollupPoints(rollups.data?.rollups ?? {}), [rollups.data]);
-  const mix = metricNumber(rollup?.llm_tokens) + metricNumber(rollup?.embedding_tokens) > 0
-    ? [
-        { label: 'LLM', value: metricNumber(rollup?.llm_tokens), color: 'var(--primary)' },
-        { label: 'Embeddings', value: metricNumber(rollup?.embedding_tokens), color: 'var(--electric)' },
-      ]
-    : [];
+  const trendPoints = useMemo(() => buildMetricsRunTrendPoints(rows), [rows]);
+  const rollupPoints = useMemo(() => buildMetricsRollupPoints(rollups.data?.rollups ?? {}), [rollups.data]);
+  const mix = useMemo(() => metricsTokenMixSegments(rollup), [rollup]);
+  const metricsError =
+    runs.isError || rollups.isError
+      ? [runs.error, rollups.error]
+          .filter((error): error is Error => error instanceof Error)
+          .map((error) => error.message)
+          .join(' · ')
+      : '';
+  const trendUsesVectors = trendPoints.some((point) => point.vectors > 0 && point.tokens === point.vectors);
+  const rollupUsesVectors = rollupPoints.some((point) => point.vectors > 0 && point.tokens === point.vectors);
   return (
-    <section>
+    <section className="metrics-workspace">
       <h2>Metrics</h2>
+      <p className="metrics-scope-note">{model.scopeNote}</p>
+      {metricsError && <div className="alert">Metrics feed unavailable: {metricsError}</div>}
+      {(runs.isLoading || rollups.isLoading) && !metricsError && <p className="inline-status">Loading Pi agent metrics…</p>}
       <Panel title="Pi Agent Metrics Overview">
         <div className="metrics-overview-head">
           <div>
-            <p className="panel-copy">Aggregate health, spend, and token movement across Pi runs. Charts refresh with the live metrics feed.</p>
+            <p className="panel-copy">
+              Aggregate health, spend, and token movement across Pi runs and embedding rebuilds. Charts refresh from the metrics API
+              {trendUsesVectors ? ' and fall back to embedding vector counts when token totals are unavailable' : ''}.
+            </p>
           </div>
           <div className="segmented">
             {['30d', '60d', '90d', '365d', 'all_time'].map((label) => (
@@ -2094,10 +2548,20 @@ const Metrics = memo(function Metrics({ siteId }: { siteId: string }) {
         </div>
         <MetricStrip metrics={model.aggregateMetrics} />
         <div className="metrics-dashboard-grid">
-          <MiniBarChart title="Token trend by run" points={trendPoints} valueKey="tokens" valueLabel="tokens" />
+          <MiniBarChart
+            title={trendUsesVectors ? 'Activity trend by run (vectors when tokens missing)' : 'Token trend by run'}
+            points={trendPoints}
+            valueKey="tokens"
+            valueLabel={trendUsesVectors ? 'vectors' : 'tokens'}
+          />
           <MiniLineChart title="Cost trend by run" points={trendPoints} valueKey="cost" valueLabel="USD" />
-          <TokenMixChart title={`${windowLabel.replace('_', ' ')} token mix`} segments={mix} />
-          <MiniBarChart title="Window comparison" points={rollupPoints} valueKey="tokens" valueLabel="tokens" />
+          <TokenMixChart title={`${windowLabel.replace('_', ' ')} usage mix`} segments={mix} />
+          <MiniBarChart
+            title={rollupUsesVectors ? 'Window comparison (vectors when tokens missing)' : 'Window comparison'}
+            points={rollupPoints}
+            valueKey="tokens"
+            valueLabel={rollupUsesVectors ? 'vectors' : 'activity'}
+          />
         </div>
       </Panel>
       <Panel title="Selected Run Detail">
@@ -2139,93 +2603,100 @@ const Metrics = memo(function Metrics({ siteId }: { siteId: string }) {
   );
 });
 
-type ChartPoint = { label: string; tokens: number; cost: number; runs: number };
-
-type TokenSegment = { label: string; value: number; color: string };
-
-function metricNumber(value: unknown): number {
-  const numeric = Number(value ?? 0);
+function chartMetricValue(point: MetricsChartPoint, valueKey: keyof MetricsChartPoint): number {
+  const numeric = Number(point[valueKey] ?? 0);
   return Number.isFinite(numeric) ? numeric : 0;
 }
 
-function metricCostValue(cost: unknown): number {
-  if (!cost || typeof cost !== 'object') return 0;
-  const amount = Number((cost as AnyRecord).amount_usd ?? 0);
-  return Number.isFinite(amount) ? amount : 0;
-}
-
-function shortRunLabel(value: unknown, index: number): string {
-  const text = String(value ?? `run-${index + 1}`);
-  return text.length > 14 ? `${text.slice(0, 6)}…${text.slice(-5)}` : text;
-}
-
-function buildRunTrendPoints(runs: AnyRecord[]): ChartPoint[] {
-  return runs.slice(0, 12).reverse().map((run, index) => ({
-    label: shortRunLabel(run.run_id, index),
-    tokens: metricNumber(run.total_model_tokens),
-    cost: metricCostValue(run.cost),
-    runs: 1,
-  }));
-}
-
-function buildRollupPoints(rollups: AnyRecord): ChartPoint[] {
-  return ['30d', '60d', '90d', '365d', 'all_time']
-    .map((label) => {
-      const rollup = rollups[label] ?? {};
-      return {
-        label: label === '365d' ? '1y' : label.replace('_', ' '),
-        tokens: metricNumber(rollup.total_tokens),
-        cost: metricCostValue(rollup.total_cost),
-        runs: metricNumber(rollup.run_count),
-      };
-    })
-    .filter((point) => point.tokens > 0 || point.runs > 0 || point.cost > 0);
-}
-
-function MiniBarChart({ title, points, valueKey, valueLabel }: { title: string; points: ChartPoint[]; valueKey: keyof ChartPoint; valueLabel: string }) {
-  const max = Math.max(...points.map((point) => metricNumber(point[valueKey])), 0);
+function MiniBarChart({
+  title,
+  points,
+  valueKey,
+  valueLabel,
+}: {
+  title: string;
+  points: MetricsChartPoint[];
+  valueKey: keyof MetricsChartPoint;
+  valueLabel: string;
+}) {
+  const values = points.map((point) => chartMetricValue(point, valueKey));
+  const max = Math.max(...values, 0);
+  const hasValues = values.some((value) => value > 0);
   return (
     <article className="metric-chart-card">
       <div className="metric-chart-title">{title}</div>
-      {points.length ? (
+      {points.length && hasValues ? (
         <div className="metric-bars" role="img" aria-label={title}>
           {points.map((point) => {
-            const value = metricNumber(point[valueKey]);
-            const height = max > 0 ? Math.max(6, (value / max) * 100) : 0;
+            const value = chartMetricValue(point, valueKey);
+            const share = max > 0 && value > 0 ? value / max : 0;
+            const height = share > 0 ? Math.max(share * 100, 10) : 0;
+            const markerValue = value > 0 ? formatCompact(value) : null;
+            const tooltipLead = point.detail?.trim() || point.label;
             return (
-              <div className="metric-bar-column" key={`${title}-${point.label}`} title={`${point.label}: ${formatCount(value)} ${valueLabel}`}>
-                <div className="metric-bar-track"><span style={{ height: `${height}%` }} /></div>
-                <small>{point.label}</small>
+              <div
+                className="metric-bar-column"
+                key={`${title}-${point.label}-${point.detail ?? ''}`}
+                title={`${tooltipLead}: ${formatCount(value)} ${valueLabel}`}
+              >
+                <div className="metric-bar-track">
+                  {height > 0 ? (
+                    <div className="metric-bar-fill" style={{ height: `${height}%` }}>
+                      {markerValue ? <span className="metric-bar-marker">{markerValue}</span> : null}
+                    </div>
+                  ) : null}
+                </div>
+                <small className="metric-bar-label">{point.label}</small>
               </div>
             );
           })}
         </div>
       ) : (
-        <EmptyState message="No aggregate metrics available yet." />
+        <EmptyState message="No Pi agent activity recorded for this view yet." />
       )}
     </article>
   );
 }
 
-function MiniLineChart({ title, points, valueKey, valueLabel }: { title: string; points: ChartPoint[]; valueKey: keyof ChartPoint; valueLabel: string }) {
-  const values = points.map((point) => metricNumber(point[valueKey]));
+function MiniLineChart({
+  title,
+  points,
+  valueKey,
+  valueLabel,
+}: {
+  title: string;
+  points: MetricsChartPoint[];
+  valueKey: keyof MetricsChartPoint;
+  valueLabel: string;
+}) {
+  const values = points.map((point) => chartMetricValue(point, valueKey));
   const max = Math.max(...values, 0);
-  const path = points.map((point, index) => {
-    const x = points.length <= 1 ? 50 : (index / (points.length - 1)) * 100;
-    const y = max > 0 ? 92 - (metricNumber(point[valueKey]) / max) * 78 : 92;
-    return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
-  }).join(' ');
+  const hasValues = values.some((value) => value > 0);
+  const path = points
+    .map((point, index) => {
+      const x = points.length <= 1 ? 50 : (index / (points.length - 1)) * 100;
+      const y = max > 0 ? 92 - (chartMetricValue(point, valueKey) / max) * 78 : 92;
+      return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
+    })
+    .join(' ');
   return (
     <article className="metric-chart-card">
       <div className="metric-chart-title">{title}</div>
-      {points.length ? (
+      {points.length && hasValues ? (
         <div className="metric-line-wrap" role="img" aria-label={title}>
           <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
             <path className="metric-line-fill" d={`${path} L 100 100 L 0 100 Z`} />
             <path className="metric-line" d={path} />
           </svg>
           <div className="metric-line-labels">
-            {points.map((point) => <small key={`${title}-${point.label}`} title={`${point.label}: ${metricNumber(point[valueKey]).toFixed(valueKey === 'cost' ? 4 : 0)} ${valueLabel}`}>{point.label}</small>)}
+            {points.map((point) => (
+              <small
+                key={`${title}-${point.label}`}
+                title={`${point.label}: ${chartMetricValue(point, valueKey).toFixed(valueKey === 'cost' ? 4 : 0)} ${valueLabel}`}
+              >
+                {point.label}
+              </small>
+            ))}
           </div>
         </div>
       ) : (
@@ -2235,7 +2706,13 @@ function MiniLineChart({ title, points, valueKey, valueLabel }: { title: string;
   );
 }
 
-function TokenMixChart({ title, segments }: { title: string; segments: TokenSegment[] }) {
+function TokenMixChart({
+  title,
+  segments,
+}: {
+  title: string;
+  segments: { label: string; value: number; tone: 'llm' | 'embeddings' }[];
+}) {
   const total = segments.reduce((sum, segment) => sum + segment.value, 0);
   return (
     <article className="metric-chart-card">
@@ -2244,11 +2721,21 @@ function TokenMixChart({ title, segments }: { title: string; segments: TokenSegm
         <>
           <div className="token-mix-bar">
             {segments.map((segment) => (
-              <span key={segment.label} style={{ width: `${(segment.value / total) * 100}%`, background: segment.color }} title={`${segment.label}: ${formatCount(segment.value)}`} />
+              <span
+                key={segment.label}
+                className={`token-mix-${segment.tone}`}
+                style={{ width: `${(segment.value / total) * 100}%` }}
+                title={`${segment.label}: ${formatCount(segment.value)}`}
+              />
             ))}
           </div>
           <div className="token-mix-legend">
-            {segments.map((segment) => <span key={segment.label}><i style={{ background: segment.color }} />{segment.label} · {formatCount(segment.value)}</span>)}
+            {segments.map((segment) => (
+              <span key={segment.label} className={`token-mix-${segment.tone}`}>
+                <i />
+                {segment.label} · {formatCount(segment.value)}
+              </span>
+            ))}
           </div>
         </>
       ) : (
@@ -2309,7 +2796,7 @@ const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) 
     setSaving(true);
     setSaveMessage('');
     try {
-      const payload = settingsSavePayloadFromDraft(draft);
+      const payload = settingsSavePayloadFromDraft(draft, state);
       await apiJson<AnyRecord>('/api/app-state', 'PUT', { payload });
       await queryClientHook.invalidateQueries({ queryKey: ['app-state'] });
       setSaveMessage('Settings saved.');
@@ -2328,7 +2815,7 @@ const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) 
         metrics={[
           { label: 'OpenRouter', value: state.openrouter_api_key ? 'set' : 'missing' },
           { label: 'Scraper', value: fmt(state.scrape_browser_mode, 'none') },
-          { label: 'Wiki runtime', value: fmt(state.wiki_builder_runtime, 'pi') },
+          { label: 'Wiki build', value: 'LLM Wiki compile' },
           { label: 'Tmux grace', value: `${formatCount(Math.round((state.tmux_session_grace_seconds ?? 1800) / 60))} min` },
         ]}
       />
@@ -2339,7 +2826,8 @@ const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) 
             <input
               type="password"
               autoComplete="off"
-              value={draft.openrouter_api_key}
+              placeholder={draft.openrouter_api_key === SECRET_UNCHANGED ? 'Saved key present — enter a new key to replace' : 'Paste OpenRouter key'}
+              value={draft.openrouter_api_key === SECRET_UNCHANGED ? '' : draft.openrouter_api_key}
               onChange={(event) => setDraft((current) => ({ ...current, openrouter_api_key: event.target.value }))}
             />
           </label>
@@ -2348,7 +2836,8 @@ const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) 
             <input
               type="password"
               autoComplete="off"
-              value={draft.tavily_api_key}
+              placeholder={draft.tavily_api_key === SECRET_UNCHANGED ? 'Saved key present — enter a new key to replace' : 'Paste Tavily key'}
+              value={draft.tavily_api_key === SECRET_UNCHANGED ? '' : draft.tavily_api_key}
               onChange={(event) => setDraft((current) => ({ ...current, tavily_api_key: event.target.value }))}
             />
           </label>
@@ -2437,25 +2926,7 @@ const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) 
               onChange={(event) => setDraft((current) => ({ ...current, tmux_session_grace_minutes: Number(event.target.value) }))}
             />
           </label>
-          <p className="setting-help">Finished wiki tmux sessions stay open this long for log review, then auto-close.</p>
-          <label className="setting-row">
-            <span>Wiki builder runtime</span>
-            <select
-              value={draft.wiki_builder_runtime}
-              onChange={(event) => setDraft((current) => ({ ...current, wiki_builder_runtime: event.target.value }))}
-            >
-              <option value="pi">LLM Wiki v2 compile (Pi)</option>
-              <option value="python">Lint/index only</option>
-            </select>
-          </label>
-          <label className="setting-row setting-row-inline">
-            <span>Lint/index only (skip LLM compile)</span>
-            <input
-              type="checkbox"
-              checked={draft.wiki_skip_pi}
-              onChange={(event) => setDraft((current) => ({ ...current, wiki_skip_pi: event.target.checked }))}
-            />
-          </label>
+          <p className="setting-help">Finished wiki tmux sessions stay open this long for log review, then auto-close. Wiki builds always run the LLM Wiki compile path (Pi).</p>
           <label className="setting-row setting-row-inline">
             <span>Archive tmux session logs</span>
             <input
@@ -2643,7 +3114,12 @@ function rowsForGroup(rows: AnyRecord[], group: string): AnyRecord[] {
   return rows.filter((row) => !['web', 'pdf'].includes(row.source_kind));
 }
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
+const rootElement = document.getElementById('root')! as HTMLElement & {
+  __uopsReactRoot__?: ReturnType<typeof ReactDOM.createRoot>;
+};
+const reactRoot = rootElement.__uopsReactRoot__ ?? ReactDOM.createRoot(rootElement);
+rootElement.__uopsReactRoot__ = reactRoot;
+reactRoot.render(
   <QueryClientProvider client={queryClient}>
     <App />
   </QueryClientProvider>,
