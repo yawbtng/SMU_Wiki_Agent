@@ -31,6 +31,8 @@ Git rules:
 - Use small GitHub-style commits: one concern per commit, clear imperative message, no unrelated files.
 - Commit only explicit paths/hunks. Do not `git add .` in this repo.
 - Never stage, revert, reset, rebase, clean, amend, push, or rewrite history unless explicitly authorized.
+- Never push to any remote without a fresh, explicit manual approval in the current thread, even if the user previously asked to merge or an approved command prefix exists.
+- Never swap, repoint, or replace the active workspace while inside it. Exit the workspace first, then perform an explicit workspace switch as the only operation.
 - If the worktree contains many unrelated changes, keep your commit scoped to your files and report the remaining unrelated changes.
 - Before a commit: inspect the diff and run verification. If verification cannot run, state that clearly before committing.
 
