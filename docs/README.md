@@ -9,6 +9,8 @@ Project documentation lives here. The repository root stays limited to **README*
 | [../README.md](../README.md) | Everyone | Quickstart, operator workflow, MCP, Docker, production query |
 | [CODEBASE.md](CODEBASE.md) | Developers | Module map under `src/scrape_planner/` |
 | [cursor-mcp-setup.md](cursor-mcp-setup.md) | Cursor users | Install and smoke-test the llm-wiki MCP server |
+| [agents/operating-guide.md](agents/operating-guide.md) | Agents | Detailed workflow behind root `AGENTS.md` |
+| [agents/ai-development.md](agents/ai-development.md) | Agents / PM | Required planning packet before AI-assisted app work |
 
 ## Operator and production
 
@@ -37,6 +39,9 @@ Project documentation lives here. The repository root stays limited to **README*
 | --- | --- |
 | [openspec/opsx-quickstart.md](openspec/opsx-quickstart.md) | OpenSpec change workflow (`openspec/changes/`) |
 | [../AGENTS.md](../AGENTS.md) | Agent operating guide |
+| [agents/codegraph.md](agents/codegraph.md) | CodeGraph usage and index hygiene |
+| [agents/repo-context.md](agents/repo-context.md) | Repo facts and durable user preferences |
+| [agents/student-wiki-policy.md](agents/student-wiki-policy.md) | Student wiki source/content policy |
 
 ## Audits and archive
 
