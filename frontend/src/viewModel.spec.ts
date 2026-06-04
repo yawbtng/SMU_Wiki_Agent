@@ -5,6 +5,7 @@ import {
   buildMetricsRollupPoints,
   buildMetricsRunTrendPoints,
   formatChartMetricValue,
+  formatMcpBlockReason,
   metricsChartRangeLabel,
   metricsRollupCostAmount,
   metricsRunCostAmount,
@@ -269,6 +270,14 @@ if (vectorRollupModel.aggregateMetrics[1].value !== '90') {
 
 if (vectorRollupModel.aggregateMetrics[3].value !== '90') {
   throw new Error('aggregate metric strip should fall back to embedding vectors for embedding tokens');
+}
+
+if (!formatMcpBlockReason('missing_index').includes('Embeddings')) {
+  throw new Error('MCP block reason should map missing_index to operator guidance');
+}
+
+if (formatMcpBlockReason('Index version is llm-wiki-hybrid-v1; expected llm-wiki-hybrid-v2.').includes('Embeddings')) {
+  throw new Error('MCP block reason should preserve full backend messages');
 }
 
 if (formatCost({ amount_usd: 0.02, source: 'estimated' }) !== '$0.02 estimated') {

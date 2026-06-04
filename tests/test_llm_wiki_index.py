@@ -724,3 +724,41 @@ def test_explainable_evidence_schema_is_stable(tmp_path: Path) -> None:
     }
     assert set(row["scores"]) >= {"lexical", "vector", "keyword", "source_priority", "freshness", "citation", "combined"}
     assert isinstance(row["ranking_reasons"], list)
+
+
+def test_site_mcp_query_readiness_explains_missing_index(tmp_path: Path) -> None:
+    from src.scrape_planner.wiki.llm_wiki_index import site_mcp_query_readiness
+
+    site_root = tmp_path / "demo.edu"
+    site_root.mkdir(parents=True)
+
+    readiness = site_mcp_query_readiness(site_root)
+
+    assert readiness["query_ready"] is False
+    assert readiness["reason"] == "missing_index"
+    assert "Embeddings" in readiness["mcp_block_reason"]
+
+
+def test_index_info_flags_missing_query_artifacts_when_manifest_ready(tmp_path: Path) -> None:
+    from src.scrape_planner.wiki.llm_wiki_index import index_info
+
+    site_root = tmp_path / "demo.edu"
+    indexes = site_root / "indexes"
+    indexes.mkdir(parents=True)
+    (indexes / "llm_wiki_manifest.json").write_text(
+        json.dumps(
+            {
+                "status": "ready",
+                "version": "llm-wiki-hybrid-v2",
+                "wiki_index_count": 1,
+                "vector_store": {"ready": True, "backend": "zvec", "documents": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    info = index_info(site_root)
+
+    assert info["ready"] is False
+    assert info["error"] == "index_artifacts_missing"
+    assert "incomplete" in str(info.get("message") or "").lower()

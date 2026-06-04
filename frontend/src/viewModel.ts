@@ -301,6 +301,25 @@ export function formatMetricsRunEmbeddingTokens(run: AgentRunSummary): string {
   return formatOptionalCount(raw);
 }
 
+const MCP_BLOCK_REASON_LABELS: Record<string, string> = {
+  missing_index: 'LLM wiki index has not been built. Rebuild it from the Embeddings tab.',
+  malformed_index: 'Index manifest is unreadable. Rebuild the index from the Embeddings tab.',
+  index_artifacts_missing: 'Index files are incomplete. Rebuild from the Embeddings tab.',
+  not_ready: 'Index build is not complete. Rebuild or wait for the embedding job to finish.',
+  index_version_mismatch: 'Index version is outdated. Rebuild the index from Embeddings.',
+  embedding_degraded: 'Index used degraded embeddings. Rebuild after OpenRouter embeddings are available.',
+  embedding_dimension_mismatch: 'Index embedding dimensions do not match. Rebuild the index.',
+  embedding_space_mismatch: 'Index embedding space does not match. Rebuild the index.',
+  vector_store_unavailable: 'Vector store is not ready. Rebuild the index after zvec is available.',
+};
+
+export function formatMcpBlockReason(reason: unknown): string {
+  const text = String(reason ?? '').trim();
+  if (!text) return 'Rebuild the index from the Embeddings tab.';
+  if (text.includes(' ')) return text;
+  return MCP_BLOCK_REASON_LABELS[text] ?? text.replace(/_/g, ' ');
+}
+
 export function formatCost(cost: MetricCost | null | undefined): string {
   const source = String(cost?.source ?? 'unknown');
   if (cost?.amount_usd === null || cost?.amount_usd === undefined || source === 'unknown') return 'Unknown';

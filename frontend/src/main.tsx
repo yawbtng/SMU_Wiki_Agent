@@ -26,6 +26,7 @@ import {
   buildOverviewModel,
   buildScrapeModel,
   formatChartMetricValue,
+  formatMcpBlockReason,
   formatCount,
   formatCompact,
   metricsChartRangeLabel,
@@ -2479,7 +2480,7 @@ const McpServer = memo(function McpServer() {
             wiki_ready: row.wiki_ready ? 'ready' : 'missing',
             index_ready: row.index_ready ? 'ready' : 'missing',
             mcp_enabled: row.mcp_enabled ? 'enabled' : 'not ready',
-            mcp_block_reason: row.mcp_enabled ? '—' : String(row.mcp_block_reason || 'rebuild index'),
+            mcp_block_reason: row.mcp_enabled ? '—' : formatMcpBlockReason(row.mcp_block_reason),
           }))}
         />
       </Panel>

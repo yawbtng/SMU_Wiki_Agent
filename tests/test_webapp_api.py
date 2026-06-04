@@ -1165,6 +1165,8 @@ def test_mcp_universities_excludes_non_query_ready_indexes(tmp_path: Path, monke
             "vector_store": {"ready": True, "backend": "zvec", "documents": 3},
         },
     )
+    (v2_site / "indexes" / "llm_wiki_documents.jsonl").write_text("{}\n", encoding="utf-8")
+    (v2_site / "indexes" / "llm_wiki_postings.json").write_text("{}", encoding="utf-8")
     monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(data_root))
 
     response = TestClient(create_app()).get("/api/mcp/universities")

@@ -957,14 +957,35 @@ def _maybe_openrouter_rerank(query: str, scored: list[dict[str, Any]]) -> list[d
         return None
 
 
+_INDEX_INFO_MESSAGES: dict[str, str] = {
+    "missing_index": "LLM wiki index has not been built. Rebuild it from the Embeddings tab.",
+    "malformed_index": "Index manifest is unreadable. Rebuild the index from the Embeddings tab.",
+    "index_artifacts_missing": "Index files are incomplete (documents or postings missing). Rebuild from Embeddings.",
+    "not_ready": "Index build is not complete. Rebuild or wait for the embedding job to finish.",
+}
+
+
+def _index_info_operator_message(error: str, manifest: dict[str, Any] | None = None) -> str:
+    code = str(error or "").strip()
+    if code in _INDEX_INFO_MESSAGES:
+        return _INDEX_INFO_MESSAGES[code]
+    status = str((manifest or {}).get("status") or "").strip()
+    if status and status != "ready":
+        return f"Index status is {status}. Rebuild or wait for the embedding job to finish."
+    return _INDEX_INFO_MESSAGES["not_ready"]
+
+
 def index_info(site_root: Path) -> dict[str, Any]:
     layout = site_layout(Path(site_root))
     manifest_path = layout.indexes_dir / "llm_wiki_manifest.json"
+    docs_path = layout.indexes_dir / "llm_wiki_documents.jsonl"
+    postings_path = layout.indexes_dir / "llm_wiki_postings.json"
     if not manifest_path.exists():
         return {
             "ok": False,
             "ready": False,
             "error": "missing_index",
+            "message": _INDEX_INFO_MESSAGES["missing_index"],
             "site_root": str(layout.site_root.resolve()),
             "index_path": str(manifest_path),
         }
@@ -975,16 +996,34 @@ def index_info(site_root: Path) -> dict[str, Any]:
             "ok": False,
             "ready": False,
             "error": "malformed_index",
+            "message": _INDEX_INFO_MESSAGES["malformed_index"],
             "site_root": str(layout.site_root.resolve()),
             "index_path": str(manifest_path),
         }
     embedding_error = _embedding_manifest_error(manifest)
-    ready = str(manifest.get("status") or "") == "ready" and embedding_error is None
+    artifacts_ok = docs_path.exists() and postings_path.exists()
+    manifest_ready = str(manifest.get("status") or "") == "ready"
+    if manifest_ready and embedding_error is not None:
+        ready = False
+        error = str(embedding_error.get("reason") or "not_ready")
+        message = str(embedding_error.get("message") or _index_info_operator_message(error, manifest))
+    elif manifest_ready and not artifacts_ok:
+        ready = False
+        error = "index_artifacts_missing"
+        message = _INDEX_INFO_MESSAGES["index_artifacts_missing"]
+    elif manifest_ready:
+        ready = True
+        error = ""
+        message = ""
+    else:
+        ready = False
+        error = str(manifest.get("status") or "not_ready")
+        message = _index_info_operator_message(error, manifest)
     return {
         "ok": ready,
         "ready": ready,
-        "error": "" if ready else (embedding_error or {}).get("reason", str(manifest.get("status") or "not_ready")),
-        "message": "" if ready else (embedding_error or {}).get("message", ""),
+        "error": error,
+        "message": message,
         "site_root": str(layout.site_root.resolve()),
         "index_path": str(manifest_path),
         "raw_index_count": int(manifest.get("raw_index_count") or 0),

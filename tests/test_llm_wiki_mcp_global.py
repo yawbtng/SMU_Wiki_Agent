@@ -12,6 +12,7 @@ def write_site(data_root: Path, site_id: str, *, name: str = "") -> Path:
     (root / "indexes").mkdir(parents=True)
     (root / "wiki" / "pages" / "catalog.md").write_text("# Catalog\n", encoding="utf-8")
     (root / "indexes" / "llm_wiki_documents.jsonl").write_text("{}\n", encoding="utf-8")
+    (root / "indexes" / "llm_wiki_postings.json").write_text("{}", encoding="utf-8")
     if name:
         (root / "discovery_summary.json").write_text(f'{{"site_url":"https://{site_id}","name":"{name}"}}', encoding="utf-8")
     return root
