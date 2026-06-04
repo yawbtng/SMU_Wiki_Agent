@@ -710,12 +710,13 @@ button.ghost.danger:hover:not(:disabled) {
 }
 .metric-line-point small {
   color: var(--muted);
-  font-size: 0.68rem;
+  font-size: 0.66rem;
   font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 100%;
+  line-height: 1.25;
+  text-align: center;
+  white-space: normal;
+  max-width: 6.5rem;
+  overflow-wrap: anywhere;
 }
 .token-mix-bar {
   display: flex;

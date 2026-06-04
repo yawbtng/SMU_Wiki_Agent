@@ -9,6 +9,7 @@ import {
   metricsChartRangeLabel,
   metricsRollupCostAmount,
   metricsRunCostAmount,
+  metricsRunTrendLabel,
   buildOverviewModel,
   buildScrapeModel,
   formatCost,
@@ -201,8 +202,25 @@ if (vectorOnlyTrend[0]?.tokens !== 42) {
   throw new Error('metrics trend should fall back to embedding vectors when tokens are missing');
 }
 
-if (!vectorOnlyTrend[0]?.label.includes('manual-1') || vectorOnlyTrend[0]?.detail !== 'embedding-manual-1') {
-  throw new Error('metrics trend labels should shorten run ids with full id in detail');
+const vectorTrendPoint = vectorOnlyTrend[0];
+if (!vectorTrendPoint?.label.includes('Embed') || !vectorTrendPoint.detail?.includes('embedding-manual-1')) {
+  throw new Error('metrics trend labels should show run kind and keep full run id in detail');
+}
+
+const trendLabel = metricsRunTrendLabel(
+  {
+    run_id: 'embedding-manual-20260604T123177554695Z',
+    started_at: '2026-06-04T15:30:00Z',
+    status: 'completed',
+    breakdowns: { trigger: 'manual' },
+    embedding_usage: { vector_count: 21 },
+  },
+  1,
+  3,
+);
+
+if (!trendLabel.label.startsWith('#2') || !trendLabel.label.includes('Manual')) {
+  throw new Error('metrics run labels should use sequence, trigger, and time instead of run id tails');
 }
 
 const estimatedCostTrend = buildMetricsRunTrendPoints([

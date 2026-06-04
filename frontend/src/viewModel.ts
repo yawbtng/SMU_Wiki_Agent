@@ -178,11 +178,60 @@ export function metricsRollupCostAmount(rollup?: MetricsRollup): number {
   return estimateEmbeddingCostUsd(tokens);
 }
 
+function parseRunIdTimestamp(runId: string): string {
+  const match = runId.match(/(\d{4})(\d{2})(\d{2})[T-]?(\d{2})(\d{2})(\d{2})/);
+  if (!match) return '';
+  const [, year, month, day, hour, minute, second] = match;
+  return `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;
+}
+
+export function metricsRunKindLabel(run: AgentRunSummary): string {
+  const trigger = String(run.breakdowns?.trigger ?? '').trim();
+  if (trigger) return titleCase(trigger);
+  const runId = String(run.run_id ?? '').trim().toLowerCase();
+  if (runId.startsWith('embedding-')) {
+    const slug = runId.slice('embedding-'.length);
+    const triggerSlug = slug.replace(/\d{8}.*$/, '').replace(/-+$/g, '');
+    if (triggerSlug) return titleCase(triggerSlug.replace(/-/g, ' '));
+    return 'Embed';
+  }
+  if (runId.includes('wiki') || runId.includes('pi') || runId.includes('ralph')) return 'Pi';
+  const llmRequests = Number(run.llm_usage?.request_count ?? 0);
+  const embeddingRequests = Number(run.embedding_usage?.request_count ?? 0);
+  if (embeddingRequests > 0 && llmRequests === 0) return 'Embed';
+  if (llmRequests > 0) return 'Pi';
+  return 'Run';
+}
+
+export function metricsRunChartTimeLabel(run: AgentRunSummary): string {
+  const timestamp = String(run.started_at ?? run.completed_at ?? '').trim();
+  if (timestamp) return formatShortTime(timestamp);
+  return formatShortTime(parseRunIdTimestamp(String(run.run_id ?? '')));
+}
+
+export function metricsRunTrendLabel(
+  run: AgentRunSummary,
+  index: number,
+  total: number,
+): { label: string; detail: string } {
+  const sequence = total > 1 ? `#${index + 1}` : '';
+  const kind = metricsRunKindLabel(run);
+  const when = metricsRunChartTimeLabel(run);
+  const label = [sequence, kind, when].filter(Boolean).join(' · ') || `Run ${index + 1}`;
+  const status = String(run.status ?? '').trim();
+  const vectors = metricsRunVectors(run);
+  const tokens = metricsRunChartValue(run);
+  const detailParts = [
+    String(run.run_id ?? '').trim(),
+    status ? `Status: ${titleCase(status)}` : '',
+    tokens > 0 ? `${formatCount(tokens)} tokens` : vectors > 0 ? `${formatCount(vectors)} vectors` : '',
+  ].filter(Boolean);
+  return { label, detail: detailParts.join(' · ') };
+}
+
+/** @deprecated Use metricsRunTrendLabel for chart points. */
 export function shortMetricsRunLabel(runId: unknown, index: number): string {
-  const id = String(runId ?? '').trim();
-  if (!id) return String(index + 1);
-  if (id.length <= 12) return id;
-  return `…${id.slice(-10)}`;
+  return metricsRunTrendLabel({ run_id: String(runId ?? '') }, index, 1).label;
 }
 
 export function formatChartMetricValue(value: number, valueKey: keyof MetricsChartPoint): string {
@@ -206,17 +255,18 @@ export function metricsChartRangeLabel(values: number[], valueKey: keyof Metrics
 }
 
 export function buildMetricsRunTrendPoints(runs: AgentRunSummary[]): MetricsChartPoint[] {
-  return runs
-    .slice(0, 12)
-    .reverse()
-    .map((run, index) => ({
-      label: shortMetricsRunLabel(run.run_id, index),
-      detail: String(run.run_id ?? '').trim() || undefined,
+  const selected = runs.slice(0, 12).reverse();
+  return selected.map((run, index) => {
+    const { label, detail } = metricsRunTrendLabel(run, index, selected.length);
+    return {
+      label,
+      detail: detail || undefined,
       tokens: metricsRunChartValue(run),
       vectors: metricsRunVectors(run),
       cost: metricsRunCostAmount(run),
       runs: 1,
-    }));
+    };
+  });
 }
 
 export function buildMetricsRollupPoints(rollups: Record<string, MetricsRollup | undefined>): MetricsChartPoint[] {
