@@ -4,8 +4,6 @@ export type SettingsDraft = {
   openrouter_api_key: string;
   tavily_api_key: string;
   url_reasoning_openrouter_model: string;
-  graph_enrichment_openrouter_model: string;
-  graph_answer_openrouter_model: string;
   scrape_concurrency: number;
   scrape_browser_mode: string;
   lightpanda_cdp_url: string;
@@ -51,8 +49,6 @@ export function settingsDraftFromState(state: SettingsRecord): SettingsDraft {
     openrouter_api_key: stringValue(state.openrouter_api_key),
     tavily_api_key: stringValue(state.tavily_api_key),
     url_reasoning_openrouter_model: normalizeModel(state.url_reasoning_openrouter_model, OPENROUTER_LLM_MODELS, DEFAULT_OPENROUTER_MODEL),
-    graph_enrichment_openrouter_model: normalizeModel(state.graph_enrichment_openrouter_model, OPENROUTER_LLM_MODELS, 'openai/gpt-4.1-mini'),
-    graph_answer_openrouter_model: normalizeModel(state.graph_answer_openrouter_model, OPENROUTER_LLM_MODELS, DEFAULT_OPENROUTER_MODEL),
     scrape_concurrency: clampInt(state.scrape_concurrency, 4, 1, 16),
     scrape_browser_mode: normalizeBrowserMode(state.scrape_browser_mode),
     lightpanda_cdp_url: stringValue(state.lightpanda_cdp_url),
@@ -75,11 +71,7 @@ export function settingsSavePayloadFromDraft(draft: SettingsDraft): SettingsReco
     tavily_api_key: draft.tavily_api_key.trim(),
     llm_provider: 'openrouter',
     url_reasoning_provider: 'openrouter',
-    graph_enrichment_provider: 'openrouter',
-    graph_answer_provider: 'openrouter',
     url_reasoning_openrouter_model: normalizeModel(draft.url_reasoning_openrouter_model, OPENROUTER_LLM_MODELS, DEFAULT_OPENROUTER_MODEL),
-    graph_enrichment_openrouter_model: normalizeModel(draft.graph_enrichment_openrouter_model, OPENROUTER_LLM_MODELS, 'openai/gpt-4.1-mini'),
-    graph_answer_openrouter_model: normalizeModel(draft.graph_answer_openrouter_model, OPENROUTER_LLM_MODELS, DEFAULT_OPENROUTER_MODEL),
     scrape_concurrency: clampInt(draft.scrape_concurrency, 4, 1, 16),
     scrape_browser_mode: normalizeBrowserMode(draft.scrape_browser_mode),
     lightpanda_cdp_url: draft.lightpanda_cdp_url.trim(),

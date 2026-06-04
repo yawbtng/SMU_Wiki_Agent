@@ -119,10 +119,6 @@ class AppStateContract(TypedDict, total=False):
     default_llm_sleep_sec: float
     url_reasoning_provider: str
     url_reasoning_openrouter_model: str
-    graph_enrichment_provider: str
-    graph_enrichment_openrouter_model: str
-    graph_answer_provider: str
-    graph_answer_openrouter_model: str
     scrape_concurrency: int
     embedding_enabled: bool
     embedding_model: str
@@ -160,10 +156,6 @@ APP_STATE_DEFAULTS: AppStateContract = {
     "default_llm_sleep_sec": 0.0,
     "url_reasoning_provider": "openrouter",
     "url_reasoning_openrouter_model": "deepseek/deepseek-v4-flash",
-    "graph_enrichment_provider": "openrouter",
-    "graph_enrichment_openrouter_model": "openai/gpt-4.1-mini",
-    "graph_answer_provider": "openrouter",
-    "graph_answer_openrouter_model": "deepseek/deepseek-v4-flash",
     "scrape_concurrency": 4,
     "embedding_enabled": True,
     "embedding_model": "openai/text-embedding-3-small",

@@ -4,8 +4,6 @@ const draft = settingsDraftFromState({
   openrouter_api_key: 'or-existing',
   tavily_api_key: 'tv-existing',
   url_reasoning_openrouter_model: 'deepseek/deepseek-v4-flash',
-  graph_enrichment_openrouter_model: 'openai/gpt-4.1-mini',
-  graph_answer_openrouter_model: 'deepseek/deepseek-v4-flash',
   scrape_concurrency: 10,
   scrape_browser_mode: 'lightpanda',
   lightpanda_cdp_url: 'ws://127.0.0.1:9222',
@@ -57,6 +55,10 @@ if (payload.tmux_session_grace_seconds !== 900) {
 
 if (payload.llm_provider !== 'openrouter' || payload.url_reasoning_provider !== 'openrouter') {
   throw new Error('settings save payload should force OpenRouter providers');
+}
+
+if ('graph_enrichment_openrouter_model' in payload || 'graph_answer_openrouter_model' in payload) {
+  throw new Error('settings save payload should not include stale wiki graph model fields');
 }
 
 if (estimateOpenRouterCost('openai/gpt-4.1-mini', [{ id: 'openai/gpt-4.1-mini', label: 'mini', inputPerMTok: 0.4, outputPerMTok: 1.6, category: 'llm' }], 1_000_000, 1_000_000) !== 2) {

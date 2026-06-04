@@ -27,6 +27,15 @@ from ..wiki.stepper_status import (
 )
 from ..core.storage import read_json, write_json
 
+STALE_APP_STATE_KEYS = {
+    "ollama_model",
+    "ollama_base_url",
+    "graph_enrichment_provider",
+    "graph_enrichment_openrouter_model",
+    "graph_answer_provider",
+    "graph_answer_openrouter_model",
+}
+
 
 def _run_root(data_root: Path, site_id: str, run_id: str) -> Path:
     return site_root_for(data_root, site_id) / str(run_id)
@@ -156,7 +165,7 @@ def _normalize_app_state_payload(payload: Any, defaults: AppStateContract) -> Ap
     if not isinstance(payload, dict):
         return merged
 
-    normalized = {str(key): value for key, value in payload.items() if not str(key).startswith("ollama_") and str(key) not in {"ollama_model", "ollama_base_url"}}
+    normalized = {str(key): value for key, value in payload.items() if not str(key).startswith("ollama_") and str(key) not in STALE_APP_STATE_KEYS}
     normalized["active_workspace_id"] = _normalize_string(payload.get("active_workspace_id"), defaults.get("active_workspace_id", ""))
     normalized["workspaces"] = _normalize_workspace_rows(payload.get("workspaces"))
     normalized["last_site_url"] = _normalize_string(payload.get("last_site_url"), defaults.get("last_site_url", ""))
@@ -186,16 +195,6 @@ def _normalize_app_state_payload(payload: Any, defaults: AppStateContract) -> Ap
     normalized["url_reasoning_openrouter_model"] = _normalize_string(
         payload.get("url_reasoning_openrouter_model"),
         defaults.get("url_reasoning_openrouter_model", ""),
-    )
-    normalized["graph_enrichment_provider"] = "openrouter"
-    normalized["graph_enrichment_openrouter_model"] = _normalize_string(
-        payload.get("graph_enrichment_openrouter_model"),
-        defaults.get("graph_enrichment_openrouter_model", ""),
-    )
-    normalized["graph_answer_provider"] = "openrouter"
-    normalized["graph_answer_openrouter_model"] = _normalize_string(
-        payload.get("graph_answer_openrouter_model"),
-        defaults.get("graph_answer_openrouter_model", ""),
     )
     normalized["scrape_concurrency"] = _normalize_int(payload.get("scrape_concurrency"), int(defaults.get("scrape_concurrency") or 4), minimum=1, maximum=16)
     normalized["embedding_enabled"] = _normalize_bool(payload.get("embedding_enabled"), bool(defaults.get("embedding_enabled", True)))

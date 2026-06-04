@@ -91,10 +91,11 @@ def test_app_state_repository_normalizes_provider_and_index_settings(tmp_path: P
     assert loaded["openrouter_api_key"] == "123"
     assert loaded["tavily_api_key"] == " tavily "
     assert loaded["url_reasoning_provider"] == "openrouter"
-    assert loaded["graph_enrichment_provider"] == "openrouter"
-    assert loaded["graph_answer_provider"] == "openrouter"
     assert loaded["url_reasoning_openrouter_model"] == "7"
-    assert loaded["graph_answer_openrouter_model"] == "deepseek/deepseek-v4-flash"
+    assert "graph_enrichment_provider" not in loaded
+    assert "graph_enrichment_openrouter_model" not in loaded
+    assert "graph_answer_provider" not in loaded
+    assert "graph_answer_openrouter_model" not in loaded
     assert loaded["scrape_concurrency"] == 16
     assert loaded["scrape_browser_mode"] == "lightpanda"
     assert loaded["lightpanda_cdp_url"] == "42"

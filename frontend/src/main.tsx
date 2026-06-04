@@ -2353,23 +2353,13 @@ const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) 
             />
           </label>
         </Panel>
-        <Panel title="OpenRouter models / cost">
+        <Panel title="URL model / cost">
           <OpenRouterModelSelect
             label="URL reasoning"
             value={draft.url_reasoning_openrouter_model}
             onChange={(value) => setDraft((current) => ({ ...current, url_reasoning_openrouter_model: value }))}
           />
-          <OpenRouterModelSelect
-            label="Wiki enrichment"
-            value={draft.graph_enrichment_openrouter_model}
-            onChange={(value) => setDraft((current) => ({ ...current, graph_enrichment_openrouter_model: value }))}
-          />
-          <OpenRouterModelSelect
-            label="Wiki Q&A"
-            value={draft.graph_answer_openrouter_model}
-            onChange={(value) => setDraft((current) => ({ ...current, graph_answer_openrouter_model: value }))}
-          />
-          <p className="setting-help">Estimates use 100k input + 25k output tokens per run. Actual costs are recorded in Metrics when jobs run.</p>
+          <p className="setting-help">Estimates use 100k input + 25k output tokens per run. Actual costs are recorded in Metrics.</p>
         </Panel>
         <Panel title="Scraping">
           <label className="setting-row">
