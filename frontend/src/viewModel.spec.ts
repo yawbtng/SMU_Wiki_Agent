@@ -4,7 +4,6 @@ import {
   buildMetricsModel,
   buildMetricsRollupPoints,
   buildMetricsRunTrendPoints,
-  chartBarHeightPercent,
   formatChartMetricValue,
   metricsChartRangeLabel,
   metricsRollupCostAmount,
@@ -215,10 +214,6 @@ const estimatedCostTrend = buildMetricsRunTrendPoints([
 
 if (estimatedCostTrend[0]?.cost !== 0.02) {
   throw new Error('metrics trend should estimate embedding cost from input tokens when run cost is unknown');
-}
-
-if (chartBarHeightPercent(62, [62, 62, 62]) !== 72) {
-  throw new Error('equal bar values should use a stable medium height instead of all maxed out');
 }
 
 if (metricsChartRangeLabel([62, 62], 'tokens') !== 'Each: 62') {

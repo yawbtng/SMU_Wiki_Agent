@@ -25,7 +25,6 @@ import {
   buildMetricsRunTrendPoints,
   buildOverviewModel,
   buildScrapeModel,
-  chartBarHeightPercent,
   formatChartMetricValue,
   formatCount,
   formatCompact,
@@ -2551,7 +2550,7 @@ const Metrics = memo(function Metrics({ siteId }: { siteId: string }) {
         </div>
         <MetricStrip metrics={model.aggregateMetrics} />
         <div className="metrics-dashboard-grid">
-          <MiniBarChart
+          <MiniLineChart
             title={trendUsesVectors ? 'Activity trend by run (vectors when tokens missing)' : 'Token trend by run'}
             points={trendPoints}
             valueKey="tokens"
@@ -2559,12 +2558,13 @@ const Metrics = memo(function Metrics({ siteId }: { siteId: string }) {
           />
           <MiniLineChart title="Cost trend by run" points={trendPoints} valueKey="cost" valueLabel="USD" />
           <TokenMixChart title={`${windowLabel.replace('_', ' ')} usage mix`} segments={mix} />
-          <MiniBarChart
-            title={rollupUsesVectors ? 'Window comparison (vectors when tokens missing)' : 'Window comparison'}
+          <MiniLineChart
+            title={rollupUsesVectors ? 'Activity by window (vectors when tokens missing)' : 'Activity by window'}
             points={rollupPoints}
             valueKey="tokens"
-            valueLabel={rollupUsesVectors ? 'vectors' : 'activity'}
+            valueLabel={rollupUsesVectors ? 'vectors' : 'tokens'}
           />
+          <MiniLineChart title="Cost by window" points={rollupPoints} valueKey="cost" valueLabel="USD" />
         </div>
       </Panel>
       <Panel title="Selected Run Detail">
@@ -2611,60 +2611,11 @@ function chartMetricValue(point: MetricsChartPoint, valueKey: keyof MetricsChart
   return Number.isFinite(numeric) ? numeric : 0;
 }
 
-function MiniBarChart({
-  title,
-  points,
-  valueKey,
-  valueLabel,
-}: {
-  title: string;
-  points: MetricsChartPoint[];
-  valueKey: keyof MetricsChartPoint;
-  valueLabel: string;
-}) {
-  const values = points.map((point) => chartMetricValue(point, valueKey));
-  const hasValues = values.some((value) => value > 0);
-  const rangeLabel = metricsChartRangeLabel(values, valueKey);
-  return (
-    <article className="metric-chart-card">
-      <div className="metric-chart-head">
-        <div className="metric-chart-title">{title}</div>
-        {rangeLabel ? <div className="metric-chart-range">{rangeLabel}</div> : null}
-      </div>
-      {points.length && hasValues ? (
-        <div className="metric-bars" role="img" aria-label={title}>
-          {points.map((point, index) => {
-            const value = chartMetricValue(point, valueKey);
-            const height = chartBarHeightPercent(value, values);
-            const formatted = formatChartMetricValue(value, valueKey);
-            const tooltipLead = point.detail?.trim() || point.label;
-            return (
-              <div
-                className="metric-bar-column"
-                key={`${title}-${point.label}-${point.detail ?? ''}`}
-                title={`${tooltipLead}: ${formatted} ${valueLabel}`}
-              >
-                <div className="metric-bar-track">
-                  {height > 0 ? (
-                    <div
-                      className="metric-bar-fill"
-                      style={{ height: `${height}%`, opacity: 0.72 + (index % 3) * 0.08 }}
-                    />
-                  ) : null}
-                </div>
-                <div className="metric-bar-foot">
-                  <strong className="metric-bar-value">{formatted}</strong>
-                  <small className="metric-bar-label">{point.label}</small>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      ) : (
-        <EmptyState message="No Pi agent activity recorded for this view yet." />
-      )}
-    </article>
-  );
+function metricsChartEmptyMessage(valueKey: keyof MetricsChartPoint): string {
+  if (valueKey === 'cost') {
+    return 'No cost data yet. Rebuild the embedding index or run Pi to record spend.';
+  }
+  return 'No Pi agent activity recorded for this view yet.';
 }
 
 function MiniLineChart({
@@ -2711,7 +2662,7 @@ function MiniLineChart({
         {rangeLabel ? <div className="metric-chart-range">{rangeLabel}</div> : null}
       </div>
       {points.length && hasValues ? (
-        <div className="metric-line-panel" role="img" aria-label={title}>
+        <div className="metric-line-panel" role="img" aria-label={`${title} (${valueLabel})`}>
           <div className="metric-line-yaxis">
             {yTicks
               .slice()
@@ -2747,7 +2698,7 @@ function MiniLineChart({
           </div>
         </div>
       ) : (
-        <EmptyState message="No cost data yet. Rebuild the embedding index or run Pi to record spend." />
+        <EmptyState message={metricsChartEmptyMessage(valueKey)} />
       )}
     </article>
   );

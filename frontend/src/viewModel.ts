@@ -185,18 +185,6 @@ export function shortMetricsRunLabel(runId: unknown, index: number): string {
   return `…${id.slice(-10)}`;
 }
 
-export function chartBarHeightPercent(value: number, values: number[]): number {
-  const positives = values.filter((entry) => entry > 0);
-  const max = Math.max(...positives, 0);
-  if (value <= 0 || max <= 0) return 0;
-  if (positives.length <= 1 || positives.every((entry) => entry === max)) return 72;
-  const min = Math.min(...positives);
-  const floor = min > 0 ? min * 0.92 : 0;
-  const span = Math.max(max - floor, max * 0.08);
-  const normalized = (value - floor) / span;
-  return Math.min(92, Math.max(16, normalized * 92));
-}
-
 export function formatChartMetricValue(value: number, valueKey: keyof MetricsChartPoint): string {
   if (valueKey === 'cost') {
     if (value >= 1) return `$${value.toFixed(2)}`;
