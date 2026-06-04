@@ -34,3 +34,21 @@ and committed.
 - Trusted workspace: `/Users/abhsheno/Desktop/Projects/ultra-fast-rag`.
 - React/FastAPI is the operator UI; Streamlit is removed and must not be reintroduced.
 - Root stays minimal: `README.md`, `AGENTS.md`, `CLAUDE.md`, dependency manifests, `start.sh`, `stop.sh`, `status.sh`, and prompt seeds only.
+
+## Learned User Preferences
+
+- Structural code questions: CodeGraph first; use `rg` only for literal strings, policy text, configs, markdown, and logs.
+- After source, config, test, or doc edits: run `codegraph sync` before further CodeGraph queries or completion reports.
+- Never print or log real API keys; in tests and reports use fake keys or only presence/empty/length.
+- Assigned `docs/superpowers/plans/*.md` work: implement the plan exactly, one focused logical change at a time.
+- Sources-tab edits in `frontend/src/main.tsx`: preserve WorkspaceDashboard, workspace return (X), durable agent panel, and dynamic Available-areas picker unless explicitly asked otherwise.
+- `uops` MCP is read-only retrieval (`query_wiki`, `get_wiki_page`, `search_sources`) unless the user explicitly requests ingest, rebuild, or operator refresh.
+- Operator workspace UI: Inter/sans on cards and metadata (not monospace); Sources/Wiki/runs as neutral flat labels, not colored pills; hero data-root shows only a short project-relative tail (e.g. `repo-name/data`) with no absolute path or hover tooltip.
+
+## Learned Workspace Facts
+
+- Metrics tab covers Pi agent and embedding-index jobs only; scrape run outcomes stay on Runs.
+- OpenRouter key saved in Settings must flow through app-state persistence into Pi/wiki build and MCP launch environment.
+- Sources URL curation uses `POST /api/sites/{site_id}/approved-urls/chat` for realtime group approve/preview updates.
+- Raw source registry rows need click-to-inspect via document-preview, not opaque IDs alone.
+- Wiki Settings should expose a single LLM Wiki compile path; avoid redundant fallback compile modes in the operator UI.
