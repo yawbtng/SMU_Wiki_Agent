@@ -72,6 +72,39 @@ def test_app_state_repository_normalizes_wiki_tmux_settings(tmp_path: Path) -> N
     assert loaded["pi_cmd"] == "/opt/pi"
 
 
+def test_app_state_repository_normalizes_provider_and_index_settings(tmp_path: Path) -> None:
+    from src.scrape_planner.app.repositories import AppStateRepository
+
+    path = tmp_path / "app_state.json"
+    path.write_text(
+        '{"openrouter_api_key":123,"tavily_api_key":" tavily ",'
+        '"url_reasoning_provider":"local","graph_enrichment_provider":"bad","graph_answer_provider":"ollama",'
+        '"url_reasoning_openrouter_model":7,"graph_enrichment_openrouter_model":"openai/gpt-4.1-mini",'
+        '"graph_answer_openrouter_model":["bad"],"scrape_concurrency":99,"scrape_browser_mode":"LIGHTPANDA",'
+        '"lightpanda_cdp_url":42,"embedding_enabled":"off","embedding_model":false,'
+        '"zvec_collection":"","use_tavily_for_map":"on","default_llm_sleep_sec":"1.5"}',
+        encoding="utf-8",
+    )
+
+    loaded = AppStateRepository(path).load()
+
+    assert loaded["openrouter_api_key"] == "123"
+    assert loaded["tavily_api_key"] == " tavily "
+    assert loaded["url_reasoning_provider"] == "ollama"
+    assert loaded["graph_enrichment_provider"] == "openrouter"
+    assert loaded["graph_answer_provider"] == "ollama"
+    assert loaded["url_reasoning_openrouter_model"] == "7"
+    assert loaded["graph_answer_openrouter_model"] == "deepseek/deepseek-v4-flash"
+    assert loaded["scrape_concurrency"] == 16
+    assert loaded["scrape_browser_mode"] == "lightpanda"
+    assert loaded["lightpanda_cdp_url"] == "42"
+    assert loaded["embedding_enabled"] is False
+    assert loaded["embedding_model"] == "False"
+    assert loaded["zvec_collection"] == ""
+    assert loaded["use_tavily_for_map"] is True
+    assert loaded["default_llm_sleep_sec"] == 1.5
+
+
 def test_site_artifact_repository_loads_discovered_rows_without_rewriting_file(tmp_path: Path) -> None:
     from src.scrape_planner.app.repositories import SiteArtifactRepository
 

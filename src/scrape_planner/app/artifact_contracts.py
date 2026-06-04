@@ -113,6 +113,7 @@ class AppStateContract(TypedDict, total=False):
     scrape_browser_mode: str
     lightpanda_cdp_url: str
     site_history: List[str]
+    openrouter_api_key: str
     tavily_api_key: str
     default_or_model: str
     default_llm_cap: int
@@ -157,7 +158,34 @@ APP_STATE_DEFAULTS: AppStateContract = {
     "ollama_model": "",
     "llm_provider": "openrouter",
     "ollama_base_url": "http://host.docker.internal:11434",
+    "scrape_browser_mode": "none",
+    "lightpanda_cdp_url": "",
     "site_history": [],
+    "openrouter_api_key": "",
+    "tavily_api_key": "",
+    "default_or_model": "deepseek/deepseek-v4-flash",
+    "default_llm_cap": 150,
+    "default_llm_batch_size": 250,
+    "default_llm_sleep_sec": 0.0,
+    "url_reasoning_provider": "openrouter",
+    "url_reasoning_openrouter_model": "deepseek/deepseek-v4-flash",
+    "url_reasoning_ollama_model": "qwen2.5:3b",
+    "graph_enrichment_provider": "openrouter",
+    "graph_enrichment_openrouter_model": "openai/gpt-4.1-mini",
+    "graph_enrichment_ollama_model": "qwen2.5:3b",
+    "graph_answer_provider": "openrouter",
+    "graph_answer_openrouter_model": "deepseek/deepseek-v4-flash",
+    "graph_answer_ollama_model": "qwen2.5:3b",
+    "scrape_concurrency": 4,
+    "embedding_enabled": True,
+    "embedding_model": "nomic-embed-text:latest",
+    "zvec_enabled": True,
+    "zvec_index_path": "",
+    "zvec_collection": "university_wiki",
+    "use_tavily_for_map": False,
+    "tavily_cost_per_call_usd": 0.0,
+    "ollama_input_per_m_usd": 0.0,
+    "ollama_output_per_m_usd": 0.0,
     "tmux_session_grace_seconds": 1800,
     "wiki_builder_runtime": "pi",
     "wiki_skip_pi": False,

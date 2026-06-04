@@ -13,8 +13,8 @@ Refresh the local LLM Wiki for the SMU workspace from existing normalized source
 
 ## Requirements
 
-1. Run the deterministic non-interactive wiki pipeline for `data/sites/www.smu.edu`.
-2. Prefer rebuild mode for the first Ralph run so the derived wiki is refreshed from normalized ready sources.
+1. Run the noninteractive LLM Wiki v2 compile pipeline for `data/sites/www.smu.edu`.
+2. Prefer rebuild mode for the first compile so the derived wiki is refreshed from normalized ready sources.
 3. Generate/refresh the LLM Wiki pages, reports, manifest, and document index artifacts.
 4. Run a smoke query against the generated wiki/index.
 5. Run the relevant syntax/compile checks for changed wiki code paths before completion.

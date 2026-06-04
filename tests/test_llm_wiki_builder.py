@@ -128,6 +128,20 @@ def test_launch_rejects_unknown_runtime(tmp_path: Path) -> None:
     assert result["ok"] is False
 
 
+def test_update_wiki_build_report_marks_failure(tmp_path: Path) -> None:
+    from src.scrape_planner.wiki.wiki_build_report import update_wiki_build_report
+
+    site = tmp_path / "site"
+    report = update_wiki_build_report(site, status="failed", exit_code=7, message="embedding unavailable")
+
+    assert report["job_status"] == "failed"
+    assert report["status"] == "failed"
+    assert report["exit_code"] == 7
+    assert report["last_error"] == "embedding unavailable"
+    assert report["job_finished_at"]
+    assert (site / "wiki" / "reports" / "wiki-build-latest.json").exists()
+
+
 def test_cli_requires_no_input(tmp_path: Path) -> None:
     import subprocess
     import sys

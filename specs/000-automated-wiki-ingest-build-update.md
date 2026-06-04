@@ -24,12 +24,12 @@ The existing end-to-end entrypoint is `src.scrape_planner.wiki_ingestion_pipelin
 
 ## Context
 
-- Main UI: `app.py` workflow tabs.
-- End-to-end Python pipeline: `src/scrape_planner/wiki_ingestion_pipeline.py::run_wiki_ingestion_pipeline`.
-- Wiki builder launcher: `src/scrape_planner/llm_wiki_builder.py::launch_wiki_builder`.
-- Pi SDK runner: `scripts/pi-sdk-wiki-runner.mjs`.
+- Main UI: FastAPI + React webapp.
+- End-to-end Python pipeline: `src/scrape_planner/wiki/wiki_ingestion_pipeline.py::run_wiki_ingestion_pipeline`.
+- Wiki builder launcher: `src/scrape_planner/wiki/wiki_launcher.py::launch_wiki_builder`.
+- Compile runner: `.pi/skills/llm-wiki-noninteractive/scripts/build_wiki.sh`.
 - Target smoke workspace: `data/sites/www.smu.edu`.
-- Required runtime for automated operator path: Pi SDK streaming only. Remove the user-facing Python deterministic runtime path from the Wiki/Ingest UI.
+- Required runtime for automated operator path: LLM Wiki v2 compile by default. Keep lint/index-only mode as fallback, not as the primary wiki strategy.
 - Raw source artifacts are inputs and must not be destructively edited by automation.
 
 ## Requirements
@@ -42,10 +42,10 @@ The existing end-to-end entrypoint is `src.scrape_planner.wiki_ingestion_pipelin
    5. wiki build/update,
    6. LLM Wiki/source index build/update,
    7. optional smoke query.
-2. Expose the pipeline in the UI as a clear single action named around the standard word, for example `Run Ingest Pipeline` or `Ingest Content`. This must be runnable from the Streamlit UI; users should not need to start Ralph or the pipeline from the terminal for normal operation.
-3. The automated action must use Pi SDK streaming only, so the UI can show agent events/tool output. Remove the deterministic Python runtime selector from normal UI operation.
-4. The UI must provide Pi SDK model controls for the automated pipeline, defaulting to `gpt-5.4-mini` with `high` reasoning. Operators may override model/reasoning from the UI before launch.
-5. Status displays must reflect the actual selected/launched runtime. If the operator launches Pi SDK streaming, the UI must not show `Runtime: python` from a stale previous report.
+2. Expose the pipeline in the UI as a clear single action named around the standard word, for example `Run Ingest Pipeline` or `Ingest Content`. This must be runnable from the webapp UI; users should not need to start the pipeline from the terminal for normal operation.
+3. The automated action must use the LLM Wiki v2 compile path by default, so the UI can show agent events/tool output. Remove deterministic framing from normal UI operation.
+4. The UI must present LLM Wiki v2 compile status, including runtime, stage, and failure details.
+5. Status displays must reflect the actual selected/launched runtime. If the operator launches Pi compile, the UI must not show `Runtime: python` from a stale previous report.
 6. The UI should make the relationship clear: Ingest, Clean, Standardize, Lint, Build Wiki, Build Index, and Verify are stages of one automation pipeline.
 7. The normal Wiki UI should expose only `Build Wiki` and `Update Wiki` actions: Build performs a full rebuild; Update performs an incremental/resume run.
 8. Raw log dumps/operator details/latest report JSON should stay hidden in normal operation; show meaningful stage and agent activity instead.
@@ -109,12 +109,12 @@ The existing end-to-end entrypoint is `src.scrape_planner.wiki_ingestion_pipelin
 ## Acceptance Criteria
 
 - [ ] The UI has a single automated action that runs Ingest → Clean → Standardize → Lint → Build Wiki → Build Index → Verify without requiring a terminal command.
-- [ ] The UI exposes Pi SDK model/reasoning controls for this action, defaulting to `gpt-5.4-mini` and `high` reasoning.
+- [ ] The UI exposes LLM Wiki v2 compile status for this action.
 - [ ] The UI consistently uses **Ingest** as the standard top-level word for this pipeline.
 - [ ] The UI labels or help text explains that cleanup, standardization, wiki building, and index updating are stages of the same end-to-end Ingest pipeline.
-- [ ] The automated action runs using Pi SDK streaming and emits/records an event log for live progress.
-- [ ] The normal UI no longer exposes or defaults to a Python deterministic runtime selector for wiki/ingest operation.
-- [ ] When Pi SDK streaming is selected/launched, runtime status displays `pi-sdk`/`Pi SDK streaming`, not stale `python` values from older reports.
+- [ ] The automated action runs using LLM Wiki v2 compile and emits/records progress for live review.
+- [ ] The normal UI exposes LLM Wiki v2 compile as the wiki/ingest strategy, with lint/index-only clearly marked as fallback.
+- [ ] When Pi compile is selected/launched, runtime status displays `pi`, not stale `python` values from older reports.
 - [ ] For `data/sites/www.smu.edu`, running the automated pipeline updates/creates `raw_sources/registry.jsonl` without duplicate source records.
 - [ ] Source content passed to wiki generation excludes obvious nav/header/footer/menu/cookie/social boilerplate while preserving useful academic/program content and provenance.
 - [ ] Ready source documents conform to the common structure or include lint quality flags explaining any exceptions.
@@ -137,8 +137,8 @@ The existing end-to-end entrypoint is `src.scrape_planner.wiki_ingestion_pipelin
 
 ## Suggested Implementation Notes
 
-- Prefer using `run_wiki_ingestion_pipeline(...)` as the core deterministic implementation instead of duplicating stage logic.
-- Consider adding a Pi SDK runner/tool for the full ingestion pipeline, similar to `scripts/pi-sdk-wiki-runner.mjs`, or extending the existing runner so its tool can execute `python -m src.scrape_planner.wiki_ingestion_pipeline`.
+- Prefer using `run_wiki_ingestion_pipeline(...)` as the core stage implementation instead of duplicating stage logic.
+- Prefer extending the existing LLM Wiki v2 compile runner/reporting before adding another runtime wrapper.
 - Keep report formats backward-compatible with `_load_wiki_status(...)` and embedding/index status loaders.
 - If adding a new report file, link it from the existing wiki latest report or UI status so operators can find it.
 
@@ -148,11 +148,10 @@ The existing end-to-end entrypoint is `src.scrape_planner.wiki_ingestion_pipelin
 source .venv/bin/activate
 python -m py_compile \
   app.py \
-  src/scrape_planner/wiki_ingestion_pipeline.py \
-  src/scrape_planner/llm_wiki_builder.py \
-  src/scrape_planner/llm_wiki_index.py
+  src/scrape_planner/wiki/wiki_ingestion_pipeline.py \
+  src/scrape_planner/wiki/llm_wiki_builder.py \
+  src/scrape_planner/wiki/llm_wiki_index.py
 python -m pytest tests/test_llm_wiki_builder.py tests/test_llm_wiki_index.py tests/test_wiki_ui.py
-node --check scripts/pi-sdk-wiki-runner.mjs
 python -m src.scrape_planner.wiki_ingestion_pipeline \
   --site-root data/sites/www.smu.edu \
   --kind auto \
@@ -160,7 +159,7 @@ python -m src.scrape_planner.wiki_ingestion_pipeline \
   --query "What graduate catalog programs are available?"
 ```
 
-For a no-write command-shape check, use the Pi SDK runner dry-run path if the implementation adds or extends one for the full pipeline.
+For a no-write command-shape check, use a report/status-only runner path if the implementation adds one for the full pipeline.
 
 ## Status: TODO
 

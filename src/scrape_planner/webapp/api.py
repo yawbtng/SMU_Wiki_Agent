@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import threading
 import uuid
 from collections.abc import AsyncIterator
@@ -197,175 +198,245 @@ def site_overview_payload(site_id: str, *, compact: bool = True) -> dict[str, An
     }
 
 
-def mcp_server_state_path(root: Path) -> Path:
-    return root / "indexes" / "mcp-server-latest.json"
+GLOBAL_MCP_SESSION_NAME = "llm-wiki-mcp-global"
 
 
-def mcp_session_name(site_id: str) -> str:
+def mcp_server_state_path(root: Path | None = None) -> Path:
+    if root is not None and root.name != "sites":
+        return root / "indexes" / "mcp-server-latest.json"
+    return data_root() / "runtime" / "mcp-server-latest.json"
+
+
+def mcp_session_name(site_id: str = "global") -> str:
+    if site_id == "global":
+        return GLOBAL_MCP_SESSION_NAME
     normalized = "".join(ch if ch.isalnum() else "-" for ch in site_id.lower()).strip("-")
     return f"llm-wiki-mcp-{normalized or 'site'}"
 
 
-def empty_mcp_server_state(site_id: str) -> dict[str, Any]:
+def global_mcp_server_command() -> str:
+    return " ".join([sys.executable, "-m", "mcp_servers.llm_wiki_mcp", "--data-root", str(data_root())])
+
+
+def _workspace_metadata() -> dict[str, dict[str, Any]]:
+    state = state_repo().load()
+    rows = state.get("workspaces") if isinstance(state, dict) else []
+    metadata: dict[str, dict[str, Any]] = {}
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            site_id = str(row.get("id") or "").strip()
+            if site_id:
+                metadata[site_id] = row
+    return metadata
+
+
+def _site_has_markdown_pages(site_path: Path) -> bool:
+    wiki_dir = site_path / "wiki"
+    if (wiki_dir / "index.md").exists():
+        return True
+    pages_dir = wiki_dir / "pages"
+    return pages_dir.exists() and any(pages_dir.rglob("*.md"))
+
+
+def _site_has_query_index(site_path: Path) -> bool:
+    candidates = [
+        site_path / "indexes" / "llm_wiki_documents.jsonl",
+        site_path / "indexes" / "llm_wiki_manifest.json",
+        site_path / "wiki" / "index" / "llm_wiki_documents.jsonl",
+        site_path / "wiki" / "index" / "llm_wiki_manifest.json",
+    ]
+    if any(path.exists() for path in candidates):
+        return True
+    reports_dir = site_path / "indexes" / "reports"
+    if not reports_dir.exists():
+        return False
+    for report_path in sorted(reports_dir.glob("embedding-*.json"), reverse=True):
+        report = read_json(report_path, {})
+        if not isinstance(report, dict):
+            continue
+        if str(report.get("status") or "").lower() not in {"ready", "complete", "completed"}:
+            continue
+        if int(report.get("raw_index_count") or 0) > 0 or int(report.get("wiki_index_count") or 0) > 0:
+            return True
+    return False
+
+
+def list_mcp_universities_payload() -> dict[str, Any]:
+    sites_root = data_root() / "sites"
+    metadata = _workspace_metadata()
+    universities: list[dict[str, Any]] = []
+    if sites_root.exists():
+        for path in sorted(sites_root.iterdir(), key=lambda item: item.name):
+            if not path.is_dir():
+                continue
+            summary = read_json(path / "discovery_summary.json", {})
+            site_id = path.name
+            meta = metadata.get(site_id, {})
+            url = str(meta.get("url") or summary.get("site_url") or "")
+            domain = urlparse(url).netloc or site_id
+            wiki_ready = _site_has_markdown_pages(path)
+            index_ready = _site_has_query_index(path)
+            universities.append(
+                {
+                    "site_id": site_id,
+                    "name": str(meta.get("name") or summary.get("name") or site_id),
+                    "url": url,
+                    "domain": domain,
+                    "site_root": str(path),
+                    "wiki_ready": wiki_ready,
+                    "index_ready": index_ready,
+                    "mcp_enabled": wiki_ready or index_ready,
+                }
+            )
+    ready_count = sum(1 for row in universities if row["mcp_enabled"])
     return {
-        "site_id": site_id,
+        "universities": universities,
+        "count": len(universities),
+        "ready_count": ready_count,
+        "generated_at": utc_now(),
+    }
+
+
+def empty_mcp_server_state(site_id: str = "global") -> dict[str, Any]:
+    is_global = site_id == "global"
+    return {
+        "scope": "global" if is_global else "site",
+        "site_id": "global" if is_global else site_id,
         "session_name": mcp_session_name(site_id),
         "status": "idle",
         "running": False,
-        "server_command": "",
+        "server_command": global_mcp_server_command() if is_global else "",
         "started_at": "",
         "updated_at": "",
         "last_error": "",
     }
 
 
-def load_mcp_server_state(root: Path, site_id: str) -> dict[str, Any]:
+def load_mcp_server_state(root: Path | None = None, site_id: str = "global") -> dict[str, Any]:
     payload = read_json(mcp_server_state_path(root), {})
     state = empty_mcp_server_state(site_id)
     if isinstance(payload, dict):
         state.update(payload)
-    state["site_id"] = site_id
-    state["session_name"] = mcp_session_name(site_id)
+    is_global = root is None and site_id == "global"
+    state["scope"] = "global" if is_global else "site"
+    state["site_id"] = "global" if is_global else site_id
+    state["session_name"] = mcp_session_name("global" if is_global else site_id)
+    if is_global:
+        state["server_command"] = str(state.get("server_command") or global_mcp_server_command())
     return state
 
 
-def write_mcp_server_state(root: Path, state: dict[str, Any]) -> dict[str, Any]:
-    state = {**state, "updated_at": utc_now()}
+def write_mcp_server_state(root: Path | None, state: dict[str, Any]) -> dict[str, Any]:
+    is_global = root is None
+    site_id = str(state.get("site_id") or "global")
+    state = {
+        **state,
+        "scope": "global" if is_global else "site",
+        "site_id": "global" if is_global else site_id,
+        "session_name": mcp_session_name("global" if is_global else site_id),
+        "updated_at": utc_now(),
+    }
     write_json(mcp_server_state_path(root), state)
     return state
 
 
-def mcp_runtime_status(root: Path, site_id: str, mcp_status: dict[str, Any]) -> dict[str, Any]:
-    state = load_mcp_server_state(root, site_id)
+def mcp_runtime_status(root: Path | None, site_id: str, mcp_status: dict[str, Any]) -> dict[str, Any]:
+    state = load_mcp_server_state(None, "global")
     runner = mcp_runner()
-    running = runner.session_exists(state["session_name"]) if runner.available() else False
+    running = runner.session_exists(GLOBAL_MCP_SESSION_NAME) if runner.available() else False
+    universities = list_mcp_universities_payload()
+    command = state.get("server_command") or global_mcp_server_command()
     return {
-        "session_name": state["session_name"],
+        "scope": "global",
+        "site_id": "global",
+        "session_name": GLOBAL_MCP_SESSION_NAME,
         "running": running,
+        "server_available": True,
         "last_start_status": state.get("status") or "idle",
         "last_error": state.get("last_error") or "",
         "updated_at": state.get("updated_at") or "",
-        "server_command": mcp_status.get("server_command") or state.get("server_command") or "",
+        "server_command": command,
+        "university_count": universities["count"],
+        "ready_university_count": universities["ready_count"],
+        "index_health": mcp_status.get("index_health") or "global",
     }
 
 
-def start_mcp_server_for_site(root: Path, site_id: str, mcp_status: dict[str, Any], *, runner: TmuxRunner | None = None) -> dict[str, Any]:
-    command = str(mcp_status.get("server_command") or "").strip()
-    state = load_mcp_server_state(root, site_id)
+def global_mcp_status_payload(*, runner: TmuxRunner | None = None) -> dict[str, Any]:
     tmux = runner or mcp_runner()
-    session = state["session_name"]
-    if not command:
-        state = write_mcp_server_state(
-            root,
-            {
-                **state,
-                "status": "blocked",
-                "running": False,
-                "server_command": "",
-                "last_error": "mcp_server_command_unavailable",
-            },
-        )
-        return {"status": "blocked", "mcp": state}
-    if not tmux.available():
-        state = write_mcp_server_state(
-            root,
-            {
-                **state,
-                "status": "failed",
-                "running": False,
-                "server_command": command,
-                "last_error": "tmux_not_available",
-            },
-        )
-        return {"status": "failed", "mcp": state}
-    if tmux.session_exists(session):
-        state = write_mcp_server_state(
-            root,
-            {
-                **state,
-                "status": "running",
-                "running": True,
-                "server_command": command,
-                "last_error": "",
-            },
-        )
-        return {"status": "already_running", "mcp": state}
-    result = tmux.start(session, command, str(PROJECT_ROOT))
-    if not result.get("ok"):
-        state = write_mcp_server_state(
-            root,
-            {
-                **state,
-                "status": "failed",
-                "running": False,
-                "server_command": command,
-                "last_error": str(result.get("error") or "failed_to_start_mcp_server"),
-            },
-        )
-        return {"status": "failed", "mcp": state}
-    state = write_mcp_server_state(
-        root,
-        {
+    state = load_mcp_server_state(None, "global")
+    running = tmux.session_exists(GLOBAL_MCP_SESSION_NAME) if tmux.available() else False
+    state = {**state, "running": running, "server_command": state.get("server_command") or global_mcp_server_command()}
+    universities = list_mcp_universities_payload()
+    return {
+        "mcp": {
             **state,
-            "status": "running",
-            "running": True,
-            "server_command": command,
-            "started_at": utc_now(),
-            "last_error": "",
+            "server_available": True,
+            "last_start_status": state.get("status") or "idle",
+            "university_count": universities["count"],
+            "ready_university_count": universities["ready_count"],
         },
-    )
-    return {"status": "started", "mcp": state}
+        **universities,
+    }
+
+
+def start_global_mcp_server(*, runner: TmuxRunner | None = None) -> dict[str, Any]:
+    state = load_mcp_server_state(None, "global")
+    tmux = runner or mcp_runner()
+    command = global_mcp_server_command()
+    if not tmux.available():
+        state = write_mcp_server_state(None, {**state, "status": "failed", "running": False, "server_command": command, "last_error": "tmux_not_available"})
+        return {"status": "failed", "mcp": state, **list_mcp_universities_payload()}
+    if tmux.session_exists(GLOBAL_MCP_SESSION_NAME):
+        state = write_mcp_server_state(None, {**state, "status": "running", "running": True, "server_command": command, "last_error": ""})
+        return {"status": "already_running", "mcp": state, **list_mcp_universities_payload()}
+    result = tmux.start(GLOBAL_MCP_SESSION_NAME, command, str(PROJECT_ROOT))
+    if not result.get("ok"):
+        state = write_mcp_server_state(None, {**state, "status": "failed", "running": False, "server_command": command, "last_error": str(result.get("error") or "failed_to_start_mcp_server")})
+        return {"status": "failed", "mcp": state, **list_mcp_universities_payload()}
+    state = write_mcp_server_state(None, {**state, "status": "running", "running": True, "server_command": command, "started_at": utc_now(), "last_error": ""})
+    return {"status": "started", "mcp": state, **list_mcp_universities_payload()}
+
+
+def stop_global_mcp_server(*, runner: TmuxRunner | None = None) -> dict[str, Any]:
+    state = load_mcp_server_state(None, "global")
+    tmux = runner or mcp_runner()
+    if not tmux.available():
+        state = write_mcp_server_state(None, {**state, "status": "failed", "running": False, "last_error": "tmux_not_available"})
+        return {"status": "failed", "mcp": state, **list_mcp_universities_payload()}
+    if not tmux.session_exists(GLOBAL_MCP_SESSION_NAME):
+        state = write_mcp_server_state(None, {**state, "status": "stopped", "running": False, "last_error": ""})
+        return {"status": "not_running", "mcp": state, **list_mcp_universities_payload()}
+    kill = tmux.kill(GLOBAL_MCP_SESSION_NAME)
+    if not kill.get("ok"):
+        state = write_mcp_server_state(None, {**state, "status": "failed", "running": False, "last_error": str(kill.get("error") or "failed_to_stop_mcp_server")})
+        return {"status": "failed", "mcp": state, **list_mcp_universities_payload()}
+    state = write_mcp_server_state(None, {**state, "status": "stopped", "running": False, "stopped_at": utc_now(), "last_error": ""})
+    return {"status": "stopped", "mcp": state, **list_mcp_universities_payload()}
+
+
+def restart_global_mcp_server(*, runner: TmuxRunner | None = None) -> dict[str, Any]:
+    tmux = runner or mcp_runner()
+    stop_global_mcp_server(runner=tmux)
+    return start_global_mcp_server(runner=tmux)
+
+
+def start_mcp_server_for_site(root: Path, site_id: str, mcp_status: dict[str, Any], *, runner: TmuxRunner | None = None) -> dict[str, Any]:
+    """Compatibility wrapper: MCP is now one global gateway, not a site-scoped server."""
+    result = start_global_mcp_server(runner=runner)
+    result["deprecated_site_route"] = True
+    result["requested_site_id"] = site_id
+    return result
 
 
 def stop_mcp_server_for_site(root: Path, site_id: str, *, runner: TmuxRunner | None = None) -> dict[str, Any]:
-    state = load_mcp_server_state(root, site_id)
-    tmux = runner or mcp_runner()
-    session = str(state.get("session_name") or mcp_session_name(site_id))
-    if not tmux.available():
-        state = write_mcp_server_state(
-            root,
-            {
-                **state,
-                "status": "failed",
-                "running": False,
-                "last_error": "tmux_not_available",
-            },
-        )
-        return {"status": "failed", "mcp": state}
-    if not tmux.session_exists(session):
-        state = write_mcp_server_state(
-            root,
-            {
-                **state,
-                "status": "stopped",
-                "running": False,
-                "last_error": "",
-            },
-        )
-        return {"status": "not_running", "mcp": state}
-    kill = tmux.kill(session)
-    if not kill.get("ok"):
-        state = write_mcp_server_state(
-            root,
-            {
-                **state,
-                "status": "failed",
-                "running": False,
-                "last_error": str(kill.get("error") or "failed_to_stop_mcp_server"),
-            },
-        )
-        return {"status": "failed", "mcp": state}
-    state = write_mcp_server_state(
-        root,
-        {
-            **state,
-            "status": "stopped",
-            "running": False,
-            "stopped_at": utc_now(),
-            "last_error": "",
-        },
-    )
-    return {"status": "stopped", "mcp": state}
+    """Compatibility wrapper: MCP is now one global gateway, not a site-scoped server."""
+    result = stop_global_mcp_server(runner=runner)
+    result["deprecated_site_route"] = True
+    result["requested_site_id"] = site_id
+    return result
 
 
 def list_runs_payload(site_id: str) -> dict[str, Any]:
@@ -577,6 +648,26 @@ def wiki_agent_payload(site_id: str, *, compact: bool = False) -> dict[str, Any]
     directory = reports_dir(site_id)
     run_state = read_json_file(directory / "wiki-agent-run-latest.json", {})
     tasks = read_json_file(directory / "wiki-agent-tasks-latest.json", {})
+    wiki_build_report = read_json_file(directory / "wiki-build-latest.json", {})
+    build_session = str(wiki_build_report.get("tmux_session") or "")
+    build_status = str(wiki_build_report.get("job_status") or wiki_build_report.get("status") or "")
+    if wiki_build_report:
+        build_alive = tmux_session_exists(build_session) if build_session else False
+        run_state = {
+            "status": build_status,
+            "job_status": build_status,
+            "runtime": wiki_build_report.get("runtime"),
+            "site_root": wiki_build_report.get("site_root"),
+            "site_id": site_id,
+            "tmux_session": build_session,
+            "mode": "rebuild" if wiki_build_report.get("rebuild") else "resume",
+            "current_task": wiki_build_report.get("last_progress") or "LLM Wiki v2 compile",
+            "last_error": wiki_build_report.get("last_error") or "",
+            "started_at": wiki_build_report.get("generated_at") or "",
+            "updated_at": wiki_build_report.get("updated_at") or "",
+            "job_finished_at": wiki_build_report.get("job_finished_at") or "",
+            "tmux_session_alive": build_alive,
+        }
     summary = ""
     summary_path = directory / "wiki-agent-summary-latest.md"
     if summary_path.exists() and not compact:
@@ -586,7 +677,6 @@ def wiki_agent_payload(site_id: str, *, compact: bool = False) -> dict[str, Any]
             summary = ""
     event_limit = 5 if compact else 200
     events = read_jsonl_tail(directory / "wiki-agent-events-latest.jsonl", event_limit)
-    wiki_build_report = read_json_file(directory / "wiki-build-latest.json", {})
     pi_events_path = wiki_build_report.get("pi_events_path")
     if pi_events_path:
         from ..app.pi_agent import read_pi_events_after
@@ -603,7 +693,7 @@ def wiki_agent_payload(site_id: str, *, compact: bool = False) -> dict[str, Any]
             pane_tail = ""
 
     stale_running = False
-    if run_state.get("status") == "running":
+    if str(run_state.get("status") or "").lower() == "running":
         session = str(run_state.get("tmux_session") or "")
         stale_running = bool(session) and not tmux_session_exists(session)
 

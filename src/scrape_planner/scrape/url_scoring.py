@@ -24,6 +24,7 @@ HIGH_VALUE_PATTERNS = (
     r"/registrar",
     r"/housing",
     r"/dining",
+    r"dining",
     r"/student-life",
     r"/studentlife",
     r"/health",

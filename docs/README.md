@@ -1,6 +1,6 @@
 # Documentation
 
-Project documentation lives here. The repository root stays limited to **README**, **AGENTS**, agent entrypoints, and Ralph prompt seeds.
+Project documentation lives here. The repository root stays limited to **README**, **AGENTS**, and agent entrypoints.
 
 ## Start here
 
@@ -23,8 +23,8 @@ Project documentation lives here. The repository root stays limited to **README*
 
 | Doc | Contents |
 | --- | --- |
-| [planning/work-index.md](planning/work-index.md) | Ralph queue, stop rule, completion ledger |
-| [planning/implementation-plan.md](planning/implementation-plan.md) | Prioritized Ralph task breakdown (planning mode) |
+| [planning/work-index.md](planning/work-index.md) | Wiki queue, stop rule, completion ledger |
+| [planning/implementation-plan.md](planning/implementation-plan.md) | Prioritized wiki task breakdown (planning mode) |
 | [planning/history.md](planning/history.md) | One-line log after each completed spec |
 | [planning/completion_log/](planning/completion_log/) | Timestamped completion notes |
 | [planning/pdf-extraction-blueprint.md](planning/pdf-extraction-blueprint.md) | PDF page-probe and Docling/PyMuPDF design |
@@ -36,8 +36,6 @@ Project documentation lives here. The repository root stays limited to **README*
 | Doc | Contents |
 | --- | --- |
 | [openspec/opsx-quickstart.md](openspec/opsx-quickstart.md) | OpenSpec change workflow (`openspec/changes/`) |
-| [ralph/master-prompt.md](ralph/master-prompt.md) | Generic Ralph master prompt template |
-| [../.specify/memory/constitution.md](../.specify/memory/constitution.md) | Project Ralph constitution |
 | [../AGENTS.md](../AGENTS.md) | Agent operating guide |
 
 ## Audits and archive

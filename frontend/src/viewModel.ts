@@ -23,6 +23,8 @@ export type OverviewInput = {
   wiki?: AnyRecord;
   agent?: AnyRecord;
   embeddings?: AnyRecord;
+  discovery?: AnyRecord;
+  approvedCount?: number;
   run?: AnyRecord;
 };
 
@@ -141,14 +143,30 @@ export function buildOverviewModel(input: OverviewInput): OverviewModel {
   const raw = input.rawSources ?? {};
   const wiki = input.wiki ?? {};
   const embeddings = input.embeddings ?? {};
+  const discovery = input.discovery ?? {};
   const readySources = Number(raw.ready_count ?? wiki.source_count ?? 0);
+  const discoveredTotal = Number(discovery.discovered_total ?? 0);
+  const eligibleTotal = Number(discovery.eligible_total ?? 0);
+  const rejectedTotal = Number(discovery.rejected_total ?? 0);
+  const approvedCount = Number(input.approvedCount ?? 0);
+  const hasDiscovery = discoveredTotal > 0;
   const needsReview = Number(raw.by_status?.['needs-review'] ?? raw.by_status?.needs_review ?? 0) + Number(wiki.review_queue_count ?? 0);
   const pendingOrChanged = Number(wiki.pending_source_count ?? 0) + Number(wiki.changed_source_count ?? 0);
   const wikiStatus = String(wiki.job_status ?? 'not started');
   const indexDocs = Number(embeddings.wiki_index_count ?? 0);
   const lastUpdated = wiki.last_progress || embeddings.last_build_time || input.run?.status?.finished_at || input.run?.status?.updated_at || 'Unknown';
-  const health = needsReview > 0 ? 'Needs review' : pendingOrChanged > 0 ? 'Update needed' : indexDocs <= 0 ? 'Index missing' : titleCase(wikiStatus);
-  const nextAction = needsReview > 0 ? 'Review flagged sources' : pendingOrChanged > 0 ? 'Update wiki' : indexDocs <= 0 ? 'Build index' : 'Monitor';
+  const health = needsReview > 0 ? 'Needs review' : pendingOrChanged > 0 ? 'Update needed' : readySources <= 0 && hasDiscovery ? 'Discovery ready' : indexDocs <= 0 ? 'Index missing' : titleCase(wikiStatus);
+  const nextAction = needsReview > 0 ? 'Review flagged sources' : pendingOrChanged > 0 ? 'Update wiki' : readySources <= 0 && hasDiscovery ? 'Approve and scrape sources' : indexDocs <= 0 ? 'Build index' : 'Monitor';
+  const sourceStatusRows = rowsFromCounts(raw.by_status, 'status');
+  const sourceKindRows = rowsFromCounts(raw.by_kind, 'kind');
+  const discoveryRows = hasDiscovery
+    ? [
+        { status: 'Discovered URLs', count: formatCount(discoveredTotal) },
+        { status: 'Eligible URLs', count: formatCount(eligibleTotal) },
+        { status: 'Rejected URLs', count: formatCount(rejectedTotal) },
+        { status: 'Approved URLs', count: formatCount(approvedCount) },
+      ]
+    : [];
 
   return {
     statusBand: {
@@ -158,14 +176,21 @@ export function buildOverviewModel(input: OverviewInput): OverviewModel {
       tone: toneForStatus(health),
       actionLabel: nextAction,
     },
-    essentialMetrics: [
-      { label: 'Ready Sources', value: formatCount(readySources) },
-      { label: 'Needs Review', value: formatCount(needsReview) },
-      { label: 'Pending Changes', value: formatCount(pendingOrChanged) },
-      { label: 'Wiki Index Docs', value: formatCount(indexDocs), help: String(lastUpdated).slice(0, 19) },
-    ],
-    sourceStatusRows: rowsFromCounts(raw.by_status, 'status'),
-    sourceKindRows: rowsFromCounts(raw.by_kind, 'kind'),
+    essentialMetrics: hasDiscovery && readySources <= 0
+      ? [
+          { label: 'Discovered URLs', value: formatCount(discoveredTotal) },
+          { label: 'Eligible URLs', value: formatCount(eligibleTotal) },
+          { label: 'Approved URLs', value: formatCount(approvedCount) },
+          { label: 'Ready Sources', value: formatCount(readySources), help: 'Scrape after approval' },
+        ]
+      : [
+          { label: 'Ready Sources', value: formatCount(readySources) },
+          { label: 'Needs Review', value: formatCount(needsReview) },
+          { label: 'Pending Changes', value: formatCount(pendingOrChanged) },
+          { label: 'Wiki Index Docs', value: formatCount(indexDocs), help: String(lastUpdated).slice(0, 19) },
+        ],
+    sourceStatusRows: sourceStatusRows.length ? sourceStatusRows : discoveryRows,
+    sourceKindRows: sourceKindRows.length ? sourceKindRows : (hasDiscovery ? [{ kind: 'Discovered URL pool', count: formatCount(discoveredTotal) }] : []),
     wikiRows: [
       { metric: 'Wiki status', value: titleCase(wikiStatus) },
       { metric: 'Integrated sources', value: formatCount(wiki.integrated_sources) },
@@ -244,15 +269,15 @@ export function buildMcpModel(mcp: AnyRecord = {}): McpModel {
   const status = running ? 'running' : available ? 'ready' : 'unavailable';
   return {
     serverBand: {
-      title: 'MCP server',
-      subtitle: mcp.last_error || 'Start the query-only LLM Wiki MCP server for the active site.',
+      title: 'MCP gateway',
+      subtitle: mcp.last_error || 'Start one global LLM Wiki MCP gateway for all ready university workspaces.',
       statusLabel: titleCase(status),
       tone: toneForStatus(status),
-      actionLabel: running ? 'Server running' : available ? 'Start MCP server' : 'Command unavailable',
+      actionLabel: running ? 'Gateway running' : available ? 'Start MCP gateway' : 'Command unavailable',
     },
     serverMetrics: [
       { label: 'Session', value: mcp.session_name || 'none' },
-      { label: 'Index Health', value: titleCase(mcp.index_health ?? 'missing') },
+      { label: 'Universities', value: `${mcp.ready_university_count ?? 0}/${mcp.university_count ?? 0}` },
       { label: 'Command', value: available ? 'available' : 'missing', help: mcp.server_command },
       { label: 'Updated', value: mcp.updated_at || '—' },
     ],

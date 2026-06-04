@@ -23,9 +23,11 @@ class FakeResponse:
         yield self.content
 
 
-def test_manual_url_pipeline_scrapes_normalizes_builds_wiki_and_index(tmp_path: Path) -> None:
+def test_manual_url_pipeline_scrapes_normalizes_builds_wiki_and_index(tmp_path: Path, monkeypatch) -> None:
     from src.scrape_planner.scrape.manual_url_pipeline import run_manual_url_pipeline
 
+    monkeypatch.setenv("WIKI_SKIP_PI", "1")
+    monkeypatch.setenv("LLM_WIKI_ALLOW_HASH_FALLBACK", "1")
     layout = ensure_site_layout(tmp_path, "example.edu")
 
     result = run_manual_url_pipeline(

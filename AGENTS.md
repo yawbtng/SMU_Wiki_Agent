@@ -10,6 +10,10 @@ This file defines how coding agents must behave in this repository. It is intent
 - Prefer boring, maintainable solutions over clever rewrites.
 - Preserve user intent and existing work. Never overwrite, revert, or clean files just to make your own path easier.
 
+## Codex manager handoff
+
+When **Codex** supervises multi-step work in this repo, read `.cursor/skills/cursor-agent-handoff/SKILL.md` first. Codex is manager/supervisor only: delegate substantive edits to Cursor Agent with `--workspace /Users/abhsheno/Desktop/Projects/ultra-fast-rag` (see the skill for the exact `agent` invocation). Codex may write plans/prompts and run lightweight verification; it must not edit product source, tests, configs, or `data/` unless the user explicitly overrides in-thread.
+
 ## Mandatory git-first workflow
 
 Before every code/doc/config change:
@@ -182,7 +186,8 @@ For stale-content questions, recommend refresh discovery/scrape, re-normalize so
 - For multi-step work, take autonomous end-to-end decisions following best practices and only ask the user when blocked or fully complete.
 - Verify UI/operator changes with `agent-browser` on the running app before declaring work complete.
 - Keep the operator UI minimal—show actionable status (Pi progress, jobs, embeddings, MCP) without clutter or debug-only panels.
-- Prefer de-bloating (delete legacy modules, split god files, remove duplicate policy) over large deterministic hardening patch lists; use OpenSpec with agent-runtime boundaries before big changes.
+- Prefer de-bloating (delete legacy modules, split god files, remove duplicate policy, lean production Docker/API images without CUDA or bundled local LLM wheels) over large deterministic hardening patch lists; use OpenSpec with agent-runtime boundaries before big changes.
+- Keep public README and root docs professional—omit program credits, personal attribution, and informal sponsor lines.
 - Student-facing answers must be cite-backed with low hallucination tolerance; URL discovery/curation must demote stale or outdated sources before scrape. When confidence is low, plan for web search plus self-improving source/wiki rebuild rather than guessing.
 
 ## Learned Workspace Facts
@@ -196,3 +201,4 @@ For stale-content questions, recommend refresh discovery/scrape, re-normalize so
 - Tmux operator sessions should auto-kill after a configurable grace period (~30 minutes default) post-execution; the React Settings pane should list active sessions with archive/stop, expose lifecycle settings, and provide MCP server start/stop controls.
 - uops MCP is the local wiki-query MCP for Cursor testing; configure per `docs/cursor-mcp-setup.md` and `configs/cursor-mcp-llm-wiki.example.json` (not Playwright MCP).
 - Legacy `markdown_graph` and root `scrape_planner/*.py` import shims are removed; use canonical subpackage imports (`wiki.*`, `scrape.*`, `core.*`). `docs/CODEBASE.md` is the module map.
+- Production query/deploy uses OpenRouter/API LLMs and MCP over pre-built `data/sites/<site_id>/` wiki and hybrid indexes on a small host; Ollama, Docling, PDF ingest, scrape, and Pi jobs stay on the local operator path.

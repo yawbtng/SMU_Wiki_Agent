@@ -1,4 +1,4 @@
-# Ralph Implementation Plan — 2026-05-28
+# Wiki Implementation Plan — 2026-05-28
 
 Planning-mode artifact only. Do **not** treat any item below as implemented. Specs are worked in numeric priority order unless an explicit product-direction conflict must be resolved first.
 
@@ -11,10 +11,10 @@ All tracked specs are incomplete. **UI target:** FastAPI + React in this repo (s
 | 006 | `specs/006-fastapi-react-realtime-app.md` | TODO | FastAPI REST + SSE + React shell |
 | 000 | `specs/000-automated-wiki-ingest-build-update.md` | TODO | End-to-end Ingest → Clean → Standardize → Lint → Build Wiki → Build Index → Verify |
 | 001 | `specs/001-build-smu-llm-wiki.md` | TODO | Rebuild and verify SMU wiki/index artifacts |
-| 002 | `specs/002-wire-wiki-ui-pi-sdk.md` | TODO | Wiki UI launches observable Pi SDK runtime (webapp) |
+| 002 | `specs/002-wire-wiki-ui-pi-sdk.md` | TODO | Wiki UI launches observable LLM Wiki v2 runtime (webapp) |
 | 003 | `specs/003-semantic-student-wiki-organization.md` | TODO | Concept-first student wiki organization and retrieval proof |
 | 004 | `specs/004-agent-navigable-wiki-map.md` | TODO | Agent-traversable markdown graph, links, backlinks, manifest, MCP hints |
-| 005 | `specs/005-wiki-ralph-orchestrator-ui.md` | TODO | Tmux/Ralph wiki agent launch/status UI (webapp) |
+| 005 | `specs/005-wiki-ralph-orchestrator-ui.md` | SUPERSEDED | Removed Ralph loop strategy; use spec 002 LLM Wiki v2 compile path |
 
 ## Priority 0 — Operator UI baseline (in-repo)
 
@@ -52,9 +52,9 @@ cd frontend && npm run build
 - If report/status says `running`, verify tmux session/process exists.
 - Surface `stale_running` or convert to `stale`/`exited` with a clear warning.
 
-### Task 1.2 — Make orchestrator prompts non-interactive
+### Task 1.2 — Make compile prompts non-interactive
 
-- Remove confirmation-seeking language from unattended Ralph/wiki-agent prompts.
+- Remove confirmation-seeking language from unattended LLM Wiki compile prompts.
 
 ## Priority 2 — Complete Spec 001 (Verification Gate)
 
@@ -74,9 +74,9 @@ cd frontend && npm run build
 
 - Taxonomy/wiki-plan driven generation; retrieval proof for Cox graduate questions.
 
-## Priority 6 — Specs 002 and 005 UI Runtime Wiring (Webapp)
+## Priority 6 — Spec 002 UI Runtime Wiring (Webapp)
 
-- REST action endpoints for Build Wiki, Update Wiki, Ralph orchestrator start/stop.
+- REST action endpoints for Build Wiki and Update Wiki.
 - SSE job updates; Streamlit parity reference only.
 
 ## Required Verification Matrix

@@ -95,6 +95,6 @@ def _normalize_wiki_runtime(value: str) -> str:
     normalized = str(value or "pi").strip().lower().replace("_", "-")
     if normalized in {"python", "deterministic"}:
         return "python"
-    if normalized in {"pi", "ralph-pi", ""}:
+    if normalized in {"", "pi", "ralph-pi"}:
         return "pi"
     return normalized

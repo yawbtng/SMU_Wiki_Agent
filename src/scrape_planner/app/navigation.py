@@ -7,6 +7,7 @@ WORKFLOW_TABS = [
     "Documents",
     "Wiki",
     "Embeddings",
+    "MCP",
     "Metrics",
     "Settings",
 ]

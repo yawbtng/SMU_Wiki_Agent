@@ -7,13 +7,15 @@ import sys
 from pathlib import Path
 
 
-def test_fixture_stepper_runs_normalize_wiki_index_rerank_and_mcp(tmp_path: Path) -> None:
+def test_fixture_stepper_runs_normalize_wiki_index_rerank_and_mcp(tmp_path: Path, monkeypatch) -> None:
     from scripts.validate_llm_wiki_stepper import (
         FIXED_NOW,
         create_fixture_site,
         run_fixture_validation,
     )
 
+    monkeypatch.setenv("WIKI_SKIP_PI", "1")
+    monkeypatch.setenv("LLM_WIKI_ALLOW_HASH_FALLBACK", "1")
     site_root = create_fixture_site(tmp_path / "fixture-site")
     report = run_fixture_validation(site_root, now=FIXED_NOW)
 
@@ -43,9 +45,11 @@ def test_fixture_stepper_runs_normalize_wiki_index_rerank_and_mcp(tmp_path: Path
     assert "[Programs](pages/programs.md)" in index_text
 
 
-def test_validation_command_writes_fixture_and_smu_proof_report(tmp_path: Path) -> None:
+def test_validation_command_writes_fixture_and_smu_proof_report(tmp_path: Path, monkeypatch) -> None:
     from scripts.validate_llm_wiki_stepper import run_validation
 
+    monkeypatch.setenv("WIKI_SKIP_PI", "1")
+    monkeypatch.setenv("LLM_WIKI_ALLOW_HASH_FALLBACK", "1")
     output_root = tmp_path / "validation"
     report = run_validation(
         output_root=output_root,
@@ -83,6 +87,7 @@ def test_validation_script_runs_as_direct_operator_command(tmp_path: Path) -> No
             "--skip-smu",
         ],
         cwd=Path.cwd(),
+        env={**os.environ, "WIKI_SKIP_PI": "1", "LLM_WIKI_ALLOW_HASH_FALLBACK": "1"},
         text=True,
         capture_output=True,
         check=True,

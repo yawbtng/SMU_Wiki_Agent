@@ -7,7 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
-from src.scrape_planner.scrape.url_policy import TARGET_YEAR
+from src.scrape_planner.scrape.url_policy import TARGET_YEAR, detect_dated_archive
 from src.scrape_planner.scrape.url_scoring import DEFAULT_THRESHOLD, score_url, select_scored_urls
 
 

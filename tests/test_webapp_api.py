@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from src.scrape_planner.core.storage import write_json
 from src.scrape_planner.runtime.agent_run_metrics import AgentRunMetricsRepository, build_embedding_metric_event, build_llm_metric_event
-from src.scrape_planner.webapp.api import create_app, run_embedding_job, start_mcp_server_for_site, stop_mcp_server_for_site, sse_event, tmux_session_exists
+from src.scrape_planner.webapp.api import create_app, run_embedding_job, sse_event, tmux_session_exists
 
 
 @pytest.fixture()
@@ -400,33 +400,35 @@ class FakeMcpRunner:
         return {"ok": True}
 
 
-def test_mcp_start_endpoint_starts_site_scoped_server_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mcp_start_endpoint_starts_global_gateway_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     data_root = tmp_path / "data"
-    site_root = write_embedding_ready_site(data_root, changed=0, embedding_enabled=True)
+    write_embedding_ready_site(data_root, changed=0, embedding_enabled=True)
     monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(data_root))
     fake_runner = FakeMcpRunner()
     monkeypatch.setattr("src.scrape_planner.webapp.api.mcp_runner", lambda: fake_runner)
 
-    response = TestClient(create_app()).post("/api/sites/demo.edu/mcp/start")
+    response = TestClient(create_app()).post("/api/mcp/start")
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "started"
     assert payload["mcp"]["running"] is True
-    assert payload["mcp"]["session_name"] == "llm-wiki-mcp-demo-edu"
+    assert payload["mcp"]["session_name"] == "llm-wiki-mcp-global"
+    assert payload["ready_count"] == 1
     assert "mcp_servers.llm_wiki_mcp" in fake_runner.started[0][1]
-    assert str(site_root) in fake_runner.started[0][1]
-    assert (site_root / "indexes" / "mcp-server-latest.json").exists()
+    assert "--data-root" in fake_runner.started[0][1]
+    assert str(data_root) in fake_runner.started[0][1]
+    assert (data_root / "runtime" / "mcp-server-latest.json").exists()
 
 
-def test_mcp_start_endpoint_reuses_existing_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mcp_start_endpoint_reuses_existing_global_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     data_root = tmp_path / "data"
     write_embedding_ready_site(data_root, changed=0, embedding_enabled=True)
     monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(data_root))
     fake_runner = FakeMcpRunner(exists=True)
     monkeypatch.setattr("src.scrape_planner.webapp.api.mcp_runner", lambda: fake_runner)
 
-    response = TestClient(create_app()).post("/api/sites/demo.edu/mcp/start")
+    response = TestClient(create_app()).post("/api/mcp/start")
 
     assert response.status_code == 200
     payload = response.json()
@@ -435,20 +437,20 @@ def test_mcp_start_endpoint_reuses_existing_session(tmp_path: Path, monkeypatch:
     assert fake_runner.started == []
 
 
-def test_mcp_stop_endpoint_kills_site_scoped_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mcp_stop_endpoint_kills_global_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     data_root = tmp_path / "data"
-    site_root = write_embedding_ready_site(data_root, changed=0, embedding_enabled=True)
+    write_embedding_ready_site(data_root, changed=0, embedding_enabled=True)
     monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(data_root))
     fake_runner = FakeMcpRunner(exists=True)
     monkeypatch.setattr("src.scrape_planner.webapp.api.mcp_runner", lambda: fake_runner)
 
-    response = TestClient(create_app()).post("/api/sites/demo.edu/mcp/stop")
+    response = TestClient(create_app()).post("/api/mcp/stop")
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "stopped"
     assert payload["mcp"]["running"] is False
-    assert fake_runner.killed == ["llm-wiki-mcp-demo-edu"]
+    assert fake_runner.killed == ["llm-wiki-mcp-global"]
     assert fake_runner.exists is False
 
 
@@ -459,7 +461,7 @@ def test_mcp_stop_endpoint_when_not_running(tmp_path: Path, monkeypatch: pytest.
     fake_runner = FakeMcpRunner(exists=False)
     monkeypatch.setattr("src.scrape_planner.webapp.api.mcp_runner", lambda: fake_runner)
 
-    response = TestClient(create_app()).post("/api/sites/demo.edu/mcp/stop")
+    response = TestClient(create_app()).post("/api/mcp/stop")
 
     assert response.status_code == 200
     assert response.json()["status"] == "not_running"

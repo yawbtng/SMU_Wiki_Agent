@@ -33,6 +33,8 @@ EMBEDDING_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text:latest").str
 EMBEDDING_DIMENSIONS = 768
 EMBEDDING_SPACE_DENSE = "dense-ollama"
 EMBEDDING_SPACE_HASH = "hash-fallback"
+FALLBACK_EMBEDDING_PROVIDER = "hash"
+FALLBACK_EMBEDDING_MODEL = "sha256-keyword"
 RERANK_PROVIDER = "openrouter"
 RERANK_API_URL = "https://openrouter.ai/api/v1/rerank"
 RERANK_MODEL = "cohere/rerank-4-pro"
@@ -496,6 +498,8 @@ def query_mcp_wiki_index(
 
 
 def _embedding_manifest_error(manifest: dict[str, Any]) -> dict[str, str] | None:
+    if _allow_hash_embedding_fallback():
+        return None
     space = str(manifest.get("embedding_space") or "")
     if bool(manifest.get("embedding_degraded")):
         return {
@@ -1992,6 +1996,8 @@ def _embedding_vector_and_space(
     global _DENSE_EMBEDDING_UNAVAILABLE, _EMBEDDING_DEGRADED
     manifest_space = str(manifest.get("embedding_space") or "") if manifest else ""
     if manifest and manifest_space and manifest_space != EMBEDDING_SPACE_DENSE:
+        if _allow_hash_embedding_fallback() and manifest_space == EMBEDDING_SPACE_HASH:
+            return _hash_embedding_vector(text, dimensions=dimensions), EMBEDDING_SPACE_HASH
         _EMBEDDING_DEGRADED = True
         raise EmbeddingUnavailableError(
             f"Index embedding space is {manifest_space}; expected {EMBEDDING_SPACE_DENSE}. Rebuild the index."
@@ -2006,6 +2012,9 @@ def _embedding_vector_and_space(
     try:
         vector = embed_text(text[:8000], embedding_config_from_env())
     except Exception as exc:
+        if _allow_hash_embedding_fallback():
+            _EMBEDDING_DEGRADED = True
+            return _hash_embedding_vector(text, dimensions=dimensions), EMBEDDING_SPACE_HASH
         _DENSE_EMBEDDING_UNAVAILABLE = True
         _EMBEDDING_DEGRADED = True
         raise EmbeddingUnavailableError(
@@ -2016,6 +2025,20 @@ def _embedding_vector_and_space(
         _EMBEDDING_DEGRADED = True
         raise EmbeddingUnavailableError("Ollama dense embedding response was empty.")
     return _normalize_embedding_dimensions(vector, dimensions), EMBEDDING_SPACE_DENSE
+
+
+def _allow_hash_embedding_fallback() -> bool:
+    return str(os.getenv("LLM_WIKI_ALLOW_HASH_FALLBACK") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _hash_embedding_vector(text: str, *, dimensions: int = EMBEDDING_DIMENSIONS) -> list[float]:
+    seed = hashlib.sha256(text.encode("utf-8", errors="replace")).digest()
+    values: list[float] = []
+    block = seed
+    while len(values) < dimensions:
+        block = hashlib.sha256(block + seed).digest()
+        values.extend(((byte / 127.5) - 1.0) for byte in block)
+    return _normalize_embedding_dimensions(values[:dimensions], dimensions)
 
 
 def _normalize_embedding_dimensions(vector: list[float], dimensions: int) -> list[float]:

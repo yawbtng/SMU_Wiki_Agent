@@ -9,6 +9,7 @@ def test_workflow_tabs_match_operator_ui() -> None:
         "Documents",
         "Wiki",
         "Embeddings",
+        "MCP",
         "Metrics",
         "Settings",
     ]

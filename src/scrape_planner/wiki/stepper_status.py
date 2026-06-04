@@ -146,7 +146,7 @@ def load_wiki_agent_status(reports_dir: Path, *, runner: TmuxRunner | None = Non
     reconciled = reconcile_tmux_job_status(reported_status, session, runner=runner)
     return {
         "tmux_session": session,
-        "runtime": str(report.get("runtime") or "ralph-pi"),
+        "runtime": str(report.get("runtime") or "pi"),
         "job_status": reconciled["job_status"],
         "reported_job_status": reconciled["reported_job_status"],
         "stale_running": reconciled["stale_running"],

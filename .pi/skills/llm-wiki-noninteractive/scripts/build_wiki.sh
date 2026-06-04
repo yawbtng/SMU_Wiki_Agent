@@ -41,6 +41,24 @@ cd "$repo_root"
 python_bin="${PYTHON:-python3}"
 command -v "$python_bin" >/dev/null || { echo "Python not found" >&2; exit 1; }
 
+finish_report() {
+  local code=$?
+  trap - EXIT
+  local status="complete"
+  local message="[llm-wiki] done"
+  if [[ "$code" -ne 0 ]]; then
+    status="failed"
+    message="[llm-wiki] failed with exit code $code"
+  fi
+  "$python_bin" -m src.scrape_planner.wiki.wiki_build_report \
+    --site-root "$site_root" \
+    --status "$status" \
+    --exit-code "$code" \
+    --message "$message" >/dev/null 2>&1 || true
+  exit "$code"
+}
+trap finish_report EXIT
+
 echo "[llm-wiki] site_root=$site_root mode=$mode"
 "$python_bin" -m py_compile src/scrape_planner/wiki/llm_wiki_builder.py src/scrape_planner/wiki/llm_wiki_index.py
 

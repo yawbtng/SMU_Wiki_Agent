@@ -1,4 +1,4 @@
-"""Tmux launcher for the Pi LLM wiki pipeline."""
+"""Tmux launcher for the LLM Wiki v2 compile pipeline."""
 
 from __future__ import annotations
 
@@ -94,7 +94,11 @@ def launch_wiki_builder(
 
 def _normalize_runtime(runtime: str) -> str:
     value = str(runtime or "pi").strip().lower().replace("_", "-")
-    return "python" if value in {"python", "deterministic"} else "pi" if value in {"pi", "ralph-pi", ""} else value
+    if value in {"python", "deterministic"}:
+        return "python"
+    if value in {"", "pi", "ralph-pi"}:
+        return "pi"
+    return value
 
 
 def _pipeline_command(
@@ -130,6 +134,8 @@ def _pipeline_command(
             skill_paths=[skill],
         )
         return command, "pi"
+    if runtime == "pi" and not wiki_skip_pi():
+        return shell, "pi"
     return shell, "python"
 
 

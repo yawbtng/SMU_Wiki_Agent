@@ -58,7 +58,7 @@ def _normalize_optional_string(value: Any) -> str | None:
     return _normalize_string(value, "")
 
 
-def _normalize_int(value: Any, default: int = 0, *, minimum: int | None = None) -> int:
+def _normalize_int(value: Any, default: int = 0, *, minimum: int | None = None, maximum: int | None = None) -> int:
     if isinstance(value, bool):
         return default
     if isinstance(value, int):
@@ -68,6 +68,25 @@ def _normalize_int(value: Any, default: int = 0, *, minimum: int | None = None) 
     elif isinstance(value, str) and value.strip():
         try:
             result = int(value.strip())
+        except ValueError:
+            return default
+    else:
+        return default
+    if minimum is not None:
+        result = max(minimum, result)
+    if maximum is not None:
+        result = min(maximum, result)
+    return result
+
+
+def _normalize_float(value: Any, default: float = 0.0, *, minimum: float | None = None) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        result = float(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            result = float(value.strip())
         except ValueError:
             return default
     else:
@@ -113,6 +132,18 @@ def _normalize_string_mapping(value: Any) -> dict[str, str]:
     return normalized
 
 
+def _normalize_provider(value: Any, default: str = "openrouter") -> str:
+    normalized = _normalize_string(value, default).strip().lower()
+    if normalized in {"ollama", "local"}:
+        return "ollama"
+    return "openrouter"
+
+
+def _normalize_browser_mode(value: Any, default: str = "none") -> str:
+    normalized = _normalize_string(value, default).strip().lower()
+    return "lightpanda" if normalized == "lightpanda" else "none"
+
+
 def _normalize_workspace_rows(value: Any) -> list[WorkspaceContract]:
     if not isinstance(value, list):
         return []
@@ -147,7 +178,72 @@ def _normalize_app_state_payload(payload: Any, defaults: AppStateContract) -> Ap
     normalized["ollama_model"] = _normalize_string(payload.get("ollama_model"), defaults.get("ollama_model", ""))
     normalized["llm_provider"] = _normalize_string(payload.get("llm_provider"), defaults.get("llm_provider", "openrouter"))
     normalized["ollama_base_url"] = _normalize_string(payload.get("ollama_base_url"), defaults.get("ollama_base_url", ""))
+    normalized["scrape_browser_mode"] = _normalize_browser_mode(payload.get("scrape_browser_mode"), defaults.get("scrape_browser_mode", "none"))
+    normalized["lightpanda_cdp_url"] = _normalize_string(payload.get("lightpanda_cdp_url"), defaults.get("lightpanda_cdp_url", ""))
     normalized["site_history"] = _normalize_string_list(payload.get("site_history"))
+    normalized["openrouter_api_key"] = _normalize_string(payload.get("openrouter_api_key"), defaults.get("openrouter_api_key", ""))
+    normalized["tavily_api_key"] = _normalize_string(payload.get("tavily_api_key"), defaults.get("tavily_api_key", ""))
+    normalized["default_or_model"] = _normalize_string(payload.get("default_or_model"), defaults.get("default_or_model", ""))
+    normalized["default_llm_cap"] = _normalize_int(payload.get("default_llm_cap"), int(defaults.get("default_llm_cap") or 150), minimum=1)
+    normalized["default_llm_batch_size"] = _normalize_int(
+        payload.get("default_llm_batch_size"),
+        int(defaults.get("default_llm_batch_size") or 250),
+        minimum=1,
+    )
+    normalized["default_llm_sleep_sec"] = _normalize_float(
+        payload.get("default_llm_sleep_sec"),
+        float(defaults.get("default_llm_sleep_sec") or 0.0),
+        minimum=0.0,
+    )
+    normalized["url_reasoning_provider"] = _normalize_provider(payload.get("url_reasoning_provider"), defaults.get("url_reasoning_provider", "openrouter"))
+    normalized["url_reasoning_openrouter_model"] = _normalize_string(
+        payload.get("url_reasoning_openrouter_model"),
+        defaults.get("url_reasoning_openrouter_model", ""),
+    )
+    normalized["url_reasoning_ollama_model"] = _normalize_string(
+        payload.get("url_reasoning_ollama_model"),
+        defaults.get("url_reasoning_ollama_model", ""),
+    )
+    normalized["graph_enrichment_provider"] = _normalize_provider(payload.get("graph_enrichment_provider"), defaults.get("graph_enrichment_provider", "openrouter"))
+    normalized["graph_enrichment_openrouter_model"] = _normalize_string(
+        payload.get("graph_enrichment_openrouter_model"),
+        defaults.get("graph_enrichment_openrouter_model", ""),
+    )
+    normalized["graph_enrichment_ollama_model"] = _normalize_string(
+        payload.get("graph_enrichment_ollama_model"),
+        defaults.get("graph_enrichment_ollama_model", ""),
+    )
+    normalized["graph_answer_provider"] = _normalize_provider(payload.get("graph_answer_provider"), defaults.get("graph_answer_provider", "openrouter"))
+    normalized["graph_answer_openrouter_model"] = _normalize_string(
+        payload.get("graph_answer_openrouter_model"),
+        defaults.get("graph_answer_openrouter_model", ""),
+    )
+    normalized["graph_answer_ollama_model"] = _normalize_string(
+        payload.get("graph_answer_ollama_model"),
+        defaults.get("graph_answer_ollama_model", ""),
+    )
+    normalized["scrape_concurrency"] = _normalize_int(payload.get("scrape_concurrency"), int(defaults.get("scrape_concurrency") or 4), minimum=1, maximum=16)
+    normalized["embedding_enabled"] = _normalize_bool(payload.get("embedding_enabled"), bool(defaults.get("embedding_enabled", True)))
+    normalized["embedding_model"] = _normalize_string(payload.get("embedding_model"), defaults.get("embedding_model", "nomic-embed-text:latest"))
+    normalized["zvec_enabled"] = _normalize_bool(payload.get("zvec_enabled"), bool(defaults.get("zvec_enabled", True)))
+    normalized["zvec_index_path"] = _normalize_string(payload.get("zvec_index_path"), defaults.get("zvec_index_path", ""))
+    normalized["zvec_collection"] = _normalize_string(payload.get("zvec_collection"), defaults.get("zvec_collection", "university_wiki"))
+    normalized["use_tavily_for_map"] = _normalize_bool(payload.get("use_tavily_for_map"), bool(defaults.get("use_tavily_for_map", False)))
+    normalized["tavily_cost_per_call_usd"] = _normalize_float(
+        payload.get("tavily_cost_per_call_usd"),
+        float(defaults.get("tavily_cost_per_call_usd") or 0.0),
+        minimum=0.0,
+    )
+    normalized["ollama_input_per_m_usd"] = _normalize_float(
+        payload.get("ollama_input_per_m_usd"),
+        float(defaults.get("ollama_input_per_m_usd") or 0.0),
+        minimum=0.0,
+    )
+    normalized["ollama_output_per_m_usd"] = _normalize_float(
+        payload.get("ollama_output_per_m_usd"),
+        float(defaults.get("ollama_output_per_m_usd") or 0.0),
+        minimum=0.0,
+    )
     normalized["tmux_session_grace_seconds"] = _normalize_int(
         payload.get("tmux_session_grace_seconds"),
         int(defaults.get("tmux_session_grace_seconds") or 1800),

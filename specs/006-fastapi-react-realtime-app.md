@@ -49,7 +49,7 @@ Reusable backend read models (this repo):
 
 ### Action endpoints (follow-on; may span specs 002/005)
 
-8. REST action endpoints for Build Wiki, Update Wiki, start/stop Ralph orchestrator, and status recovery.
+8. REST action endpoints for Build Wiki, Update Wiki, and status recovery.
 9. Job updates stream via SSE initially; reserve WebSockets for bidirectional terminal/agent controls.
 
 ### Documentation
@@ -84,7 +84,7 @@ cd frontend && npm run build
 
 ## Dependencies
 
-- Specs 002 and 005 implement wiki/Pi SDK and Ralph orchestrator UI **in the webapp**, not in Streamlit, once this spec's baseline is stable.
+- Spec 002 implements wiki compile UI **in the webapp**, not in Streamlit, once this spec's baseline is stable.
 - Spec 001 provides a known-good SMU wiki/index baseline for UI smoke checks.
 
 ## Status: TODO

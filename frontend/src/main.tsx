@@ -3,7 +3,19 @@ import ReactDOM from 'react-dom/client';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AnyRecord, MetricModel, StatusBandModel, buildEmbeddingModel, buildMcpModel, buildMetricsModel, buildOverviewModel, formatCount, titleCase, toneForStatus } from './viewModel';
+import { settingsDraftFromState, settingsSavePayloadFromDraft } from './settingsModel';
+import {
+  AnyRecord,
+  MetricModel,
+  StatusBandModel,
+  buildEmbeddingModel,
+  buildMcpModel,
+  buildMetricsModel,
+  buildOverviewModel,
+  formatCount,
+  titleCase,
+  toneForStatus,
+} from './viewModel';
 import './styles.css';
 
 const SSE_INTERVAL_SECONDS = 3;
@@ -119,6 +131,14 @@ function siteDisplay(siteId: string, appState?: AnyRecord): { name: string; url:
   };
 }
 
+function workspaceCardStatus(site: AnyRecord): { sources: string; wiki: string; runs: string } {
+  return {
+    sources: site.has_sources ? 'Sources ready' : 'No sources yet',
+    wiki: site.has_wiki ? 'Wiki present' : 'No wiki yet',
+    runs: `${formatCount(site.run_count ?? 0)} artifact runs`,
+  };
+}
+
 function activeWorkspaceStatus(runId: string, liveSnapshot: AnyRecord | null, activeTab: string): { label: string; detail: string } {
   if (runId) {
     return { label: 'Scrape run', detail: runId };
@@ -174,6 +194,8 @@ function useSiteStream(siteId?: string) {
 
   useEffect(() => {
     if (!siteId) return;
+    setSnapshot(null);
+    setConnected(false);
     setPiEvents([]);
     setPiSkill('');
     const stream = new EventSource(`/api/stream/sites/${encodeURIComponent(siteId)}?interval=${SSE_INTERVAL_SECONDS}`);
@@ -210,15 +232,6 @@ function App() {
   const appState = useQuery({ queryKey: ['app-state'], queryFn: () => api<AnyRecord>('/api/app-state') });
   const sites = sitesQuery.data?.sites ?? [];
 
-  useEffect(() => {
-    if (!siteId && sites.length) {
-      const saved = String(appState.data?.state?.active_workspace_id ?? '').trim();
-      const savedSite = saved ? sites.find((site: AnyRecord) => site.id === saved) : undefined;
-      const populated = sites.find((site: AnyRecord) => site.has_sources);
-      setSiteId(savedSite?.has_sources ? saved : (populated?.id ?? saved ?? sites[0].id));
-    }
-  }, [appState.data, siteId, sites]);
-
   const stream = useSiteStream(siteId);
   const overviewHeader = useQuery({
     queryKey: ['overview-header', siteId],
@@ -226,15 +239,60 @@ function App() {
     enabled: !!siteId,
     staleTime: 10_000,
   });
-  const handleSiteDiscovered = useCallback((nextSiteId: string) => {
+  const handleSiteSelected = useCallback((nextSiteId: string) => {
+    if (!nextSiteId) return;
     setSiteId(nextSiteId);
+    setActiveTab('Overview');
+    queryClientHook.setQueryData(['app-state'], (current: AnyRecord | undefined) => ({
+      ...(current ?? {}),
+      state: { ...(current?.state ?? {}), active_workspace_id: nextSiteId, last_site_id: nextSiteId },
+    }));
+  }, [queryClientHook]);
+  const handleReturnToDashboard = useCallback(() => {
+    setSiteId('');
+    setActiveTab('Overview');
+  }, []);
+  const handleSiteDiscovered = useCallback((payload: AnyRecord) => {
+    const nextSiteId = String(payload.site_id ?? '');
+    if (!nextSiteId) return;
+    handleSiteSelected(nextSiteId);
+    const discovery = {
+      discovered_total: payload.discovered_total,
+      eligible_total: payload.eligible_total,
+      rejected_total: payload.rejected_total,
+    };
+    queryClientHook.setQueryData(['approved-urls', nextSiteId], (current: AnyRecord | undefined) => ({
+      ...(current ?? {}),
+      site_id: nextSiteId,
+      discovery,
+      count: current?.count ?? 0,
+      markdown: current?.markdown ?? '# Approved URLs\n\n',
+      urls: current?.urls ?? [],
+      groups: current?.groups ?? [],
+      available_groups: current?.available_groups ?? [],
+      generated_at: payload.generated_at,
+    }));
+    queryClientHook.setQueryData(['sites'], (current: AnyRecord | undefined) => {
+      const existing = Array.isArray(current?.sites) ? current.sites : [];
+      const sites = existing.some((site: AnyRecord) => site.id === nextSiteId)
+        ? existing.map((site: AnyRecord) => site.id === nextSiteId ? { ...site, has_sources: Boolean(site.has_sources), url: payload.site_url } : site)
+        : [...existing, { id: nextSiteId, has_sources: false, has_wiki: false, run_count: 0, url: payload.site_url }];
+      return { ...(current ?? {}), sites };
+    });
     queryClientHook.invalidateQueries({ queryKey: ['sites'] });
     queryClientHook.invalidateQueries({ queryKey: ['app-state'] });
+    queryClientHook.invalidateQueries({ queryKey: ['overview-header', nextSiteId] });
+    queryClientHook.invalidateQueries({ queryKey: ['overview', nextSiteId] });
+    queryClientHook.invalidateQueries({ queryKey: ['sources', nextSiteId] });
     queryClientHook.invalidateQueries({ queryKey: ['approved-urls', nextSiteId] });
-  }, [queryClientHook]);
-  const display = siteDisplay(siteId, appState.data);
+    setActiveTab('Sources');
+  }, [handleSiteSelected, queryClientHook]);
+  const workspaceOpen = Boolean(siteId);
+  const activeDisplay = workspaceOpen ? siteDisplay(siteId, appState.data) : { name: '—', url: '—', runId: '' };
   const selectedSite = sites.find((site: AnyRecord) => site.id === siteId);
-  const activeStatus = activeWorkspaceStatus(display.runId, stream.snapshot ?? overviewHeader.data ?? null, activeTab);
+  const activeStatus = workspaceOpen
+    ? activeWorkspaceStatus(activeDisplay.runId, stream.snapshot ?? overviewHeader.data ?? null, activeTab)
+    : { label: 'Workspace', detail: 'Choose a workspace to begin' };
 
   let bootstrapMessage: string | null = null;
   if (sitesQuery.isPending) {
@@ -244,69 +302,169 @@ function App() {
     bootstrapMessage = `API unavailable (${detail}). Run ./start.sh from the repo root and confirm http://127.0.0.1:8000/api/health responds.`;
   } else if (!sites.length) {
     bootstrapMessage = 'No site data found. Set SCRAPE_PLANNER_DATA_ROOT to your data directory.';
-  } else if (!siteId) {
-    bootstrapMessage = 'Loading workspace…';
   }
 
   return (
     <div className="app-shell">
       <main className="page">
         <Hero
-          activeTab={activeTab}
           activeStatus={activeStatus}
-          connected={stream.connected}
+          connected={workspaceOpen ? stream.connected : false}
           dataRoot={sitesQuery.data?.data_root}
-          site={selectedSite}
-          siteName={display.name}
-          siteUrl={display.url}
+          siteCount={sites.length}
+          siteName={workspaceOpen ? activeDisplay.name : 'Workspace dashboard'}
+          siteUrl={workspaceOpen ? activeDisplay.url : 'Open or add a university workspace'}
         />
-        <WorkspaceToolbar
-          siteName={display.name}
-          siteUrl={display.url}
-          activeStatus={activeStatus}
-          sites={sites}
-          siteId={siteId}
-          onSiteId={setSiteId}
-          onSiteDiscovered={handleSiteDiscovered}
-        />
-        <WorkflowNav activeTab={activeTab} onTab={setActiveTab} />
         {bootstrapMessage ? (
           <EmptyState message={bootstrapMessage} />
-        ) : (
-          <TabView
-            tab={activeTab}
-            siteId={siteId}
-            site={selectedSite}
-            siteName={display.name}
-            siteUrl={display.url}
-            runId={display.runId}
-            liveSnapshot={stream.snapshot}
-            streamConnected={stream.connected}
-            piEvents={stream.piEvents}
-            piSkill={stream.piSkill}
-            onClearPiEvents={stream.clearPiEvents}
+        ) : !workspaceOpen ? (
+          <WorkspaceDashboard
+            sites={sites}
             appState={appState.data}
+            onOpen={handleSiteSelected}
+            onSiteDiscovered={handleSiteDiscovered}
           />
+        ) : (
+          <>
+            <WorkspaceToolbar
+              siteName={activeDisplay.name}
+              siteUrl={activeDisplay.url}
+              activeStatus={activeStatus}
+              sites={sites}
+              siteId={siteId}
+              onSiteId={handleSiteSelected}
+              onSiteDiscovered={handleSiteDiscovered}
+              onReturnToDashboard={handleReturnToDashboard}
+            />
+            <WorkflowNav activeTab={activeTab} onTab={setActiveTab} />
+            <TabView
+              tab={activeTab}
+              siteId={siteId}
+              site={selectedSite}
+              siteName={activeDisplay.name}
+              siteUrl={activeDisplay.url}
+              runId={activeDisplay.runId}
+              liveSnapshot={stream.snapshot}
+              streamConnected={stream.connected}
+              piEvents={stream.piEvents}
+              piSkill={stream.piSkill}
+              onClearPiEvents={stream.clearPiEvents}
+              appState={appState.data}
+            />
+          </>
         )}
       </main>
     </div>
   );
 }
 
+const WorkspaceDashboard = memo(function WorkspaceDashboard({
+  sites,
+  appState,
+  onOpen,
+  onSiteDiscovered,
+}: {
+  sites: AnyRecord[];
+  appState?: AnyRecord;
+  onOpen: (siteId: string) => void;
+  onSiteDiscovered: (payload: AnyRecord) => void;
+}) {
+  const [showAdd, setShowAdd] = useState(false);
+  const [discoverUrl, setDiscoverUrl] = useState('');
+  const [discoverMessage, setDiscoverMessage] = useState('');
+  const [discoverBusy, setDiscoverBusy] = useState(false);
+
+  const runDiscovery = useCallback(async () => {
+    const target = discoverUrl.trim();
+    if (!target) return;
+    setDiscoverBusy(true);
+    setDiscoverMessage('Reading robots.txt and sitemap.xml…');
+    try {
+      const payload = await apiJson<AnyRecord>('/api/discover', 'POST', { site_url: target, timeout: 30 });
+      setDiscoverMessage(`Discovered ${formatCount(payload.discovered_total)} URLs from ${formatCount(payload.sitemap_sources?.length)} sitemap source(s).`);
+      onSiteDiscovered(payload);
+      setShowAdd(false);
+    } catch (error) {
+      setDiscoverMessage(error instanceof Error ? error.message : 'Discovery failed');
+    } finally {
+      setDiscoverBusy(false);
+    }
+  }, [discoverUrl, onSiteDiscovered]);
+
+  return (
+    <section className="workspace-dashboard" aria-label="Workspace dashboard">
+      <div className="workspace-dashboard-head">
+        <div>
+          <h2>Workspaces</h2>
+          <p className="workspace-dashboard-copy">Select a university workspace or discover a new site to begin operator workflows.</p>
+        </div>
+        <button type="button" className="ghost workspace-add-toggle" onClick={() => setShowAdd((value) => !value)}>
+          {showAdd ? 'Cancel' : 'Add workspace'}
+        </button>
+      </div>
+      {showAdd && (
+        <div className="workspace-add-panel">
+          <label className="field-label" htmlFor="workspace-discover-url">University site URL</label>
+          <div className="workspace-add-row">
+            <input
+              id="workspace-discover-url"
+              value={discoverUrl}
+              onChange={(event) => setDiscoverUrl(event.target.value)}
+              placeholder="https://university.edu"
+              aria-label="University URL"
+            />
+            <button type="button" onClick={() => void runDiscovery()} disabled={discoverBusy || !discoverUrl.trim()}>
+              {discoverBusy ? 'Discovering…' : 'Discover / Add'}
+            </button>
+          </div>
+          {discoverMessage && <p className="inline-status">{discoverMessage}</p>}
+        </div>
+      )}
+      {sites.length ? (
+        <div className="workspace-card-grid">
+          {sites.map((site) => {
+            const display = siteDisplay(String(site.id), appState);
+            const cardUrl = String(site.url ?? display.url);
+            const status = workspaceCardStatus(site);
+            const domain = cardUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+            return (
+              <article className="workspace-card" key={String(site.id)}>
+                <div className="workspace-card-top">
+                  <div>
+                    <div className="workspace-card-id">{site.id}</div>
+                    <div className="workspace-card-name">{display.name}</div>
+                  </div>
+                  <button type="button" onClick={() => onOpen(String(site.id))}>Open</button>
+                </div>
+                <div className="workspace-card-url" title={cardUrl}>{domain || cardUrl}</div>
+                <div className="workspace-card-status">
+                  <span className={site.has_sources ? 'ready' : 'muted'}>{status.sources}</span>
+                  <span className={site.has_wiki ? 'ready' : 'muted'}>{status.wiki}</span>
+                  <span>{status.runs}</span>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      ) : (
+        <EmptyState message="No workspaces yet. Add a university URL to discover sitemap sources and create the first workspace." />
+      )}
+    </section>
+  );
+});
+
 const Hero = memo(function Hero({
-  activeTab,
   activeStatus,
   connected,
   dataRoot,
-  site,
+  siteCount,
   siteName,
   siteUrl,
 }: {
-  activeTab: string;
   activeStatus: { label: string; detail: string };
   connected: boolean;
   dataRoot?: string;
-  site?: AnyRecord;
+  siteCount: number;
   siteName: string;
   siteUrl: string;
 }) {
@@ -325,7 +483,7 @@ const Hero = memo(function Hero({
           </div>
           <div className="design-stat">
             <div className="design-stat-label">Workspaces</div>
-            <div className="design-stat-value">{site ? '1' : '0'}</div>
+            <div className="design-stat-value">{formatCount(siteCount)}</div>
           </div>
           <div className="design-stat wide">
             <div className="design-stat-label">{activeStatus.label}</div>
@@ -351,6 +509,7 @@ const WorkspaceToolbar = memo(function WorkspaceToolbar({
   siteId,
   onSiteId,
   onSiteDiscovered,
+  onReturnToDashboard,
 }: {
   siteName: string;
   siteUrl: string;
@@ -358,10 +517,18 @@ const WorkspaceToolbar = memo(function WorkspaceToolbar({
   sites: AnyRecord[];
   siteId: string;
   onSiteId: (siteId: string) => void;
-  onSiteDiscovered: (siteId: string) => void;
+  onSiteDiscovered: (payload: AnyRecord) => void;
+  onReturnToDashboard: () => void;
 }) {
-  const [discoverUrl, setDiscoverUrl] = useState(siteUrl || 'https://www.smu.edu');
+  const [discoverUrl, setDiscoverUrl] = useState(siteUrl || '');
   const [discoverMessage, setDiscoverMessage] = useState('');
+  const autoDiscoverUrl = useRef(siteUrl || '');
+  useEffect(() => {
+    if (siteUrl && (!discoverUrl || discoverUrl === autoDiscoverUrl.current)) {
+      setDiscoverUrl(siteUrl);
+      autoDiscoverUrl.current = siteUrl;
+    }
+  }, [discoverUrl, siteUrl]);
   const runDiscovery = useCallback(async () => {
     const target = discoverUrl.trim();
     if (!target) return;
@@ -369,7 +536,7 @@ const WorkspaceToolbar = memo(function WorkspaceToolbar({
     try {
       const payload = await apiJson<AnyRecord>('/api/discover', 'POST', { site_url: target, timeout: 30 });
       setDiscoverMessage(`Discovered ${formatCount(payload.discovered_total)} URLs from ${formatCount(payload.sitemap_sources?.length)} sitemap source(s).`);
-      onSiteDiscovered(String(payload.site_id));
+      onSiteDiscovered(payload);
     } catch (error) {
       setDiscoverMessage(error instanceof Error ? error.message : 'Discovery failed');
     }
@@ -377,7 +544,17 @@ const WorkspaceToolbar = memo(function WorkspaceToolbar({
   return (
     <section className="workspace-row">
       <div className="workspace-toolbar">
-        <div className="workspace-toolbar-title">{siteName}</div>
+        <div className="workspace-toolbar-head">
+          <div className="workspace-toolbar-title">{siteName}</div>
+          <button
+            type="button"
+            className="icon-button workspace-close"
+            onClick={onReturnToDashboard}
+            aria-label="Return to workspaces"
+          >
+            ×
+          </button>
+        </div>
         <div className="workspace-toolbar-copy">{siteUrl}</div>
         <div className="workspace-toolbar-meta">
           <span>{activeStatus.label}</span>
@@ -385,6 +562,9 @@ const WorkspaceToolbar = memo(function WorkspaceToolbar({
         </div>
       </div>
       <div className="workspace-actions">
+        <button type="button" className="ghost workspace-dashboard-link" onClick={onReturnToDashboard}>
+          Workspaces
+        </button>
         <select value={siteId} onChange={(event) => onSiteId(event.target.value)} aria-label="Workspace">
           {sites.map((site: AnyRecord) => (
             <option key={site.id} value={site.id}>
@@ -446,7 +626,7 @@ const TabView = memo(function TabView({
   if (tab === 'Documents') return <Documents siteId={siteId} />;
   if (tab === 'Wiki') return <Wiki siteId={siteId} liveSnapshot={liveSnapshot} piEvents={piEvents} piSkill={piSkill} onClearPiEvents={onClearPiEvents} />;
   if (tab === 'Embeddings') return <Embeddings siteId={siteId} liveSnapshot={liveSnapshot} />;
-  if (tab === 'MCP') return <McpServer siteId={siteId} liveSnapshot={liveSnapshot} />;
+  if (tab === 'MCP') return <McpServer />;
   if (tab === 'Metrics') return <Metrics siteId={siteId} />;
   if (tab === 'Settings') return <Settings appState={appState} />;
   return <EmptyState message={`${tab} is unavailable.`} />;
@@ -477,6 +657,11 @@ const Overview = memo(function Overview({
     queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/runs`),
     enabled: !!siteId,
   });
+  const approved = useQuery({
+    queryKey: ['approved-urls', siteId],
+    queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/approved-urls`),
+    enabled: !!siteId,
+  });
   const data = liveSnapshot ?? overview.data;
   const activeRun = (runs.data?.runs ?? []).find((run: AnyRecord) => run.run_id === runId) ?? (runs.data?.runs ?? []).find((run: AnyRecord) => run.status?.state);
   const model = buildOverviewModel({
@@ -487,6 +672,8 @@ const Overview = memo(function Overview({
     wiki: data?.wiki,
     agent: data?.agent,
     embeddings: data?.embeddings,
+    discovery: approved.data?.discovery,
+    approvedCount: approved.data?.count,
     run: activeRun,
   });
   return (
@@ -507,7 +694,7 @@ const Overview = memo(function Overview({
       </Panel>
       <details className="operator-details">
         <summary>Operator Details</summary>
-        <JsonBlock value={{ overview: data ?? overview.error?.message ?? 'Loading', next_action: model.nextAction }} />
+        <JsonBlock value={{ overview: data ?? overview.error?.message ?? 'Loading', discovery: approved.data?.discovery, next_action: model.nextAction }} />
       </details>
     </section>
   );
@@ -619,7 +806,7 @@ const Sources = memo(function Sources({ siteId, hasSources = true, siteLabel }: 
       )}
       {!loadError && !hasSources && (
         <p className="embeddings-rebuild-line alert soft">
-          <strong>{siteLabel ?? siteId}</strong> has no scraped sources yet. Use the workspace dropdown to switch to a site with data (for example <code>www.smu.edu</code>).
+          <strong>{siteLabel ?? siteId}</strong> has no scraped sources yet. Use the scrape workflow for this workspace, or switch to another workspace with prepared sources.
         </p>
       )}
       <Panel title="Approval chat">
@@ -906,13 +1093,6 @@ const Wiki = memo(function Wiki({
     enabled: !!siteId,
     refetchInterval: 4000,
   });
-  const agentDetail = useQuery({
-    queryKey: ['wiki-agent', siteId],
-    queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/wiki/agent`),
-    enabled: !!siteId,
-    refetchInterval: 2000,
-  });
-  const agent = agentDetail.data ?? liveSnapshot?.agent ?? {};
   const wikiReport = (wikiJob.data?.report ?? {}) as AnyRecord;
   const wikiJobRunning = ['running', 'starting', 'initializing'].includes(
     String(wikiReport.job_status ?? wikiReport.status ?? '').toLowerCase(),
@@ -926,10 +1106,6 @@ const Wiki = memo(function Wiki({
     queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/document-preview?path=${encodeURIComponent(selectedPath)}`),
     enabled: Boolean(siteId && selectedPath),
   });
-  const taskItems = agent.tasks?.items ?? [];
-  const completed = Number(agent.tasks?.completed ?? 0);
-  const total = Number(agent.tasks?.total ?? taskItems.length);
-
   const launchWikiJob = useCallback(async (rebuild: boolean) => {
     if (!siteId || jobBusy) return;
     setJobBusy(true);
@@ -941,7 +1117,6 @@ const Wiki = memo(function Wiki({
         prompt: rebuild ? 'rebuild wiki' : 'resume wiki',
         rebuild_wiki: rebuild,
       });
-      await queryClientHook.invalidateQueries({ queryKey: ['wiki-agent', siteId] });
       await queryClientHook.invalidateQueries({ queryKey: ['tmux-sessions', siteId] });
       await queryClientHook.invalidateQueries({ queryKey: ['wiki-job', siteId] });
     } catch (err) {
@@ -951,10 +1126,9 @@ const Wiki = memo(function Wiki({
     }
   }, [siteId, jobBusy, onClearPiEvents, queryClientHook]);
 
-  const displayPiEvents = useMemo(() => {
+  const displayBuildEvents = useMemo(() => {
     const polled = [
       ...(Array.isArray(wikiJob.data?.pi_events) ? (wikiJob.data.pi_events as PiStreamEvent[]) : []),
-      ...(Array.isArray(agentDetail.data?.events) ? (agentDetail.data.events as PiStreamEvent[]) : []),
     ];
     if (!piEvents.length) return polled.slice(-400);
     if (!polled.length) return piEvents;
@@ -967,23 +1141,23 @@ const Wiki = memo(function Wiki({
       merged.push(event);
     }
     return merged.slice(-400);
-  }, [agentDetail.data?.events, piEvents, wikiJob.data?.pi_events]);
+  }, [piEvents, wikiJob.data?.pi_events]);
 
-  const piText = useMemo(() => {
+  const buildText = useMemo(() => {
     const chunks: string[] = [];
-    for (const event of displayPiEvents) {
+    for (const event of displayBuildEvents) {
       const label = piEventLabel(event);
       if (label) chunks.push(label);
     }
     return chunks.join('');
-  }, [displayPiEvents]);
+  }, [displayBuildEvents]);
 
-  const piStructured = useMemo(
-    () => displayPiEvents.filter((event) => {
+  const buildStructured = useMemo(
+    () => displayBuildEvents.filter((event) => {
       const type = String(event.type ?? '');
       return type && type !== 'message_update' && !type.startsWith('message_');
     }).slice(-40),
-    [displayPiEvents],
+    [displayBuildEvents],
   );
 
   const archiveTmuxSession = useCallback(async (session: string) => {
@@ -995,7 +1169,6 @@ const Wiki = memo(function Wiki({
     );
     await queryClientHook.invalidateQueries({ queryKey: ['tmux-sessions', siteId] });
     await queryClientHook.invalidateQueries({ queryKey: ['wiki-job', siteId] });
-    await queryClientHook.invalidateQueries({ queryKey: ['wiki-agent', siteId] });
   }, [queryClientHook, siteId]);
 
   return (
@@ -1021,7 +1194,7 @@ const Wiki = memo(function Wiki({
       <Panel title="Wiki build">
         <div className="wiki-builder">
           <p className="wiki-builder-lede muted">
-            Pi compiles student guides with wiki links, backlinks, and sitemap checks.
+            LLM Wiki v2 compiles Karpathy-style semantic pages with citations, backlinks, source notes, then lints and rebuilds the query index.
           </p>
           <div className="wiki-builder-bar">
             <button type="button" className="primary" disabled={jobBusy} onClick={() => void launchWikiJob(true)}>
@@ -1032,27 +1205,7 @@ const Wiki = memo(function Wiki({
             </button>
             {jobError && <span className="inline-status alert-inline">{jobError}</span>}
           </div>
-          <details className="operator-details wiki-builder-settings">
-            <summary>Run settings</summary>
-            <dl className="wiki-builder-meta">
-              <div>
-                <dt>Model</dt>
-                <dd>{agent.run?.model ?? 'openai-codex/gpt-5.3-codex'}</dd>
-              </div>
-              <div>
-                <dt>Thinking</dt>
-                <dd>{agent.run?.thinking ?? 'high'}</dd>
-              </div>
-              <div>
-                <dt>Spec</dt>
-                <dd>{agent.run?.target_spec ?? 'specs/004-agent-navigable-wiki-map.md'}</dd>
-              </div>
-              <div>
-                <dt>Loops</dt>
-                <dd>{agent.run?.max_iterations ?? 50}</dd>
-              </div>
-            </dl>
-          </details>
+          <p className="setting-help">This is a single noninteractive compile path. Poor pages should fail review or eval instead of being treated as finished.</p>
         </div>
       </Panel>
       <Panel title="Tmux sessions">
@@ -1083,28 +1236,28 @@ const Wiki = memo(function Wiki({
           )}
         </div>
       </Panel>
-      <Panel title="Pi agent event stream">
+      <Panel title="Build event stream">
         <MetricStrip
           metrics={[
-            { label: 'Skill', value: piSkill || fmt(overview.wiki?.runtime) || 'llm-wiki-noninteractive' },
-            { label: 'Events', value: formatCount(displayPiEvents.length) },
+            { label: 'Skill', value: piSkill || 'llm-wiki-v2' },
+            { label: 'Events', value: formatCount(displayBuildEvents.length) },
             { label: 'Job', value: wikiJobRunning ? 'running' : fmt(wikiReport.job_status ?? 'idle') },
-            { label: 'Mode', value: 'pi --mode json' },
+            { label: 'Mode', value: fmt(wikiReport.runtime, 'pi compile') },
           ]}
         />
-        {piText ? (
-          <pre className="pi-event-text">{piText}</pre>
+        {buildText ? (
+          <pre className="pi-event-text">{buildText}</pre>
         ) : (
           <p className="setting-help">
             {wikiJobRunning
-              ? 'Waiting for Pi JSON events (SSE + polled tail). If this stays empty, check wiki/reports/wiki-build-pi-events.jsonl.'
-              : 'Start a Pi wiki job to see message_update text deltas and tool events here.'}
+              ? 'Waiting for build log events. If this stays empty, check the tmux session archive for this wiki job.'
+              : 'Start a wiki build to see status updates here.'}
           </p>
         )}
-        {piStructured.length > 0 && (
+        {buildStructured.length > 0 && (
           <details className="operator-details" open>
-            <summary>Structured events (latest {piStructured.length})</summary>
-            <pre className="json">{JSON.stringify(piStructured, null, 2)}</pre>
+            <summary>Structured events (latest {buildStructured.length})</summary>
+            <pre className="json">{JSON.stringify(buildStructured, null, 2)}</pre>
           </details>
         )}
       </Panel>
@@ -1122,36 +1275,17 @@ const Wiki = memo(function Wiki({
         </p>
       </Panel>
       <Panel title="Build activity">
-        {agent.stale_running && (
-          <div className="alert soft">
-            Ralph agent status is stale: recorded session {fmt(agent.run?.tmux_session)} is not present in tmux. The deterministic wiki build remains the source of truth for this panel.
-          </div>
-        )}
         <MetricStrip
           metrics={[
-            { label: 'Runtime', value: fmt(overview.wiki?.runtime ?? agent.run?.runtime ?? 'python') },
-            { label: 'State', value: fmt(overview.wiki?.job_status ?? agent.run?.status ?? 'ready') },
+            { label: 'Runtime', value: fmt(overview.wiki?.runtime ?? 'python') },
+            { label: 'State', value: fmt(overview.wiki?.job_status ?? 'ready') },
             { label: 'Sources', value: formatCount(overview.wiki?.integrated_sources) },
             { label: 'Pages', value: formatCount(overview.wiki?.pages_created) },
           ]}
         />
-        <div className="progress-line">
-          <span>AI-native wiki tasks: {completed}/{total} complete</span>
-          <progress value={total ? completed / total : 0} max={1} />
-        </div>
-        {taskItems.length > 0 && (
-          <details className="operator-details" open>
-            <summary>AI-native task checklist</summary>
-            <ul className="task-list">
-              {taskItems.map((task: AnyRecord, index: number) => (
-                <li key={`${task.title ?? index}-${index}`}>{task.status === 'complete' ? '[x]' : task.status === 'running' ? '->' : '[ ]'} {task.title ?? task.name ?? JSON.stringify(task)} <span>{task.status}</span></li>
-              ))}
-            </ul>
-          </details>
-        )}
         <details className="operator-details">
-          <summary>Legacy builder log / artifacts</summary>
-          <pre className="json">{agent.pane_log_tail || JSON.stringify(agent.events ?? [], null, 2)}</pre>
+          <summary>Build report</summary>
+          <pre className="json">{JSON.stringify(wikiReport, null, 2)}</pre>
         </details>
       </Panel>
       <div className="two-col documents-grid">
@@ -1337,15 +1471,17 @@ const Embeddings = memo(function Embeddings({ siteId, liveSnapshot }: { siteId: 
   );
 });
 
-const McpServer = memo(function McpServer({ siteId, liveSnapshot }: { siteId: string; liveSnapshot: AnyRecord | null }) {
+const McpServer = memo(function McpServer() {
   const queryClientHook = useQueryClient();
-  const overviewPoll = useQuery({
-    queryKey: ['overview-header', siteId],
-    queryFn: () => api<AnyRecord>(`/api/sites/${encodeURIComponent(siteId)}/overview`),
-    enabled: !!siteId,
+  const statusPoll = useQuery({
+    queryKey: ['global-mcp-status'],
+    queryFn: () => api<AnyRecord>('/api/mcp/status'),
     staleTime: 5_000,
+    refetchInterval: 5000,
   });
-  const mcp = (overviewPoll.data?.mcp ?? liveSnapshot?.mcp ?? {}) as AnyRecord;
+  const payload = (statusPoll.data ?? {}) as AnyRecord;
+  const mcp = (payload.mcp ?? {}) as AnyRecord;
+  const universities = Array.isArray(payload.universities) ? payload.universities as AnyRecord[] : [];
   const model = buildMcpModel(mcp);
   const [message, setMessage] = useState('');
   const running = Boolean(mcp.running);
@@ -1353,86 +1489,86 @@ const McpServer = memo(function McpServer({ siteId, liveSnapshot }: { siteId: st
   const canStop = running;
 
   const refreshMcp = useCallback(() => {
-    void overviewPoll.refetch();
-    queryClientHook.invalidateQueries({ queryKey: ['overview-header', siteId] });
-  }, [overviewPoll, queryClientHook, siteId]);
+    void statusPoll.refetch();
+    queryClientHook.invalidateQueries({ queryKey: ['global-mcp-status'] });
+  }, [queryClientHook, statusPoll]);
 
-  const startServer = useCallback(async () => {
-    setMessage('Starting…');
+  const callMcp = useCallback(async (action: 'start' | 'stop' | 'restart') => {
+    setMessage(action === 'start' ? 'Starting…' : action === 'stop' ? 'Stopping…' : 'Restarting…');
     try {
-      const response = await fetch(`/api/sites/${encodeURIComponent(siteId)}/mcp/start`, { method: 'POST' });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(String(payload.detail ?? response.statusText));
-      const status = String(payload.status ?? 'started');
-      if (status === 'already_running') setMessage('Already running');
-      else if (status === 'blocked') setMessage('Cannot start — command unavailable');
-      else setMessage(status === 'started' ? 'MCP server started' : titleCase(status));
+      const response = await fetch(`/api/mcp/${action}`, { method: 'POST' });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(String(result.detail ?? response.statusText));
+      const status = String(result.status ?? action);
+      if (status === 'already_running') setMessage('Global MCP gateway already running');
+      else if (status === 'not_running') setMessage('Global MCP gateway was not running');
+      else setMessage(status === 'started' ? 'Global MCP gateway started' : status === 'stopped' ? 'Global MCP gateway stopped' : titleCase(status));
       refreshMcp();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Start failed');
+      setMessage(error instanceof Error ? error.message : `${titleCase(action)} failed`);
     }
-  }, [refreshMcp, siteId]);
-
-  const stopServer = useCallback(async () => {
-    setMessage('Stopping…');
-    try {
-      const response = await fetch(`/api/sites/${encodeURIComponent(siteId)}/mcp/stop`, { method: 'POST' });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(String(payload.detail ?? response.statusText));
-      const status = String(payload.status ?? 'stopped');
-      if (status === 'not_running') setMessage('Server was not running');
-      else setMessage(status === 'stopped' ? 'MCP server stopped' : titleCase(status));
-      refreshMcp();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Stop failed');
-    }
-  }, [refreshMcp, siteId]);
+  }, [refreshMcp]);
 
   return (
     <section>
-      <h2>MCP</h2>
+      <h2>MCP Gateway</h2>
       <div className="embeddings-summary mcp-summary">
         <div className="embeddings-summary-top">
           <div className="embeddings-pills">
             <span className={`status-pill ${model.serverBand.tone}`}>
-              Server · {model.serverBand.statusLabel}
+              Gateway · {model.serverBand.statusLabel}
             </span>
-            {mcp.session_name && (
-              <span className="status-pill neutral">{String(mcp.session_name)}</span>
-            )}
+            {mcp.session_name && <span className="status-pill neutral">{String(mcp.session_name)}</span>}
           </div>
           <p className="embeddings-headline">
             {running
-              ? 'LLM Wiki MCP is running in tmux for this site.'
-              : mcp.server_available
-                ? 'Start the query-only MCP server so agents can search this site index.'
-                : 'MCP server command is not configured for this workspace.'}
+              ? 'One global MCP gateway is running and can route agent queries across all ready universities.'
+              : 'Start one global MCP gateway so Cursor and other agents can discover and query every ready university workspace.'}
           </p>
           {mcp.last_error && <p className="embeddings-rebuild-line alert soft">{String(mcp.last_error)}</p>}
         </div>
         <dl className="embeddings-stats">
           <div>
-            <dt>Index</dt>
-            <dd>{titleCase(mcp.index_health ?? 'missing')}</dd>
+            <dt>Universities</dt>
+            <dd>{formatCount(mcp.ready_university_count ?? payload.ready_count)} / {formatCount(mcp.university_count ?? payload.count)} ready</dd>
           </div>
           <div>
             <dt>Command</dt>
             <dd>{mcp.server_available ? 'Ready' : 'Missing'}</dd>
           </div>
+          <div>
+            <dt>Scope</dt>
+            <dd>{fmt(mcp.scope, 'global')}</dd>
+          </div>
         </dl>
         <div className="action-row embeddings-actions">
-          <button type="button" className="ghost" onClick={startServer} disabled={!canStart}>
-            Start MCP
-          </button>
-          <button type="button" onClick={stopServer} disabled={!canStop}>
-            Stop MCP
-          </button>
+          <button type="button" className="ghost" onClick={() => void callMcp('start')} disabled={!canStart}>Start MCP</button>
+          <button type="button" onClick={() => void callMcp('stop')} disabled={!canStop}>Stop MCP</button>
+          <button type="button" className="ghost" onClick={() => void callMcp('restart')}>Restart</button>
           {message && <span className="inline-status">{message}</span>}
         </div>
       </div>
+      <Panel title="Universities exposed to MCP">
+        <DataTable
+          columns={[
+            ['site_id', 'Workspace'],
+            ['name', 'Name'],
+            ['domain', 'Domain'],
+            ['wiki_ready', 'Wiki'],
+            ['index_ready', 'Index'],
+            ['mcp_enabled', 'MCP'],
+          ]}
+          rows={universities.map((row) => ({
+            ...row,
+            wiki_ready: row.wiki_ready ? 'ready' : 'missing',
+            index_ready: row.index_ready ? 'ready' : 'missing',
+            mcp_enabled: row.mcp_enabled ? 'enabled' : 'not ready',
+          }))}
+        />
+      </Panel>
       <details className="operator-details">
-        <summary>Raw MCP state (debug)</summary>
-        <JsonBlock value={mcp} />
+        <summary>Raw MCP gateway state</summary>
+        <JsonBlock value={payload || statusPoll.error?.message || 'Loading'} />
       </details>
     </section>
   );
@@ -1441,45 +1577,54 @@ const McpServer = memo(function McpServer({ siteId, liveSnapshot }: { siteId: st
 const Metrics = memo(function Metrics({ siteId }: { siteId: string }) {
   const [windowLabel, setWindowLabel] = useState('30d');
   const [selectedRunId, setSelectedRunId] = useState('');
-  const runs = useQuery({ queryKey: ['agent-metrics-runs', siteId], queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/metrics/runs`), enabled: !!siteId });
+  const runs = useQuery({
+    queryKey: ['agent-metrics-runs', siteId],
+    queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/metrics/runs`),
+    enabled: !!siteId,
+    refetchInterval: 5000,
+  });
   const rollups = useQuery({
     queryKey: ['agent-metrics-rollups', siteId],
     queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/metrics/rollups?windows=30d,60d,90d,365d&include_all_time=true`),
     enabled: !!siteId,
+    refetchInterval: 5000,
   });
   const rows = runs.data?.runs ?? [];
   const selectedRun = selectedRunId ? rows.find((run: AnyRecord) => run.run_id === selectedRunId) : rows[0];
   const rollup = rollups.data?.rollups?.[windowLabel] ?? rollups.data?.rollups?.['30d'];
   const model = buildMetricsModel({ runs: rows, rollup });
   const selectedModel = buildMetricsModel({ runs: selectedRun ? [selectedRun] : [] });
+  const trendPoints = useMemo(() => buildRunTrendPoints(rows), [rows]);
+  const rollupPoints = useMemo(() => buildRollupPoints(rollups.data?.rollups ?? {}), [rollups.data]);
+  const mix = metricNumber(rollup?.llm_tokens) + metricNumber(rollup?.embedding_tokens) > 0
+    ? [
+        { label: 'LLM', value: metricNumber(rollup?.llm_tokens), color: 'var(--primary)' },
+        { label: 'Embeddings', value: metricNumber(rollup?.embedding_tokens), color: 'var(--electric)' },
+      ]
+    : [];
   return (
     <section>
       <h2>Metrics</h2>
-      <Panel title="Pi Agent Aggregates">
-        <div className="segmented">
-          {['30d', '60d', '90d', '365d', 'all_time'].map((label) => (
-            <button key={label} type="button" className={windowLabel === label ? 'active' : ''} onClick={() => setWindowLabel(label)}>
-              {label === '365d' ? '1 year' : label.replace('_', ' ')}
-            </button>
-          ))}
+      <Panel title="Pi Agent Metrics Overview">
+        <div className="metrics-overview-head">
+          <div>
+            <p className="panel-copy">Aggregate health, spend, and token movement across Pi runs. Charts refresh with the live metrics feed.</p>
+          </div>
+          <div className="segmented">
+            {['30d', '60d', '90d', '365d', 'all_time'].map((label) => (
+              <button key={label} type="button" className={windowLabel === label ? 'active' : ''} onClick={() => setWindowLabel(label)}>
+                {label === '365d' ? '1 year' : label.replace('_', ' ')}
+              </button>
+            ))}
+          </div>
         </div>
         <MetricStrip metrics={model.aggregateMetrics} />
-      </Panel>
-      <Panel title="Agent Metrics Per Run">
-        <DataTable
-          columns={[
-            ['run_id', 'Run'],
-            ['state', 'State'],
-            ['total_tokens', 'Total Tokens'],
-            ['llm_tokens', 'LLM Tokens'],
-            ['embedding_tokens', 'Embedding Tokens'],
-            ['vectors', 'Vectors'],
-            ['cost', 'Cost'],
-            ['health', 'Health'],
-          ]}
-          rows={model.runRows}
-          onRowClick={(row) => setSelectedRunId(String(row.run_id ?? ''))}
-        />
+        <div className="metrics-dashboard-grid">
+          <MiniBarChart title="Token trend by run" points={trendPoints} valueKey="tokens" valueLabel="tokens" />
+          <MiniLineChart title="Cost trend by run" points={trendPoints} valueKey="cost" valueLabel="USD" />
+          <TokenMixChart title={`${windowLabel.replace('_', ' ')} token mix`} segments={mix} />
+          <MiniBarChart title="Window comparison" points={rollupPoints} valueKey="tokens" valueLabel="tokens" />
+        </div>
       </Panel>
       <Panel title="Selected Run Detail">
         {selectedRun ? (
@@ -1499,34 +1644,162 @@ const Metrics = memo(function Metrics({ siteId }: { siteId: string }) {
           <EmptyState message="No Pi agent metrics have been recorded yet." />
         )}
       </Panel>
+      <details className="operator-details metrics-technical-details">
+        <summary>Run-level technical details</summary>
+        <DataTable
+          columns={[
+            ['run_id', 'Run'],
+            ['status', 'State'],
+            ['total_tokens', 'Total Tokens'],
+            ['llm_tokens', 'LLM Tokens'],
+            ['embedding_tokens', 'Embedding Tokens'],
+            ['vectors', 'Vectors'],
+            ['cost', 'Cost'],
+            ['health', 'Health'],
+          ]}
+          rows={model.runRows}
+          onRowClick={(row) => setSelectedRunId(String(row.run_id ?? ''))}
+        />
+      </details>
     </section>
   );
 });
+
+type ChartPoint = { label: string; tokens: number; cost: number; runs: number };
+
+type TokenSegment = { label: string; value: number; color: string };
+
+function metricNumber(value: unknown): number {
+  const numeric = Number(value ?? 0);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function metricCostValue(cost: unknown): number {
+  if (!cost || typeof cost !== 'object') return 0;
+  const amount = Number((cost as AnyRecord).amount_usd ?? 0);
+  return Number.isFinite(amount) ? amount : 0;
+}
+
+function shortRunLabel(value: unknown, index: number): string {
+  const text = String(value ?? `run-${index + 1}`);
+  return text.length > 14 ? `${text.slice(0, 6)}…${text.slice(-5)}` : text;
+}
+
+function buildRunTrendPoints(runs: AnyRecord[]): ChartPoint[] {
+  return runs.slice(0, 12).reverse().map((run, index) => ({
+    label: shortRunLabel(run.run_id, index),
+    tokens: metricNumber(run.total_model_tokens),
+    cost: metricCostValue(run.cost),
+    runs: 1,
+  }));
+}
+
+function buildRollupPoints(rollups: AnyRecord): ChartPoint[] {
+  return ['30d', '60d', '90d', '365d', 'all_time']
+    .map((label) => {
+      const rollup = rollups[label] ?? {};
+      return {
+        label: label === '365d' ? '1y' : label.replace('_', ' '),
+        tokens: metricNumber(rollup.total_tokens),
+        cost: metricCostValue(rollup.total_cost),
+        runs: metricNumber(rollup.run_count),
+      };
+    })
+    .filter((point) => point.tokens > 0 || point.runs > 0 || point.cost > 0);
+}
+
+function MiniBarChart({ title, points, valueKey, valueLabel }: { title: string; points: ChartPoint[]; valueKey: keyof ChartPoint; valueLabel: string }) {
+  const max = Math.max(...points.map((point) => metricNumber(point[valueKey])), 0);
+  return (
+    <article className="metric-chart-card">
+      <div className="metric-chart-title">{title}</div>
+      {points.length ? (
+        <div className="metric-bars" role="img" aria-label={title}>
+          {points.map((point) => {
+            const value = metricNumber(point[valueKey]);
+            const height = max > 0 ? Math.max(6, (value / max) * 100) : 0;
+            return (
+              <div className="metric-bar-column" key={`${title}-${point.label}`} title={`${point.label}: ${formatCount(value)} ${valueLabel}`}>
+                <div className="metric-bar-track"><span style={{ height: `${height}%` }} /></div>
+                <small>{point.label}</small>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <EmptyState message="No aggregate metrics available yet." />
+      )}
+    </article>
+  );
+}
+
+function MiniLineChart({ title, points, valueKey, valueLabel }: { title: string; points: ChartPoint[]; valueKey: keyof ChartPoint; valueLabel: string }) {
+  const values = points.map((point) => metricNumber(point[valueKey]));
+  const max = Math.max(...values, 0);
+  const path = points.map((point, index) => {
+    const x = points.length <= 1 ? 50 : (index / (points.length - 1)) * 100;
+    const y = max > 0 ? 92 - (metricNumber(point[valueKey]) / max) * 78 : 92;
+    return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
+  }).join(' ');
+  return (
+    <article className="metric-chart-card">
+      <div className="metric-chart-title">{title}</div>
+      {points.length ? (
+        <div className="metric-line-wrap" role="img" aria-label={title}>
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+            <path className="metric-line-fill" d={`${path} L 100 100 L 0 100 Z`} />
+            <path className="metric-line" d={path} />
+          </svg>
+          <div className="metric-line-labels">
+            {points.map((point) => <small key={`${title}-${point.label}`} title={`${point.label}: ${metricNumber(point[valueKey]).toFixed(valueKey === 'cost' ? 4 : 0)} ${valueLabel}`}>{point.label}</small>)}
+          </div>
+        </div>
+      ) : (
+        <EmptyState message="No cost metrics available yet." />
+      )}
+    </article>
+  );
+}
+
+function TokenMixChart({ title, segments }: { title: string; segments: TokenSegment[] }) {
+  const total = segments.reduce((sum, segment) => sum + segment.value, 0);
+  return (
+    <article className="metric-chart-card">
+      <div className="metric-chart-title">{title}</div>
+      {total > 0 ? (
+        <>
+          <div className="token-mix-bar">
+            {segments.map((segment) => (
+              <span key={segment.label} style={{ width: `${(segment.value / total) * 100}%`, background: segment.color }} title={`${segment.label}: ${formatCount(segment.value)}`} />
+            ))}
+          </div>
+          <div className="token-mix-legend">
+            {segments.map((segment) => <span key={segment.label}><i style={{ background: segment.color }} />{segment.label} · {formatCount(segment.value)}</span>)}
+          </div>
+        </>
+      ) : (
+        <EmptyState message="No token mix for this window yet." />
+      )}
+    </article>
+  );
+}
 
 const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) {
   const state = appState?.state ?? {};
   const queryClientHook = useQueryClient();
   const [saveMessage, setSaveMessage] = useState('');
   const [saving, setSaving] = useState(false);
-  const [draft, setDraft] = useState(() => wikiTmuxDraftFromState(state));
+  const [draft, setDraft] = useState(() => settingsDraftFromState(state));
 
   useEffect(() => {
-    setDraft(wikiTmuxDraftFromState(state));
+    setDraft(settingsDraftFromState(state));
   }, [appState]);
 
-  const graceMinutes = draft.tmux_session_grace_minutes;
   const saveSettings = useCallback(async () => {
     setSaving(true);
     setSaveMessage('');
     try {
-      const payload = {
-        tmux_session_grace_seconds: Math.max(0, Math.round(Number(graceMinutes) * 60)),
-        wiki_builder_runtime: draft.wiki_builder_runtime,
-        wiki_skip_pi: draft.wiki_skip_pi,
-        tmux_archive_sessions: draft.tmux_archive_sessions,
-        tmux_reconcile_expired_sessions: draft.tmux_reconcile_expired_sessions,
-        pi_cmd: draft.pi_cmd.trim() || 'pi',
-      };
+      const payload = settingsSavePayloadFromDraft(draft);
       await apiJson<AnyRecord>('/api/app-state', 'PUT', { payload });
       await queryClientHook.invalidateQueries({ queryKey: ['app-state'] });
       setSaveMessage('Settings saved.');
@@ -1535,7 +1808,7 @@ const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) 
     } finally {
       setSaving(false);
     }
-  }, [draft, graceMinutes, queryClientHook]);
+  }, [draft, queryClientHook]);
 
   return (
     <section>
@@ -1550,22 +1823,113 @@ const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) 
         ]}
       />
       <div className="settings-grid">
-        {[
-          ['Keys', ['OpenRouter key', 'Tavily key']],
-          ['LLM', ['URL reasoning', 'Wiki enrichment', 'Wiki Q&A']],
-          ['Scraping', ['Scrape concurrency', 'Browser fallback', 'Lightpanda CDP URL']],
-          ['Indexing', ['Embeddings enabled', 'Embedding model', 'Zvec collection']],
-          ['Research', ['Use Tavily for university map']],
-        ].map(([title, items]) => (
-          <Panel key={String(title)} title={String(title)}>
-            {(items as string[]).map((item) => (
-              <label key={item} className="setting-row">
-                <span>{item}</span>
-                <input readOnly value={settingValue(item, state)} />
-              </label>
-            ))}
-          </Panel>
-        ))}
+        <Panel title="Keys">
+          <label className="setting-row">
+            <span>OpenRouter key</span>
+            <input
+              type="password"
+              autoComplete="off"
+              value={draft.openrouter_api_key}
+              onChange={(event) => setDraft((current) => ({ ...current, openrouter_api_key: event.target.value }))}
+            />
+          </label>
+          <label className="setting-row">
+            <span>Tavily key</span>
+            <input
+              type="password"
+              autoComplete="off"
+              value={draft.tavily_api_key}
+              onChange={(event) => setDraft((current) => ({ ...current, tavily_api_key: event.target.value }))}
+            />
+          </label>
+        </Panel>
+        <Panel title="LLM">
+          <label className="setting-row">
+            <span>URL reasoning</span>
+            <input
+              value={draft.url_reasoning_openrouter_model}
+              onChange={(event) => setDraft((current) => ({ ...current, url_reasoning_openrouter_model: event.target.value }))}
+            />
+          </label>
+          <label className="setting-row">
+            <span>Wiki enrichment</span>
+            <input
+              value={draft.graph_enrichment_openrouter_model}
+              onChange={(event) => setDraft((current) => ({ ...current, graph_enrichment_openrouter_model: event.target.value }))}
+            />
+          </label>
+          <label className="setting-row">
+            <span>Wiki Q&A</span>
+            <input
+              value={draft.graph_answer_openrouter_model}
+              onChange={(event) => setDraft((current) => ({ ...current, graph_answer_openrouter_model: event.target.value }))}
+            />
+          </label>
+        </Panel>
+        <Panel title="Scraping">
+          <label className="setting-row">
+            <span>Scrape concurrency</span>
+            <input
+              type="number"
+              min={1}
+              max={16}
+              step={1}
+              value={draft.scrape_concurrency}
+              onChange={(event) => setDraft((current) => ({ ...current, scrape_concurrency: Number(event.target.value) }))}
+            />
+          </label>
+          <label className="setting-row">
+            <span>Browser fallback</span>
+            <select
+              value={draft.scrape_browser_mode}
+              onChange={(event) => setDraft((current) => ({ ...current, scrape_browser_mode: event.target.value }))}
+            >
+              <option value="none">None</option>
+              <option value="lightpanda">Lightpanda</option>
+            </select>
+          </label>
+          <label className="setting-row">
+            <span>Lightpanda CDP URL</span>
+            <input
+              value={draft.lightpanda_cdp_url}
+              onChange={(event) => setDraft((current) => ({ ...current, lightpanda_cdp_url: event.target.value }))}
+            />
+          </label>
+        </Panel>
+        <Panel title="Indexing">
+          <label className="setting-row setting-row-inline">
+            <span>Embeddings enabled</span>
+            <input
+              type="checkbox"
+              checked={draft.embedding_enabled}
+              onChange={(event) => setDraft((current) => ({ ...current, embedding_enabled: event.target.checked }))}
+            />
+          </label>
+          <label className="setting-row">
+            <span>Embedding model</span>
+            <input
+              value={draft.embedding_model}
+              onChange={(event) => setDraft((current) => ({ ...current, embedding_model: event.target.value }))}
+            />
+          </label>
+          <label className="setting-row">
+            <span>Zvec collection</span>
+            <input
+              value={draft.zvec_collection}
+              onChange={(event) => setDraft((current) => ({ ...current, zvec_collection: event.target.value }))}
+            />
+          </label>
+        </Panel>
+        <Panel title="Research">
+          <label className="setting-row setting-row-inline">
+            <span>Use Tavily for university map</span>
+            <input
+              type="checkbox"
+              checked={draft.use_tavily_for_map}
+              onChange={(event) => setDraft((current) => ({ ...current, use_tavily_for_map: event.target.checked }))}
+            />
+          </label>
+        </Panel>
         <Panel title="Wiki / Tmux">
           <label className="setting-row">
             <span>Session grace period (minutes)</span>
@@ -1584,12 +1948,12 @@ const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) 
               value={draft.wiki_builder_runtime}
               onChange={(event) => setDraft((current) => ({ ...current, wiki_builder_runtime: event.target.value }))}
             >
-              <option value="pi">Pi agent (llm-wiki-v2)</option>
-              <option value="python">Python pipeline only</option>
+              <option value="pi">LLM Wiki v2 compile (Pi)</option>
+              <option value="python">Lint/index only</option>
             </select>
           </label>
           <label className="setting-row setting-row-inline">
-            <span>Skip Pi compile (dev)</span>
+            <span>Lint/index only (skip LLM compile)</span>
             <input
               type="checkbox"
               checked={draft.wiki_skip_pi}
@@ -1631,45 +1995,6 @@ const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) 
     </section>
   );
 });
-
-type WikiTmuxDraft = {
-  tmux_session_grace_minutes: number;
-  wiki_builder_runtime: string;
-  wiki_skip_pi: boolean;
-  tmux_archive_sessions: boolean;
-  tmux_reconcile_expired_sessions: boolean;
-  pi_cmd: string;
-};
-
-function wikiTmuxDraftFromState(state: AnyRecord): WikiTmuxDraft {
-  const graceSeconds = Number(state.tmux_session_grace_seconds ?? 1800);
-  return {
-    tmux_session_grace_minutes: Math.round(graceSeconds / 60),
-    wiki_builder_runtime: String(state.wiki_builder_runtime || 'pi'),
-    wiki_skip_pi: Boolean(state.wiki_skip_pi),
-    tmux_archive_sessions: state.tmux_archive_sessions !== false,
-    tmux_reconcile_expired_sessions: state.tmux_reconcile_expired_sessions !== false,
-    pi_cmd: String(state.pi_cmd || 'pi'),
-  };
-}
-
-function settingValue(item: string, state: AnyRecord): string {
-  const map: AnyRecord = {
-    'OpenRouter key': state.openrouter_api_key ? 'set' : 'missing',
-    'Tavily key': state.tavily_api_key ? 'set' : 'missing',
-    'URL reasoning': state.url_reasoning_openrouter_model,
-    'Wiki enrichment': state.graph_enrichment_openrouter_model,
-    'Wiki Q&A': state.graph_answer_openrouter_model,
-    'Scrape concurrency': state.scrape_concurrency,
-    'Browser fallback': state.scrape_browser_mode,
-    'Lightpanda CDP URL': state.lightpanda_cdp_url,
-    'Embeddings enabled': state.embedding_enabled === false ? 'off' : 'on',
-    'Embedding model': state.embedding_model,
-    'Zvec collection': state.zvec_collection,
-    'Use Tavily for university map': state.use_tavily_for_map ? 'on' : 'off',
-  };
-  return fmt(map[item], '');
-}
 
 const StatusBand = memo(function StatusBand({ band }: { band: StatusBandModel }) {
   return (
@@ -1734,15 +2059,31 @@ function DataTable({ columns, rows, onRowClick }: { columns: [string, string][];
   );
 }
 
+function normalizeMarkdownContent(content: string): string {
+  let text = content;
+  const trimmed = text.trimStart();
+  if (trimmed.startsWith('---\n')) {
+    const frontmatterEnd = trimmed.indexOf('\n---', 4);
+    if (frontmatterEnd >= 0) {
+      text = trimmed.slice(frontmatterEnd + 4).trimStart();
+    }
+  }
+  if (!text.includes('\n') && text.includes('\\n')) {
+    text = text.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
+  }
+  return text;
+}
+
 function MarkdownPreview({ content, label, loading, error }: { content?: string; label?: string; loading?: boolean; error?: string }) {
+  const renderedContent = useMemo(() => normalizeMarkdownContent(content ?? ''), [content]);
   if (loading) return <div className="empty">Loading selected source…</div>;
   if (error) return <div className="alert">{error}</div>;
-  if (!content) return <div className="empty">Choose a source to preview rendered Markdown.</div>;
+  if (!renderedContent) return <div className="empty">Choose a source to preview rendered Markdown.</div>;
   return (
     <article className="markdown-preview">
       {label && <div className="preview-label">{label}</div>}
       <div className="markdown-body">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{renderedContent}</ReactMarkdown>
       </div>
     </article>
   );

@@ -87,6 +87,7 @@ Explicit TDD / regression test request?
 
 | Skill | Path | When |
 |-------|------|------|
+| **cursor-agent-handoff** | `.cursor/skills/cursor-agent-handoff/` | Codex manager-only: delegate implementation to Cursor Agent in trusted workspace `/Users/abhsheno/Desktop/Projects/ultra-fast-rag` |
 | **llm-wiki-noninteractive** | `.pi/skills/llm-wiki-noninteractive/` | Non-interactive wiki rebuild/resume from Pi |
 | **constitution** | `.specify/memory/constitution.md` | Ralph loop mode, specs, autonomy rules |
 | **skill-router** | `.cursor/skills/skill-router/` | This file — routing only |

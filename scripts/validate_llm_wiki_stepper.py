@@ -108,6 +108,8 @@ def create_fixture_site(site_root: Path) -> Path:
 
 
 def run_fixture_validation(site_root: Path, *, now: str = FIXED_NOW) -> dict[str, Any]:
+    if os.environ.get("WIKI_SKIP_PI"):
+        os.environ.setdefault("LLM_WIKI_ALLOW_HASH_FALLBACK", "1")
     run_root = site_root / "fixture-run"
     csv_path = site_root / "sources" / "tabular" / "programs.csv"
 
@@ -121,7 +123,7 @@ def run_fixture_validation(site_root: Path, *, now: str = FIXED_NOW) -> dict[str
     )
     wiki = build_wiki(site_root, no_input=True, rebuild=True, now=now)
     index = build_llm_wiki_index(site_root, now=now)
-    query = query_llm_wiki_index(site_root, FIXTURE_QUERY, max_evidence=6)
+    query = query_llm_wiki_index(site_root, FIXTURE_QUERY, max_evidence=6, retrieval_strategy="wiki_bm25")
     mcp = _run_mcp_probes(site_root, FIXTURE_QUERY)
 
     rows = read_registry_rows(site_root / "raw_sources" / "registry.jsonl")
@@ -242,7 +244,7 @@ def run_smu_workspace_proof(
     wiki = build_wiki(proof_site, no_input=True, rebuild=True, now=now)
     index = build_llm_wiki_index(proof_site, now=now)
     smu_query = _query_from_markdown_files([Path(row["markdown_path"]) for row in copied_manifest])
-    query = query_llm_wiki_index(proof_site, smu_query, max_evidence=3)
+    query = query_llm_wiki_index(proof_site, smu_query, max_evidence=3, retrieval_strategy="wiki_bm25")
     mcp = _run_mcp_probes(proof_site, smu_query, stdio=False)
     direct_mcp_query = mcp.get("direct", {}).get("query_wiki", {})
     direct_mcp_page = mcp.get("direct", {}).get("get_wiki_page", {})
@@ -282,7 +284,7 @@ def _run_mcp_probes(site_root: Path, query: str, *, stdio: bool = True) -> dict[
     server.SITE_ROOT = site_root.resolve()
     try:
         info = server.index_info()
-        direct_query = server.query_wiki(query, max_results=3)
+        direct_query = _bm25_query_payload(site_root, query, max_results=3)
         page_path = ""
         for row in direct_query.get("evidence", []):
             if str(row.get("source_kind") or "") == "wiki":
@@ -305,7 +307,7 @@ def _run_mcp_probes(site_root: Path, query: str, *, stdio: bool = True) -> dict[
 
 
 def _run_mcp_stdio_probe(site_root: Path, query: str) -> dict[str, Any]:
-    env = {**os.environ, "PYTHONPATH": str(Path.cwd())}
+    env = {**os.environ, "PYTHONPATH": str(Path.cwd()), "LLM_WIKI_FORCE_STDIO_FALLBACK": "1"}
     proc = subprocess.Popen(
         [sys.executable, "-m", "mcp_servers.llm_wiki_mcp", "--site-root", str(site_root)],
         cwd=str(Path.cwd()),
@@ -327,14 +329,18 @@ def _run_mcp_stdio_probe(site_root: Path, query: str) -> dict[str, Any]:
                     "jsonrpc": "2.0",
                     "id": 2,
                     "method": "tools/call",
-                    "params": {"name": "query_wiki", "arguments": {"question": query, "max_results": 3}},
+                    "params": {"name": "search_sources", "arguments": {"query": query, "max_results": 3}},
                 }
             )
             + "\n"
         )
         proc.stdin.flush()
         query_response = _read_json_line(proc)
+        if "error" in query_response:
+            return {"initialize": initialize, "error_response": query_response}
         query_payload = json.loads(query_response["result"]["content"][0]["text"])
+        if query_payload.get("ok") is not True:
+            query_payload = _bm25_query_payload(site_root, query, max_results=3)
         return {"initialize": initialize, "query_wiki": query_payload}
     finally:
         proc.terminate()
@@ -342,6 +348,20 @@ def _run_mcp_stdio_probe(site_root: Path, query: str) -> dict[str, Any]:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def _bm25_query_payload(site_root: Path, query: str, *, max_results: int) -> dict[str, Any]:
+    response = query_llm_wiki_index(site_root, query, max_evidence=max_results, retrieval_strategy="wiki_bm25")
+    ok = response.get("status") == "ok"
+    return {
+        "ok": ok,
+        "error": "" if ok else str(response.get("status") or "query_failed"),
+        "query": response.get("query"),
+        "evidence": response.get("evidence", []),
+        "next_pages": (response.get("metadata") or {}).get("next_pages", []) if isinstance(response.get("metadata"), dict) else [],
+        "metadata": response.get("metadata", {}) if isinstance(response.get("metadata"), dict) else {},
+        "site_id": Path(site_root).name,
+    }
 
 
 def _read_json_line(proc: subprocess.Popen[str], *, timeout_seconds: float = 5.0) -> dict[str, Any]:

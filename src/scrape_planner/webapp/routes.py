@@ -63,6 +63,26 @@ def register_routes(app: FastAPI) -> None:
     def list_sites() -> dict[str, Any]:
         return to_jsonable(payloads.list_sites_payload())
 
+    @app.get("/api/mcp/status")
+    def global_mcp_status() -> dict[str, Any]:
+        return to_jsonable(payloads.global_mcp_status_payload())
+
+    @app.get("/api/mcp/universities")
+    def global_mcp_universities() -> dict[str, Any]:
+        return to_jsonable(payloads.list_mcp_universities_payload())
+
+    @app.post("/api/mcp/start")
+    def start_global_mcp() -> dict[str, Any]:
+        return to_jsonable(payloads.start_global_mcp_server())
+
+    @app.post("/api/mcp/stop")
+    def stop_global_mcp() -> dict[str, Any]:
+        return to_jsonable(payloads.stop_global_mcp_server())
+
+    @app.post("/api/mcp/restart")
+    def restart_global_mcp() -> dict[str, Any]:
+        return to_jsonable(payloads.restart_global_mcp_server())
+
     @app.get("/api/sites/{site_id}/overview")
     def site_overview(site_id: str) -> dict[str, Any]:
         return to_jsonable(payloads.site_overview_payload(site_id))

@@ -2,7 +2,7 @@
 
 ## Goal
 
-Use the Ralph loop to keep iterating until the generated wiki is a rich, student-question-oriented Markdown knowledge structure, not a source-page dump or simple BM25-friendly text corpus. The wiki should organize meaning and relationships so student questions retrieve coherent answer pages.
+Use the LLM Wiki v2 compile, review, and eval flow until the generated wiki is a rich, student-question-oriented Markdown knowledge structure, not a source-page dump or simple BM25-friendly text corpus. The wiki should organize meaning and relationships so student questions retrieve coherent answer pages.
 
 The target style is **Karpathy-style knowledge organization**: dense, readable, hierarchical, concept-first notes with clear entry points, backlinks/related links, citations, and progressive detail. Prefer a high-signal map of the institution over a flat pile of documents.
 
@@ -12,9 +12,9 @@ Example target question:
 
 A good response path should surface organized Cox/graduate pages that cover curriculum/courses, costs/fees/aid, admissions/process/deadlines, contacts, and citations.
 
-## Ralph Loop Behavior
+## Compile And Review Behavior
 
-Ralph should churn on this spec until the wiki organization passes the acceptance criteria. Each iteration should:
+The LLM Wiki v2 flow should keep improving the semantic organization until it passes the acceptance criteria. Each compile/review pass should:
 
 1. Inspect the generated wiki structure and MCP/query results.
 2. Identify the weakest organizational gap.
@@ -74,7 +74,7 @@ Do not mark this spec complete just because files were generated. Fast determini
 
 ## Acceptance Criteria
 
-- [ ] Ralph has iterated/rebuilt until the semantic organization is visibly better than flat source pages.
+- [ ] LLM Wiki v2 compile/review has improved the semantic organization until it is visibly better than flat source pages.
 - [ ] A fast run that only reports thousands of generated source `.md` files is treated as incomplete unless semantic pages and query results prove organization quality.
 - [ ] The SMU wiki includes Cox-specific semantic Markdown pages when Cox evidence exists.
 - [ ] A query about a new graduate student joining Cox retrieves pages covering courses/curriculum, fees/costs, and admissions/process.
