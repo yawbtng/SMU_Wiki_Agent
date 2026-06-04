@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from ..pdf.pdf_ingest import PdfIngestConfig, ingest_pdfs
 from ..core.storage import read_json, write_json
-from .embedding_client import ollama_embed
+from .embedding_client import EmbeddingClientConfig, embed_text, embedding_config_from_env
 
 
 @dataclass(frozen=True)
@@ -52,8 +52,7 @@ def build_zvec_index(
     run_root: Path,
     *,
     db_path: Path | None = None,
-    model: str = "nomic-embed-text:latest",
-    ollama_base_url: str = "http://localhost:11434",
+    model: str = "openai/text-embedding-3-small",
     chunk_chars: int = 1800,
     embed_fn: Callable[[str], list[float]] | None = None,
 ) -> dict[str, Any]:
@@ -72,7 +71,15 @@ def build_zvec_index(
     if not docs:
         raise ValueError(f"No raw scrape, wiki, or PDF docs found under {run_root}")
 
-    embed = embed_fn or (lambda text: ollama_embed(text, model=model, base_url=ollama_base_url, timeout_seconds=120))
+    cfg = embedding_config_from_env()
+    embed_config = EmbeddingClientConfig(
+        provider="openrouter",
+        model=model or cfg.model,
+        base_url=cfg.base_url,
+        timeout_seconds=max(cfg.timeout_seconds, 120),
+        api_key=cfg.api_key,
+    )
+    embed = embed_fn or (lambda text: embed_text(text, embed_config))
     first_text = docs[0].text[:chunk_chars]
     first_embedding = embed(first_text)
     schema = _create_schema(zvec, dimension=len(first_embedding))

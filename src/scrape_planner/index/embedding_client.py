@@ -7,51 +7,60 @@ from typing import Any
 import requests
 
 
-DEFAULT_OLLAMA_EMBED_MODEL = "nomic-embed-text:latest"
-DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_OPENROUTER_EMBED_MODEL = "openai/text-embedding-3-small"
+DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 @dataclass(frozen=True)
 class EmbeddingClientConfig:
-    provider: str = "ollama"
-    model: str = DEFAULT_OLLAMA_EMBED_MODEL
-    base_url: str = DEFAULT_OLLAMA_BASE_URL
-    timeout_seconds: float = 10.0
+    provider: str = "openrouter"
+    model: str = DEFAULT_OPENROUTER_EMBED_MODEL
+    base_url: str = DEFAULT_OPENROUTER_BASE_URL
+    timeout_seconds: float = 30.0
+    api_key: str = ""
 
 
 def embedding_config_from_env() -> EmbeddingClientConfig:
     return EmbeddingClientConfig(
-        provider="ollama",
-        model=os.getenv("OLLAMA_EMBED_MODEL", DEFAULT_OLLAMA_EMBED_MODEL).strip() or DEFAULT_OLLAMA_EMBED_MODEL,
-        base_url=os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL).strip() or DEFAULT_OLLAMA_BASE_URL,
-        timeout_seconds=_float_env("OLLAMA_EMBED_TIMEOUT", 10.0),
+        provider="openrouter",
+        model=os.getenv("OPENROUTER_EMBED_MODEL", DEFAULT_OPENROUTER_EMBED_MODEL).strip() or DEFAULT_OPENROUTER_EMBED_MODEL,
+        base_url=os.getenv("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL).strip() or DEFAULT_OPENROUTER_BASE_URL,
+        timeout_seconds=_float_env("OPENROUTER_EMBED_TIMEOUT", 30.0),
+        api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
     )
 
 
-def ollama_embed(text: str, *, model: str, base_url: str, timeout_seconds: float = 10.0) -> list[float]:
-    payload = {"model": model, "prompt": text}
-    resp = requests.post(f"{base_url.rstrip('/')}/api/embeddings", json=payload, timeout=timeout_seconds)
-    if resp.status_code == 404:
-        resp = requests.post(
-            f"{base_url.rstrip('/')}/api/embed",
-            json={"model": model, "input": text},
-            timeout=timeout_seconds,
-        )
+def openrouter_embed(text: str, *, model: str, base_url: str, api_key: str, timeout_seconds: float = 30.0) -> list[float]:
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY is required for embeddings")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {"model": model, "input": text}
+    resp = requests.post(f"{base_url.rstrip('/')}/embeddings", json=payload, headers=headers, timeout=timeout_seconds)
     resp.raise_for_status()
     data: Any = resp.json()
+    rows = data.get("data") if isinstance(data, dict) else None
+    if isinstance(rows, list) and rows:
+        embedding = rows[0].get("embedding") if isinstance(rows[0], dict) else None
+        return _float_vector(embedding)
     if isinstance(data, dict) and "embedding" in data:
         return _float_vector(data["embedding"])
-    embeddings = data.get("embeddings") if isinstance(data, dict) else None
-    if isinstance(embeddings, list) and embeddings:
-        return _float_vector(embeddings[0])
-    raise ValueError("ollama embedding response did not include an embedding")
+    raise ValueError("OpenRouter embedding response did not include an embedding")
 
 
 def embed_text(text: str, config: EmbeddingClientConfig | None = None) -> list[float]:
     cfg = config or embedding_config_from_env()
-    if cfg.provider != "ollama":
+    if cfg.provider != "openrouter":
         raise ValueError(f"unsupported embedding provider: {cfg.provider}")
-    return ollama_embed(text, model=cfg.model, base_url=cfg.base_url, timeout_seconds=cfg.timeout_seconds)
+    return openrouter_embed(
+        text,
+        model=cfg.model,
+        base_url=cfg.base_url,
+        api_key=cfg.api_key,
+        timeout_seconds=cfg.timeout_seconds,
+    )
 
 
 def _float_vector(values: Any) -> list[float]:

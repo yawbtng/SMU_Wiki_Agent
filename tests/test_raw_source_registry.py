@@ -153,3 +153,68 @@ def test_registry_failed_source_status_is_explicit(tmp_path: Path) -> None:
     assert stored["change_state"] == "failed"
     assert stored["error_reason"] == "File does not exist"
     assert stored["diagnostic_path"] == "raw_sources/reports/missing.error.json"
+
+
+def test_registry_merge_reports_corrupt_jsonl_lines(tmp_path: Path) -> None:
+    registry = tmp_path / "raw_sources" / "registry.jsonl"
+    registry.parent.mkdir(parents=True)
+    registry.write_text("{not-json}\n\n", encoding="utf-8")
+    row = build_source_row(
+        source_kind="web",
+        title="Example Home",
+        original_url="https://example.edu/",
+        original_path="",
+        markdown_path="raw_sources/web/example.md",
+        metadata_path="raw_sources/web/example.metadata.json",
+        checksum=checksum_text("# Example\n"),
+        parser="scrape_worker.markdown",
+        status="ready",
+        now=NOW,
+    )
+
+    report = merge_registry_rows(registry, [row], now=NOW)
+
+    assert report.counts["registry_corrupt_lines"] == 1
+    assert report.counts["ready"] == 1
+    assert len(read_registry_rows(registry)) == 1
+
+
+def test_registry_merge_quarantines_later_duplicate_checksum_in_batch(tmp_path: Path) -> None:
+    registry = tmp_path / "raw_sources" / "registry.jsonl"
+    checksum = checksum_text("# Same content\n")
+    first = build_source_row(
+        source_kind="web",
+        title="First",
+        original_url="https://example.edu/first",
+        original_path="",
+        markdown_path="raw_sources/web/first.md",
+        metadata_path="raw_sources/web/first.metadata.json",
+        checksum=checksum,
+        parser="scrape_worker.markdown",
+        status="ready",
+        now=NOW,
+    )
+    duplicate = build_source_row(
+        source_kind="web",
+        title="Duplicate",
+        original_url="https://example.edu/duplicate",
+        original_path="",
+        markdown_path="raw_sources/web/duplicate.md",
+        metadata_path="raw_sources/web/duplicate.metadata.json",
+        checksum=checksum,
+        parser="scrape_worker.markdown",
+        status="ready",
+        now=NOW,
+    )
+
+    report = merge_registry_rows(registry, [first, duplicate], now=NOW)
+
+    rows = read_registry_rows(registry)
+    by_title = {row["title"]: row for row in rows}
+    assert report.counts["ready"] == 1
+    assert report.counts["needs-review"] == 1
+    assert by_title["First"]["status"] == "ready"
+    assert by_title["Duplicate"]["status"] == "needs-review"
+    assert by_title["Duplicate"]["change_state"] == "needs-review"
+    assert by_title["Duplicate"]["error_reason"] == f"duplicate_checksum:{first['source_id']}"
+    assert by_title["Duplicate"]["provenance"]["duplicate_of_source_id"] == first["source_id"]

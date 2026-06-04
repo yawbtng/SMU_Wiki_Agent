@@ -44,7 +44,7 @@ def _ready_index(site_root: Path) -> None:
         "wiki_index_count": 2,
         "embedding_degraded": False,
         "vector_leg_enabled": True,
-        "embedding_space": "dense-ollama",
+        "embedding_space": "dense-openrouter",
     }
     (indexes / "llm_wiki_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (indexes / "llm_wiki_documents.jsonl").write_text("", encoding="utf-8")
@@ -510,7 +510,7 @@ def test_dense_embedding_failure_stops_index_build(tmp_path: Path, monkeypatch) 
         encoding="utf-8",
     )
     monkeypatch.setattr(llm_wiki_index, "embed_text", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
-    with pytest.raises(llm_wiki_index.EmbeddingUnavailableError, match="Ollama dense embeddings unavailable"):
+    with pytest.raises(llm_wiki_index.EmbeddingUnavailableError, match="OpenRouter embeddings unavailable"):
         build_llm_wiki_index(site_root, now="2026-06-01T12:00:00+00:00")
     response = query_llm_wiki_index(site_root, "admissions deadline")
     assert response["status"] == "missing_index"

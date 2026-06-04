@@ -107,9 +107,7 @@ class AppStateContract(TypedDict, total=False):
     last_run_id: str
     last_run_by_site: Dict[str, str]
     manual_urls: str
-    ollama_model: str
     llm_provider: str
-    ollama_base_url: str
     scrape_browser_mode: str
     lightpanda_cdp_url: str
     site_history: List[str]
@@ -121,13 +119,10 @@ class AppStateContract(TypedDict, total=False):
     default_llm_sleep_sec: float
     url_reasoning_provider: str
     url_reasoning_openrouter_model: str
-    url_reasoning_ollama_model: str
     graph_enrichment_provider: str
     graph_enrichment_openrouter_model: str
-    graph_enrichment_ollama_model: str
     graph_answer_provider: str
     graph_answer_openrouter_model: str
-    graph_answer_ollama_model: str
     scrape_concurrency: int
     embedding_enabled: bool
     embedding_model: str
@@ -136,8 +131,6 @@ class AppStateContract(TypedDict, total=False):
     zvec_collection: str
     use_tavily_for_map: bool
     tavily_cost_per_call_usd: float
-    ollama_input_per_m_usd: float
-    ollama_output_per_m_usd: float
     tmux_session_grace_seconds: int
     wiki_builder_runtime: str
     wiki_skip_pi: bool
@@ -155,9 +148,7 @@ APP_STATE_DEFAULTS: AppStateContract = {
     "last_run_id": "",
     "last_run_by_site": {},
     "manual_urls": "",
-    "ollama_model": "",
     "llm_provider": "openrouter",
-    "ollama_base_url": "http://host.docker.internal:11434",
     "scrape_browser_mode": "none",
     "lightpanda_cdp_url": "",
     "site_history": [],
@@ -169,23 +160,18 @@ APP_STATE_DEFAULTS: AppStateContract = {
     "default_llm_sleep_sec": 0.0,
     "url_reasoning_provider": "openrouter",
     "url_reasoning_openrouter_model": "deepseek/deepseek-v4-flash",
-    "url_reasoning_ollama_model": "qwen2.5:3b",
     "graph_enrichment_provider": "openrouter",
     "graph_enrichment_openrouter_model": "openai/gpt-4.1-mini",
-    "graph_enrichment_ollama_model": "qwen2.5:3b",
     "graph_answer_provider": "openrouter",
     "graph_answer_openrouter_model": "deepseek/deepseek-v4-flash",
-    "graph_answer_ollama_model": "qwen2.5:3b",
     "scrape_concurrency": 4,
     "embedding_enabled": True,
-    "embedding_model": "nomic-embed-text:latest",
+    "embedding_model": "openai/text-embedding-3-small",
     "zvec_enabled": True,
     "zvec_index_path": "",
     "zvec_collection": "university_wiki",
     "use_tavily_for_map": False,
     "tavily_cost_per_call_usd": 0.0,
-    "ollama_input_per_m_usd": 0.0,
-    "ollama_output_per_m_usd": 0.0,
     "tmux_session_grace_seconds": 1800,
     "wiki_builder_runtime": "pi",
     "wiki_skip_pi": False,

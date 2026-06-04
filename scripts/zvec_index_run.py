@@ -29,19 +29,23 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _ollama_embed(text: str, *, model: str, base_url: str) -> list[float]:
-    payload = {"model": model, "prompt": text}
-    resp = requests.post(f"{base_url.rstrip('/')}/api/embeddings", json=payload, timeout=120)
-    if resp.status_code == 404:
-        resp = requests.post(f"{base_url.rstrip('/')}/api/embed", json={"model": model, "input": text}, timeout=120)
+def _openrouter_embed(text: str, *, model: str, base_url: str, api_key: str) -> list[float]:
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY is required for embeddings")
+    resp = requests.post(
+        f"{base_url.rstrip('/')}/embeddings",
+        json={"model": model, "input": text},
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        timeout=120,
+    )
     resp.raise_for_status()
     data = resp.json()
+    rows = data.get("data") or []
+    if rows and isinstance(rows[0], dict) and "embedding" in rows[0]:
+        return [float(v) for v in rows[0]["embedding"]]
     if "embedding" in data:
         return [float(v) for v in data["embedding"]]
-    embeddings = data.get("embeddings") or []
-    if embeddings:
-        return [float(v) for v in embeddings[0]]
-    raise ValueError("ollama embedding response did not include an embedding")
+    raise ValueError("OpenRouter embedding response did not include an embedding")
 
 
 def _chunks(text: str, *, chunk_chars: int = 1800, overlap: int = 200) -> list[str]:
@@ -119,11 +123,12 @@ def _create_schema(zvec: Any, *, dimension: int) -> Any:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Index wiki markdown and PDF chunks into Zvec with Ollama embeddings.")
+    parser = argparse.ArgumentParser(description="Index wiki markdown and PDF chunks into Zvec with OpenRouter embeddings.")
     parser.add_argument("run_root", type=Path)
     parser.add_argument("--db", type=Path, default=None)
-    parser.add_argument("--model", default="nomic-embed-text:latest")
-    parser.add_argument("--ollama", default="http://localhost:11434")
+    parser.add_argument("--model", default="openai/text-embedding-3-small")
+    parser.add_argument("--openrouter-base-url", default="https://openrouter.ai/api/v1")
+    parser.add_argument("--openrouter-api-key", default="")
     parser.add_argument("--chunk-chars", type=int, default=1800)
     args = parser.parse_args()
 
@@ -139,7 +144,8 @@ def main() -> None:
         raise SystemExit(f"No wiki markdown or PDF chunks found under {run_root}")
 
     first_text = docs[0]["text"][: args.chunk_chars]
-    first_embedding = _ollama_embed(first_text, model=args.model, base_url=args.ollama)
+    api_key = args.openrouter_api_key or __import__("os").getenv("OPENROUTER_API_KEY", "")
+    first_embedding = _openrouter_embed(first_text, model=args.model, base_url=args.openrouter_base_url, api_key=api_key)
     schema = _create_schema(zvec, dimension=len(first_embedding))
     collection = zvec.create_and_open(path=str(db_path), schema=schema)
 
@@ -147,7 +153,7 @@ def main() -> None:
     count = 0
     for doc in docs:
         for idx, chunk in enumerate(_chunks(doc["text"], chunk_chars=args.chunk_chars), start=1):
-            embedding = first_embedding if count == 0 else _ollama_embed(chunk, model=args.model, base_url=args.ollama)
+            embedding = first_embedding if count == 0 else _openrouter_embed(chunk, model=args.model, base_url=args.openrouter_base_url, api_key=api_key)
             doc_id = hashlib.sha1(f"{doc['path']}:{idx}".encode("utf-8")).hexdigest()
             zdocs.append(
                 zvec.Doc(

@@ -54,7 +54,7 @@ def _trace_df() -> pd.DataFrame:
                 "is_summary": True,
             },
             {
-                "provider": "ollama",
+                "provider": "legacy-local",
                 "operation": "cleanup_markdown",
                 "model": "local-model",
                 "status": "success",

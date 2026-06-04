@@ -147,7 +147,7 @@ def test_build_query_prefers_relevant_wiki_and_includes_raw_support(tmp_path: Pa
     assert report["wiki_index_count"] == 1
     assert report["changed_raw_count"] == report["raw_index_count"]
     assert report["changed_wiki_count"] == 1
-    assert report["embedding"]["provider"] == "ollama"
+    assert report["embedding"]["provider"] == "openrouter"
     assert "fallback_provider" not in report["embedding"]
     assert report["embedding"]["degraded"] is False
     assert report["embedding"]["vector_dimensions"] > 0
@@ -504,7 +504,7 @@ def test_build_fails_when_dense_embeddings_are_unavailable(tmp_path: Path, monke
     monkeypatch.delenv("RAG_DISABLE_DENSE_EMBEDDING", raising=False)
     monkeypatch.setattr(llm_wiki_index, "embed_text", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
 
-    with pytest.raises(llm_wiki_index.EmbeddingUnavailableError, match="Ollama dense embeddings unavailable"):
+    with pytest.raises(llm_wiki_index.EmbeddingUnavailableError, match="OpenRouter embeddings unavailable"):
         build_llm_wiki_index(site_root, now=NOW)
 
     assert not (site_root / "indexes" / "llm_wiki_manifest.json").exists()

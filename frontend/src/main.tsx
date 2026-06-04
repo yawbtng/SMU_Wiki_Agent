@@ -3,7 +3,15 @@ import ReactDOM from 'react-dom/client';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query';
-import { settingsDraftFromState, settingsSavePayloadFromDraft } from './settingsModel';
+import {
+  OPENROUTER_EMBEDDING_MODELS,
+  OPENROUTER_LLM_MODELS,
+  estimateOpenRouterCost,
+  openRouterModelOption,
+  settingsDraftFromState,
+  settingsSavePayloadFromDraft,
+  type OpenRouterModelOption,
+} from './settingsModel';
 import {
   AnyRecord,
   MetricModel,
@@ -83,15 +91,268 @@ function areaLabel(value: unknown): string {
   return parts.map((part) => part.replace(/-/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase())).join(' · ');
 }
 
-function groupRows(groups: AnyRecord[] = []): AnyRecord[] {
-  const byArea = new Map<string, number>();
-  for (const group of groups) {
-    const area = areaLabel(group.subpath);
-    byArea.set(area, (byArea.get(area) ?? 0) + Number(group.count ?? 0));
+const SCHOOL_ROOT_SEGMENTS = new Set([
+  'cox',
+  'dedman',
+  'dedmanlaw',
+  'law',
+  'meadows',
+  'lyle',
+  'simmons',
+  'perkins',
+  'admission',
+  'enrollment-services',
+  'studentaffairs',
+  'libraries',
+  'oit',
+  'businessfinance',
+]);
+
+function normalizeSubpath(value: unknown): string {
+  const raw = String(value ?? '/').trim() || '/';
+  return raw.startsWith('/') ? raw : `/${raw}`;
+}
+
+function groupCount(group: AnyRecord): number {
+  return Number(group.count ?? 0);
+}
+
+function parentBucket(subpath: string): string {
+  const parts = subpath.split('/').filter(Boolean);
+  return parts.length ? `/${parts[0]}` : '/';
+}
+
+function isSchoolRoot(subpath: string): boolean {
+  const parts = subpath.split('/').filter(Boolean);
+  return parts.length > 0 && SCHOOL_ROOT_SEGMENTS.has(parts[0]);
+}
+
+function availableGroupRows(groups: AnyRecord[] = []): AnyRecord[] {
+  return [...groups].sort(
+    (left, right) =>
+      Number(right.count ?? 0) - Number(left.count ?? 0) ||
+      String(left.subpath ?? '').localeCompare(String(right.subpath ?? '')),
+  );
+}
+
+function collectExampleLines(children: AnyRecord[]): string[] {
+  const examples: string[] = [];
+  for (const child of children) {
+    for (const line of groupExampleLines(child)) {
+      if (examples.length >= 3) return examples;
+      if (!examples.includes(line)) examples.push(line);
+    }
   }
-  return [...byArea.entries()]
-    .map(([area, count]) => ({ area, count }))
-    .sort((left, right) => Number(right.count) - Number(left.count) || String(left.area).localeCompare(String(right.area)));
+  return examples;
+}
+
+function enrichLeaf(group: AnyRecord): AnyRecord {
+  const subpath = normalizeSubpath(group.subpath);
+  return {
+    ...group,
+    subpath,
+    count: groupCount(group),
+    examples: groupExampleLines(group),
+    childSubpaths: [subpath],
+    childCount: 1,
+    collapsed: false,
+  };
+}
+
+function mergeChildGroups(children: AnyRecord[], displaySubpath: string): AnyRecord {
+  const childSubpaths = children.map((child) => normalizeSubpath(child.subpath));
+  return {
+    subpath: displaySubpath,
+    count: children.reduce((sum, child) => sum + groupCount(child), 0),
+    examples: collectExampleLines(children),
+    childSubpaths,
+    childCount: childSubpaths.length,
+    collapsed: childSubpaths.length > 1,
+  };
+}
+
+function sortParentBuckets(byParent: Map<string, AnyRecord[]>): string[] {
+  return [...byParent.keys()].sort((left, right) => {
+    const sum = (key: string) => (byParent.get(key) ?? []).reduce((total, group) => total + groupCount(group), 0);
+    return sum(right) - sum(left) || left.localeCompare(right);
+  });
+}
+
+function effectiveAreaGroups(rawGroups: AnyRecord[] = []): AnyRecord[] {
+  const leaves = availableGroupRows(rawGroups);
+  if (!leaves.length) return [];
+
+  const byParent = new Map<string, AnyRecord[]>();
+  for (const group of leaves) {
+    const subpath = normalizeSubpath(group.subpath);
+    const parent = parentBucket(subpath);
+    byParent.set(parent, [...(byParent.get(parent) ?? []), { ...group, subpath }]);
+  }
+
+  const result: AnyRecord[] = [];
+  for (const parent of sortParentBuckets(byParent)) {
+    const sorted = availableGroupRows(byParent.get(parent) ?? []);
+    if (sorted.length === 1) {
+      result.push(enrichLeaf(sorted[0]));
+      continue;
+    }
+
+    if (isSchoolRoot(parent)) {
+      result.push(mergeChildGroups(sorted, parent));
+      continue;
+    }
+
+    const heavy = sorted.filter((group) => groupCount(group) > 1);
+    const light = sorted.filter((group) => groupCount(group) <= 1);
+
+    if (light.length === sorted.length && sorted.length >= 3) {
+      result.push(mergeChildGroups(sorted, parent));
+      continue;
+    }
+
+    if (heavy.length === 1 && sorted.length === 2 && light.length === 1) {
+      for (const group of sorted) result.push(enrichLeaf(group));
+      continue;
+    }
+
+    if (light.length >= 2) {
+      result.push(mergeChildGroups(light, parent));
+    } else {
+      for (const group of light) result.push(enrichLeaf(group));
+    }
+    for (const group of heavy) result.push(enrichLeaf(group));
+  }
+
+  return availableGroupRows(result);
+}
+
+function childSubpathsForGroup(group: AnyRecord): string[] {
+  const raw = group.childSubpaths;
+  if (Array.isArray(raw) && raw.length) {
+    return raw.map((item) => normalizeSubpath(item));
+  }
+  return [normalizeSubpath(group.subpath)];
+}
+
+function effectiveGroupKey(group: AnyRecord): string {
+  return childSubpathsForGroup(group).join('|');
+}
+
+function formatChildSummary(childSubpaths: string[], maxItems = 3): string {
+  if (childSubpaths.length <= 1) return '';
+  const shown = childSubpaths.slice(0, maxItems);
+  const extra = childSubpaths.length > maxItems ? `, +${childSubpaths.length - maxItems} more` : '';
+  return `Includes: ${shown.join(', ')}${extra}`;
+}
+
+function groupExampleLines(group: AnyRecord): string[] {
+  const raw = group.examples;
+  if (Array.isArray(raw)) {
+    return raw.map((item) => String(item).trim()).filter(Boolean).slice(0, 3);
+  }
+  return [];
+}
+
+function formatExampleLine(value: string): { href: string; label: string } {
+  const raw = value.trim();
+  try {
+    const url = new URL(raw);
+    const path = `${url.pathname}${url.search}`;
+    const label = path && path !== '/' ? path : url.hostname;
+    return { href: raw, label: label.length > 72 ? `${label.slice(0, 69)}…` : label };
+  } catch {
+    return { href: raw, label: raw.length > 72 ? `${raw.slice(0, 69)}…` : raw };
+  }
+}
+
+const AreaGroupExamples = memo(function AreaGroupExamples({
+  group,
+  listClassName = 'area-group-examples',
+  fallbackClassName = 'area-group-examples-fallback',
+  showFallback = true,
+}: {
+  group: AnyRecord;
+  listClassName?: string;
+  fallbackClassName?: string;
+  showFallback?: boolean;
+}) {
+  const lines = groupExampleLines(group);
+  if (!lines.length) {
+    return showFallback ? <p className={fallbackClassName}>No examples captured for this group</p> : null;
+  }
+  return (
+    <ul className={listClassName}>
+      {lines.map((line) => {
+        const { href, label } = formatExampleLine(line);
+        const external = /^https?:\/\//i.test(href);
+        return (
+          <li key={line}>
+            {external ? (
+              <a href={href} target="_blank" rel="noreferrer" title={href}>
+                {label}
+              </a>
+            ) : (
+              <span title={href}>{label}</span>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+});
+
+const AreaGroupChildSummary = memo(function AreaGroupChildSummary({
+  childSubpaths,
+  className = 'area-group-child-summary',
+}: {
+  childSubpaths: string[];
+  className?: string;
+}) {
+  const summary = formatChildSummary(childSubpaths);
+  if (!summary) return null;
+  return <p className={className}>{summary}</p>;
+});
+
+const AreaGroupList = memo(function AreaGroupList({
+  groups,
+  emptyMessage = 'No areas in this list.',
+}: {
+  groups: AnyRecord[];
+  emptyMessage?: string;
+}) {
+  if (!groups.length) {
+    return <p className="muted area-groups-empty">{emptyMessage}</p>;
+  }
+  return (
+    <ul className="area-groups-list">
+      {groups.map((group) => {
+        const subpath = String(group.subpath ?? '/');
+        const childSubpaths = childSubpathsForGroup(group);
+        const childCount = Number(group.childCount ?? childSubpaths.length);
+        const sectionLabel = childCount === 1 ? 'section' : 'sections';
+        return (
+          <li key={effectiveGroupKey(group)} className="area-group-item">
+            <div className="area-group-head">
+              <span className="area-group-name">{areaLabel(subpath)}</span>
+              <span className="area-group-count">
+                {formatCount(group.count)} URLs · {formatCount(childCount)} {sectionLabel}
+              </span>
+            </div>
+            <div className="area-group-subpath">{subpath}</div>
+            <AreaGroupChildSummary childSubpaths={childSubpaths} />
+            <AreaGroupExamples group={group} />
+          </li>
+        );
+      })}
+    </ul>
+  );
+});
+
+function approveMessageForSubpaths(subpaths: string[]): string {
+  const terms = subpaths
+    .map((subpath) => subpath.replace(/^\//, '').replace(/\//g, ' ').trim())
+    .filter(Boolean);
+  return `approve ${terms.join(' ')}`;
 }
 
 function removeFromApprovedMarkdown(markdown: string, instruction: string): { markdown: string; removed: number; reasons: string[] } {
@@ -708,6 +969,9 @@ const Sources = memo(function Sources({ siteId, hasSources = true, siteLabel }: 
   const [pendingProposal, setPendingProposal] = useState<AnyRecord | null>(null);
   const [chatInput, setChatInput] = useState('');
   const [chatPending, setChatPending] = useState(false);
+  const [selectedAvailableSubpaths, setSelectedAvailableSubpaths] = useState<string[]>([]);
+  const [areaActionPending, setAreaActionPending] = useState(false);
+  const [areaActionStatus, setAreaActionStatus] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [showApprovedFile, setShowApprovedFile] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
@@ -728,13 +992,60 @@ const Sources = memo(function Sources({ siteId, hasSources = true, siteLabel }: 
     if (approved.data?.markdown !== undefined) setApprovedMarkdown(String(approved.data.markdown));
   }, [approved.data?.markdown]);
   const rows = filterRows(sources.data?.rows ?? [], query, ['source_id', 'title', 'original_url', 'markdown_path', 'source_kind', 'status', 'wiki_status']);
+  const [selectedRawSource, setSelectedRawSource] = useState<AnyRecord | null>(null);
+  const registryTableRows = useMemo(
+    () => rows.map((row) => ({
+      ...row,
+      display_title: row.title || row.source_id || 'Untitled',
+      display_path: row.markdown_path || row.original_url || row.original_path || '',
+    })),
+    [rows],
+  );
+  const selectedMarkdownPath = String(selectedRawSource?.markdown_path ?? '').trim();
+  const rawSourcePreview = useQuery({
+    queryKey: ['raw-source-preview', siteId, selectedMarkdownPath],
+    queryFn: () => api<AnyRecord>(`/api/sites/${siteId}/document-preview?path=${encodeURIComponent(selectedMarkdownPath)}`),
+    enabled: Boolean(siteId && selectedMarkdownPath),
+  });
+  useEffect(() => {
+    setSelectedRawSource(null);
+  }, [siteId]);
   const previewActive = Boolean(pendingProposal);
   const selectedPayload = pendingProposal ?? approved.data ?? {};
-  const approvedGroups = groupRows(selectedPayload.groups ?? []);
-  const availableGroups = groupRows(selectedPayload.available_groups ?? []);
-  const pendingAddedGroups = groupRows(pendingProposal?.added_groups ?? []);
-  const pendingRemovedGroups = groupRows(pendingProposal?.removed_groups ?? []);
-  const pendingRejectedGroups = groupRows(pendingProposal?.rejected_groups ?? []);
+  const selectedGroups = useMemo(
+    () => effectiveAreaGroups(selectedPayload.groups ?? []),
+    [selectedPayload.groups],
+  );
+  const rawAvailableGroups = useMemo(
+    () => availableGroupRows(selectedPayload.available_groups ?? []),
+    [selectedPayload.available_groups],
+  );
+  const effectiveAvailableGroups = useMemo(
+    () => effectiveAreaGroups(selectedPayload.available_groups ?? []),
+    [selectedPayload.available_groups],
+  );
+  const hasAvailableGroups = effectiveAvailableGroups.length > 0;
+  const availableLeafCount = rawAvailableGroups.length;
+  const selectedAvailableCount = selectedAvailableSubpaths.length;
+  useEffect(() => {
+    const available = new Set(rawAvailableGroups.map((group) => normalizeSubpath(group.subpath)));
+    setSelectedAvailableSubpaths((current) => {
+      const next = current.filter((subpath) => available.has(normalizeSubpath(subpath)));
+      return next.length === current.length ? current : next;
+    });
+  }, [rawAvailableGroups]);
+  const pendingAddedGroups = useMemo(
+    () => effectiveAreaGroups(pendingProposal?.added_groups ?? []),
+    [pendingProposal?.added_groups],
+  );
+  const pendingRemovedGroups = useMemo(
+    () => effectiveAreaGroups(pendingProposal?.removed_groups ?? []),
+    [pendingProposal?.removed_groups],
+  );
+  const pendingRejectedGroups = useMemo(
+    () => effectiveAreaGroups(pendingProposal?.rejected_groups ?? []),
+    [pendingProposal?.rejected_groups],
+  );
   const draftApproved = useCallback(async () => {
     setApprovalMessage('Asking LLM to draft approved URLs…');
     const payload = await apiJson<AnyRecord>(`/api/sites/${siteId}/approved-urls/chat`, 'POST', {
@@ -791,6 +1102,57 @@ const Sources = memo(function Sources({ siteId, hasSources = true, siteLabel }: 
       setChatPending(false);
     }
   }, [approvalPrompt, approvedMarkdown, chatInput, chatPending, queryClientHook, siteId]);
+  const toggleAvailableBucket = useCallback((childSubpaths: string[]) => {
+    if (!childSubpaths.length) return;
+    setSelectedAvailableSubpaths((current) => {
+      const allSelected = childSubpaths.every((subpath) => current.includes(subpath));
+      if (allSelected) {
+        return current.filter((item) => !childSubpaths.includes(item));
+      }
+      const next = new Set(current);
+      for (const subpath of childSubpaths) next.add(subpath);
+      return [...next];
+    });
+  }, []);
+  const isAvailableBucketSelected = useCallback(
+    (childSubpaths: string[]) => childSubpaths.length > 0 && childSubpaths.every((subpath) => selectedAvailableSubpaths.includes(subpath)),
+    [selectedAvailableSubpaths],
+  );
+  const applySelectedAreas = useCallback(async (subpaths: string[], mode: 'preview' | 'add') => {
+    if (!subpaths.length || areaActionPending) return;
+    const message = approveMessageForSubpaths(subpaths);
+    setAreaActionPending(true);
+    setAreaActionStatus(mode === 'preview' ? 'Building preview…' : 'Updating approved URLs…');
+    try {
+      const payload = await apiJson<AnyRecord>(`/api/sites/${siteId}/approved-urls/chat`, 'POST', {
+        message,
+        base_prompt: approvalPrompt,
+        markdown: approvedMarkdown,
+        limit: 30000,
+        autosave: mode === 'add',
+      });
+      const reply = String(payload.assistant_message ?? message);
+      if (mode === 'add' || payload.saved) {
+        setApprovedMarkdown(String(payload.markdown ?? ''));
+        setPendingProposal(null);
+        queryClientHook.setQueryData(['approved-urls', siteId], payload);
+        queryClientHook.removeQueries({ queryKey: ['approved-urls-preview', siteId] });
+        setSelectedAvailableSubpaths((current) => current.filter((item) => !subpaths.includes(item)));
+        setAreaActionStatus(`Saved ${formatCount(payload.count)} approved URLs (${formatCount(subpaths.length)} area${subpaths.length === 1 ? '' : 's'}).`);
+      } else {
+        setPendingProposal(payload);
+        queryClientHook.setQueryData(['approved-urls-preview', siteId], payload);
+        setAreaActionStatus(`Preview ready — ${formatCount(payload.count)} URLs if you commit (${formatCount(subpaths.length)} selected).`);
+      }
+      setApprovalMessage(reply);
+    } catch (error) {
+      const reply = error instanceof Error ? error.message : 'URL update failed.';
+      setAreaActionStatus(reply);
+      setApprovalMessage(reply);
+    } finally {
+      setAreaActionPending(false);
+    }
+  }, [approvalPrompt, approvedMarkdown, areaActionPending, queryClientHook, siteId]);
   const loadError = sources.isError || approved.isError;
   const loadErrorDetail = [
     sources.isError ? `sources (${sources.error instanceof Error ? sources.error.message : 'failed'})` : '',
@@ -876,16 +1238,16 @@ const Sources = memo(function Sources({ siteId, hasSources = true, siteLabel }: 
             <div className="approval-grid">
               <div className="approved-summary">
                 <h3>Will select</h3>
-                <DataTable columns={[["area", "Area"], ["count", "URLs"]]} rows={pendingAddedGroups} />
+                <AreaGroupList groups={pendingAddedGroups} emptyMessage="No new areas in this proposal." />
               </div>
               <div className="approved-summary">
                 <h3>Will reject or skip</h3>
-                <DataTable columns={[["area", "Area"], ["count", "URLs"]]} rows={pendingRejectedGroups} />
+                <AreaGroupList groups={pendingRejectedGroups} emptyMessage="No rejected areas in this proposal." />
               </div>
               {pendingRemovedGroups.length > 0 && (
                 <div className="approved-summary">
                   <h3>Will remove</h3>
-                  <DataTable columns={[["area", "Area"], ["count", "URLs"]]} rows={pendingRemovedGroups} />
+                  <AreaGroupList groups={pendingRemovedGroups} emptyMessage="No removals in this proposal." />
                 </div>
               )}
             </div>
@@ -900,24 +1262,88 @@ const Sources = memo(function Sources({ siteId, hasSources = true, siteLabel }: 
         <div className="approval-grid">
           <div className="approved-summary">
             <h3>{previewActive ? 'Selected areas preview' : 'Selected areas'}</h3>
-            <DataTable
-              columns={[
-                ['area', 'Area'],
-                ['count', 'URLs'],
-              ]}
-              rows={approvedGroups}
+            <AreaGroupList
+              groups={selectedGroups}
+              emptyMessage={previewActive ? 'Preview has no selected areas yet.' : 'No areas in approved_urls.md yet.'}
             />
           </div>
-          <div className="approved-summary">
+          <div className="approved-summary available-areas-panel">
             <h3>Available areas</h3>
-            <p className="muted">Chat “approve Cox”, “approve Dedman”, or “approve schools” to add these groups.</p>
-            <DataTable
-              columns={[
-                ['area', 'Area'],
-                ['count', 'URLs'],
-              ]}
-              rows={availableGroups}
-            />
+            <div className="available-areas-toolbar">
+              <span className="available-areas-count">
+                {hasAvailableGroups
+                  ? `${formatCount(selectedAvailableCount)} of ${formatCount(availableLeafCount)} sections selected · ${formatCount(effectiveAvailableGroups.length)} grouped areas`
+                  : 'No areas left to add'}
+              </span>
+              <div className="available-areas-actions">
+                <button
+                  type="button"
+                  disabled={!selectedAvailableCount || areaActionPending || chatPending}
+                  onClick={() => applySelectedAreas(selectedAvailableSubpaths, 'preview')}
+                >
+                  {areaActionPending ? 'Working…' : 'Preview selected'}
+                </button>
+                <button
+                  type="button"
+                  disabled={!selectedAvailableCount || areaActionPending || chatPending}
+                  onClick={() => applySelectedAreas(selectedAvailableSubpaths, 'add')}
+                >
+                  {areaActionPending ? 'Working…' : 'Add selected'}
+                </button>
+              </div>
+            </div>
+            {areaActionStatus && <p className="available-areas-status">{areaActionStatus}</p>}
+            {hasAvailableGroups ? (
+              <ul className="available-areas-list">
+                {effectiveAvailableGroups.map((group) => {
+                  const subpath = String(group.subpath ?? '/');
+                  const childSubpaths = childSubpathsForGroup(group);
+                  const childCount = Number(group.childCount ?? childSubpaths.length);
+                  const sectionLabel = childCount === 1 ? 'section' : 'sections';
+                  const checked = isAvailableBucketSelected(childSubpaths);
+                  const hasExamples = groupExampleLines(group).length > 0;
+                  return (
+                    <li key={effectiveGroupKey(group)} className={checked ? 'available-area-row selected' : 'available-area-row'}>
+                      <label className="available-area-label">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          disabled={areaActionPending || chatPending}
+                          onChange={() => toggleAvailableBucket(childSubpaths)}
+                        />
+                        <span className="available-area-copy">
+                          <span className="available-area-name">{areaLabel(subpath)}</span>
+                          <span className="available-area-subpath">{subpath}</span>
+                          <AreaGroupChildSummary
+                            childSubpaths={childSubpaths}
+                            className="available-area-child-summary"
+                          />
+                          <AreaGroupExamples
+                            group={group}
+                            listClassName="available-area-examples"
+                            fallbackClassName="available-area-examples-fallback"
+                            showFallback={!hasExamples}
+                          />
+                        </span>
+                        <span className="available-area-count">
+                          {formatCount(group.count)} URLs · {formatCount(childCount)} {sectionLabel}
+                        </span>
+                      </label>
+                      <button
+                        type="button"
+                        className="available-area-add"
+                        disabled={areaActionPending || chatPending}
+                        onClick={() => applySelectedAreas(childSubpaths, 'add')}
+                      >
+                        Add
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <p className="muted available-areas-empty">Every eligible area is already in approved_urls.md.</p>
+            )}
           </div>
         </div>
         {showApprovedFile && (
@@ -929,17 +1355,65 @@ const Sources = memo(function Sources({ siteId, hasSources = true, siteLabel }: 
       </Panel>
       <Panel title={`Raw source registry (${formatCount(sources.data?.total)})`}>
         <ToolbarInput value={query} onChange={setQuery} placeholder="Search sources, URLs, paths, status" />
-        <DataTable
-          columns={[
-            ['source_id', 'ID'],
-            ['source_kind', 'Kind'],
-            ['status', 'Status'],
-            ['wiki_status', 'Wiki'],
-            ['title', 'Title'],
-            ['markdown_path', 'Path/URL'],
-          ]}
-          rows={rows}
-        />
+        <div className="raw-source-registry-shell">
+          <DataTable
+            columns={[
+              ['display_title', 'Title'],
+              ['source_kind', 'Kind'],
+              ['status', 'Status'],
+              ['wiki_status', 'Wiki'],
+              ['display_path', 'Path'],
+            ]}
+            rows={registryTableRows}
+            onRowClick={(row) => setSelectedRawSource(row)}
+            isRowSelected={(row) => String(row.source_id ?? '') === String(selectedRawSource?.source_id ?? '')}
+          />
+          <aside className="raw-source-inspector" aria-label="Selected raw source inspector">
+            {selectedRawSource ? (
+              <>
+                <div className="raw-source-inspector-header">
+                  <h3>{fmt(selectedRawSource.title, String(selectedRawSource.source_id ?? 'Raw source'))}</h3>
+                  <p className="muted">Inspect scraped markdown and registry metadata for this source.</p>
+                </div>
+                <dl className="raw-source-meta">
+                  <div><dt>Kind</dt><dd>{fmt(selectedRawSource.source_kind)}</dd></div>
+                  <div><dt>Status</dt><dd>{fmt(selectedRawSource.status)}</dd></div>
+                  <div><dt>Wiki</dt><dd>{fmt(selectedRawSource.wiki_status)}</dd></div>
+                  <div><dt>Source ID</dt><dd><code>{fmt(selectedRawSource.source_id)}</code></dd></div>
+                  {selectedRawSource.original_url && (
+                    <div><dt>URL</dt><dd><a href={String(selectedRawSource.original_url)} target="_blank" rel="noreferrer">{String(selectedRawSource.original_url)}</a></dd></div>
+                  )}
+                  {selectedRawSource.markdown_path && (
+                    <div><dt>Markdown path</dt><dd><code>{String(selectedRawSource.markdown_path)}</code></dd></div>
+                  )}
+                  {!selectedRawSource.markdown_path && selectedRawSource.original_path && (
+                    <div><dt>Original path</dt><dd><code>{String(selectedRawSource.original_path)}</code></dd></div>
+                  )}
+                </dl>
+                {selectedMarkdownPath ? (
+                  <MarkdownPreview
+                    content={rawSourcePreview.data?.content}
+                    label={selectedMarkdownPath}
+                    loading={rawSourcePreview.isLoading}
+                    error={rawSourcePreview.error?.message}
+                  />
+                ) : (
+                  <div className="empty raw-source-inspector-empty">
+                    No markdown artifact for this source yet. Inspect externally via{' '}
+                    {selectedRawSource.original_url ? (
+                      <a href={String(selectedRawSource.original_url)} target="_blank" rel="noreferrer">{String(selectedRawSource.original_url)}</a>
+                    ) : (
+                      <code>{fmt(selectedRawSource.original_path || selectedRawSource.source_id)}</code>
+                    )}
+                    .
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="empty raw-source-inspector-empty">Click a registry row to preview the raw markdown and metadata.</div>
+            )}
+          </aside>
+        </div>
       </Panel>
     </section>
   );
@@ -1784,6 +2258,42 @@ function TokenMixChart({ title, segments }: { title: string; segments: TokenSegm
   );
 }
 
+function usd(value: number): string {
+  return `$${value.toFixed(value >= 1 ? 2 : 4)}`;
+}
+
+function OpenRouterModelSelect({
+  label,
+  value,
+  onChange,
+  options = OPENROUTER_LLM_MODELS,
+  inputTokens = 100_000,
+  outputTokens = 25_000,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  options?: OpenRouterModelOption[];
+  inputTokens?: number;
+  outputTokens?: number;
+}) {
+  const selected = openRouterModelOption(value, options);
+  const estimate = estimateOpenRouterCost(value, options, inputTokens, outputTokens);
+  return (
+    <label className="setting-row model-select-row">
+      <span>{label}</span>
+      <select value={value} onChange={(event) => onChange(event.target.value)}>
+        {options.map((option) => (
+          <option key={option.id} value={option.id}>{option.label}</option>
+        ))}
+      </select>
+      <span className="model-cost-line">
+        {selected.id} · {usd(selected.inputPerMTok)}/1M input{selected.outputPerMTok ? ` · ${usd(selected.outputPerMTok)}/1M output` : ''} · estimate {usd(estimate)}
+      </span>
+    </label>
+  );
+}
+
 const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) {
   const state = appState?.state ?? {};
   const queryClientHook = useQueryClient();
@@ -1813,7 +2323,7 @@ const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) 
   return (
     <section>
       <h2>Settings</h2>
-      <p>Configure local providers, models, scraping, retrieval, research, and wiki/tmux lifecycle.</p>
+      <p>Configure OpenRouter models, scraping, retrieval, research, and wiki/tmux lifecycle.</p>
       <MetricStrip
         metrics={[
           { label: 'OpenRouter', value: state.openrouter_api_key ? 'set' : 'missing' },
@@ -1843,28 +2353,23 @@ const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) 
             />
           </label>
         </Panel>
-        <Panel title="LLM">
-          <label className="setting-row">
-            <span>URL reasoning</span>
-            <input
-              value={draft.url_reasoning_openrouter_model}
-              onChange={(event) => setDraft((current) => ({ ...current, url_reasoning_openrouter_model: event.target.value }))}
-            />
-          </label>
-          <label className="setting-row">
-            <span>Wiki enrichment</span>
-            <input
-              value={draft.graph_enrichment_openrouter_model}
-              onChange={(event) => setDraft((current) => ({ ...current, graph_enrichment_openrouter_model: event.target.value }))}
-            />
-          </label>
-          <label className="setting-row">
-            <span>Wiki Q&A</span>
-            <input
-              value={draft.graph_answer_openrouter_model}
-              onChange={(event) => setDraft((current) => ({ ...current, graph_answer_openrouter_model: event.target.value }))}
-            />
-          </label>
+        <Panel title="OpenRouter models / cost">
+          <OpenRouterModelSelect
+            label="URL reasoning"
+            value={draft.url_reasoning_openrouter_model}
+            onChange={(value) => setDraft((current) => ({ ...current, url_reasoning_openrouter_model: value }))}
+          />
+          <OpenRouterModelSelect
+            label="Wiki enrichment"
+            value={draft.graph_enrichment_openrouter_model}
+            onChange={(value) => setDraft((current) => ({ ...current, graph_enrichment_openrouter_model: value }))}
+          />
+          <OpenRouterModelSelect
+            label="Wiki Q&A"
+            value={draft.graph_answer_openrouter_model}
+            onChange={(value) => setDraft((current) => ({ ...current, graph_answer_openrouter_model: value }))}
+          />
+          <p className="setting-help">Estimates use 100k input + 25k output tokens per run. Actual costs are recorded in Metrics when jobs run.</p>
         </Panel>
         <Panel title="Scraping">
           <label className="setting-row">
@@ -1905,13 +2410,14 @@ const Settings = memo(function Settings({ appState }: { appState?: AnyRecord }) 
               onChange={(event) => setDraft((current) => ({ ...current, embedding_enabled: event.target.checked }))}
             />
           </label>
-          <label className="setting-row">
-            <span>Embedding model</span>
-            <input
-              value={draft.embedding_model}
-              onChange={(event) => setDraft((current) => ({ ...current, embedding_model: event.target.value }))}
-            />
-          </label>
+          <OpenRouterModelSelect
+            label="Embedding model"
+            value={draft.embedding_model}
+            options={OPENROUTER_EMBEDDING_MODELS}
+            inputTokens={1_000_000}
+            outputTokens={0}
+            onChange={(value) => setDraft((current) => ({ ...current, embedding_model: value }))}
+          />
           <label className="setting-row">
             <span>Zvec collection</span>
             <input
@@ -2040,7 +2546,17 @@ const JsonBlock = memo(function JsonBlock({ value }: { value: unknown }) {
   return <pre className="json">{text}</pre>;
 });
 
-function DataTable({ columns, rows, onRowClick }: { columns: [string, string][]; rows: AnyRecord[]; onRowClick?: (row: AnyRecord) => void }) {
+function DataTable({
+  columns,
+  rows,
+  onRowClick,
+  isRowSelected,
+}: {
+  columns: [string, string][];
+  rows: AnyRecord[];
+  onRowClick?: (row: AnyRecord) => void;
+  isRowSelected?: (row: AnyRecord) => boolean;
+}) {
   return (
     <div className="table-wrap">
       <table>
@@ -2048,11 +2564,19 @@ function DataTable({ columns, rows, onRowClick }: { columns: [string, string][];
           <tr>{columns.map(([, label]) => <th key={label}>{label}</th>)}</tr>
         </thead>
         <tbody>
-          {rows.slice(0, 250).map((row, idx) => (
-            <tr key={row.source_id ?? row.run_id ?? row.path ?? idx} onClick={onRowClick ? () => onRowClick(row) : undefined}>
-              {columns.map(([key]) => <td key={key}>{fmt(row[key])}</td>)}
-            </tr>
-          ))}
+          {rows.slice(0, 250).map((row, idx) => {
+            const selected = Boolean(isRowSelected?.(row));
+            const className = [onRowClick ? 'table-row-clickable' : '', selected ? 'table-row-selected' : ''].filter(Boolean).join(' ') || undefined;
+            return (
+              <tr
+                key={row.source_id ?? row.run_id ?? row.path ?? idx}
+                className={className}
+                onClick={onRowClick ? () => onRowClick(row) : undefined}
+              >
+                {columns.map(([key]) => <td key={key}>{fmt(row[key])}</td>)}
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>

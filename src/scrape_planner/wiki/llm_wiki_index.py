@@ -28,10 +28,10 @@ from .query_intent import is_leadership_query, prepare_retrieval_query
 
 
 INDEX_VERSION = "llm-wiki-hybrid-v2"
-EMBEDDING_PROVIDER = "ollama"
-EMBEDDING_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text:latest").strip() or "nomic-embed-text:latest"
-EMBEDDING_DIMENSIONS = 768
-EMBEDDING_SPACE_DENSE = "dense-ollama"
+EMBEDDING_PROVIDER = "openrouter"
+EMBEDDING_MODEL = os.getenv("OPENROUTER_EMBED_MODEL", "openai/text-embedding-3-small").strip() or "openai/text-embedding-3-small"
+EMBEDDING_DIMENSIONS = int(os.getenv("OPENROUTER_EMBED_DIMENSIONS", "1536") or "1536")
+EMBEDDING_SPACE_DENSE = "dense-openrouter"
 EMBEDDING_SPACE_HASH = "hash-fallback"
 FALLBACK_EMBEDDING_PROVIDER = "hash"
 FALLBACK_EMBEDDING_MODEL = "sha256-keyword"
@@ -504,7 +504,7 @@ def _embedding_manifest_error(manifest: dict[str, Any]) -> dict[str, str] | None
     if bool(manifest.get("embedding_degraded")):
         return {
             "reason": "embedding_degraded",
-            "message": "Index was built with degraded embeddings. Rebuild the index after Ollama embeddings are available.",
+            "message": "Index was built with degraded embeddings. Rebuild the index after OpenRouter embeddings are available.",
         }
     if space and space != EMBEDDING_SPACE_DENSE:
         return {
@@ -2005,10 +2005,10 @@ def _embedding_vector_and_space(
     if _dense_embeddings_disabled():
         _DENSE_EMBEDDING_UNAVAILABLE = True
         _EMBEDDING_DEGRADED = True
-        raise EmbeddingUnavailableError("Ollama dense embeddings are disabled by RAG_DISABLE_DENSE_EMBEDDING.")
+        raise EmbeddingUnavailableError("OpenRouter embeddings are disabled by RAG_DISABLE_DENSE_EMBEDDING.")
     if _DENSE_EMBEDDING_UNAVAILABLE:
         _EMBEDDING_DEGRADED = True
-        raise EmbeddingUnavailableError("Ollama dense embeddings unavailable.")
+        raise EmbeddingUnavailableError("OpenRouter embeddings unavailable.")
     try:
         vector = embed_text(text[:8000], embedding_config_from_env())
     except Exception as exc:
@@ -2018,12 +2018,12 @@ def _embedding_vector_and_space(
         _DENSE_EMBEDDING_UNAVAILABLE = True
         _EMBEDDING_DEGRADED = True
         raise EmbeddingUnavailableError(
-            "Ollama dense embeddings unavailable. Start Ollama, pull the embedding model, or fix OLLAMA_BASE_URL/OLLAMA_EMBED_MODEL."
+            "OpenRouter embeddings unavailable. Set OPENROUTER_API_KEY or choose a reachable OpenRouter embedding model."
         ) from exc
     if not vector:
         _DENSE_EMBEDDING_UNAVAILABLE = True
         _EMBEDDING_DEGRADED = True
-        raise EmbeddingUnavailableError("Ollama dense embedding response was empty.")
+        raise EmbeddingUnavailableError("OpenRouter embedding response was empty.")
     return _normalize_embedding_dimensions(vector, dimensions), EMBEDDING_SPACE_DENSE
 
 

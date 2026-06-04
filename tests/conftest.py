@@ -9,10 +9,10 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _deterministic_llm_wiki_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Use deterministic dense-shaped embeddings so tests do not depend on local Ollama."""
+    """Use deterministic dense-shaped embeddings so tests do not call OpenRouter."""
 
     def _embed_text(text: str, *_args: object, **_kwargs: object) -> list[float]:
-        vector = [0.0] * 768
+        vector = [0.0] * 1536
         for token in re.findall(r"[a-z0-9]+", str(text).lower()):
             digest = hashlib.sha256(token.encode("utf-8")).digest()
             index = int.from_bytes(digest[:4], "big") % len(vector)

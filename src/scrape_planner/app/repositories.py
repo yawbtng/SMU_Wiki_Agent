@@ -132,10 +132,7 @@ def _normalize_string_mapping(value: Any) -> dict[str, str]:
     return normalized
 
 
-def _normalize_provider(value: Any, default: str = "openrouter") -> str:
-    normalized = _normalize_string(value, default).strip().lower()
-    if normalized in {"ollama", "local"}:
-        return "ollama"
+def _normalize_provider(value: Any = None, default: str = "openrouter") -> str:
     return "openrouter"
 
 
@@ -167,7 +164,7 @@ def _normalize_app_state_payload(payload: Any, defaults: AppStateContract) -> Ap
     if not isinstance(payload, dict):
         return merged
 
-    normalized = dict(payload)
+    normalized = {str(key): value for key, value in payload.items() if not str(key).startswith("ollama_") and str(key) not in {"ollama_model", "ollama_base_url"}}
     normalized["active_workspace_id"] = _normalize_string(payload.get("active_workspace_id"), defaults.get("active_workspace_id", ""))
     normalized["workspaces"] = _normalize_workspace_rows(payload.get("workspaces"))
     normalized["last_site_url"] = _normalize_string(payload.get("last_site_url"), defaults.get("last_site_url", ""))
@@ -175,9 +172,7 @@ def _normalize_app_state_payload(payload: Any, defaults: AppStateContract) -> Ap
     normalized["last_run_id"] = _normalize_string(payload.get("last_run_id"), defaults.get("last_run_id", ""))
     normalized["last_run_by_site"] = _normalize_string_mapping(payload.get("last_run_by_site"))
     normalized["manual_urls"] = _normalize_string(payload.get("manual_urls"), defaults.get("manual_urls", ""))
-    normalized["ollama_model"] = _normalize_string(payload.get("ollama_model"), defaults.get("ollama_model", ""))
-    normalized["llm_provider"] = _normalize_string(payload.get("llm_provider"), defaults.get("llm_provider", "openrouter"))
-    normalized["ollama_base_url"] = _normalize_string(payload.get("ollama_base_url"), defaults.get("ollama_base_url", ""))
+    normalized["llm_provider"] = "openrouter"
     normalized["scrape_browser_mode"] = _normalize_browser_mode(payload.get("scrape_browser_mode"), defaults.get("scrape_browser_mode", "none"))
     normalized["lightpanda_cdp_url"] = _normalize_string(payload.get("lightpanda_cdp_url"), defaults.get("lightpanda_cdp_url", ""))
     normalized["site_history"] = _normalize_string_list(payload.get("site_history"))
@@ -195,36 +190,24 @@ def _normalize_app_state_payload(payload: Any, defaults: AppStateContract) -> Ap
         float(defaults.get("default_llm_sleep_sec") or 0.0),
         minimum=0.0,
     )
-    normalized["url_reasoning_provider"] = _normalize_provider(payload.get("url_reasoning_provider"), defaults.get("url_reasoning_provider", "openrouter"))
+    normalized["url_reasoning_provider"] = "openrouter"
     normalized["url_reasoning_openrouter_model"] = _normalize_string(
         payload.get("url_reasoning_openrouter_model"),
         defaults.get("url_reasoning_openrouter_model", ""),
     )
-    normalized["url_reasoning_ollama_model"] = _normalize_string(
-        payload.get("url_reasoning_ollama_model"),
-        defaults.get("url_reasoning_ollama_model", ""),
-    )
-    normalized["graph_enrichment_provider"] = _normalize_provider(payload.get("graph_enrichment_provider"), defaults.get("graph_enrichment_provider", "openrouter"))
+    normalized["graph_enrichment_provider"] = "openrouter"
     normalized["graph_enrichment_openrouter_model"] = _normalize_string(
         payload.get("graph_enrichment_openrouter_model"),
         defaults.get("graph_enrichment_openrouter_model", ""),
     )
-    normalized["graph_enrichment_ollama_model"] = _normalize_string(
-        payload.get("graph_enrichment_ollama_model"),
-        defaults.get("graph_enrichment_ollama_model", ""),
-    )
-    normalized["graph_answer_provider"] = _normalize_provider(payload.get("graph_answer_provider"), defaults.get("graph_answer_provider", "openrouter"))
+    normalized["graph_answer_provider"] = "openrouter"
     normalized["graph_answer_openrouter_model"] = _normalize_string(
         payload.get("graph_answer_openrouter_model"),
         defaults.get("graph_answer_openrouter_model", ""),
     )
-    normalized["graph_answer_ollama_model"] = _normalize_string(
-        payload.get("graph_answer_ollama_model"),
-        defaults.get("graph_answer_ollama_model", ""),
-    )
     normalized["scrape_concurrency"] = _normalize_int(payload.get("scrape_concurrency"), int(defaults.get("scrape_concurrency") or 4), minimum=1, maximum=16)
     normalized["embedding_enabled"] = _normalize_bool(payload.get("embedding_enabled"), bool(defaults.get("embedding_enabled", True)))
-    normalized["embedding_model"] = _normalize_string(payload.get("embedding_model"), defaults.get("embedding_model", "nomic-embed-text:latest"))
+    normalized["embedding_model"] = _normalize_string(payload.get("embedding_model"), defaults.get("embedding_model", "openai/text-embedding-3-small"))
     normalized["zvec_enabled"] = _normalize_bool(payload.get("zvec_enabled"), bool(defaults.get("zvec_enabled", True)))
     normalized["zvec_index_path"] = _normalize_string(payload.get("zvec_index_path"), defaults.get("zvec_index_path", ""))
     normalized["zvec_collection"] = _normalize_string(payload.get("zvec_collection"), defaults.get("zvec_collection", "university_wiki"))
@@ -232,16 +215,6 @@ def _normalize_app_state_payload(payload: Any, defaults: AppStateContract) -> Ap
     normalized["tavily_cost_per_call_usd"] = _normalize_float(
         payload.get("tavily_cost_per_call_usd"),
         float(defaults.get("tavily_cost_per_call_usd") or 0.0),
-        minimum=0.0,
-    )
-    normalized["ollama_input_per_m_usd"] = _normalize_float(
-        payload.get("ollama_input_per_m_usd"),
-        float(defaults.get("ollama_input_per_m_usd") or 0.0),
-        minimum=0.0,
-    )
-    normalized["ollama_output_per_m_usd"] = _normalize_float(
-        payload.get("ollama_output_per_m_usd"),
-        float(defaults.get("ollama_output_per_m_usd") or 0.0),
         minimum=0.0,
     )
     normalized["tmux_session_grace_seconds"] = _normalize_int(
@@ -311,7 +284,7 @@ class AppStateRepository:
         return _normalize_app_state_payload(payload, self.defaults)
 
     def save(self, payload: dict[str, Any]) -> None:
-        write_json(self.path, payload)
+        write_json(self.path, _normalize_app_state_payload(payload, self.defaults))
         try:
             from .tmux_settings import refresh_app_state_cache
 

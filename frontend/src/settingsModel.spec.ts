@@ -1,4 +1,4 @@
-import { settingsDraftFromState, settingsSavePayloadFromDraft } from './settingsModel';
+import { estimateOpenRouterCost, settingsDraftFromState, settingsSavePayloadFromDraft } from './settingsModel';
 
 const draft = settingsDraftFromState({
   openrouter_api_key: 'or-existing',
@@ -10,7 +10,7 @@ const draft = settingsDraftFromState({
   scrape_browser_mode: 'lightpanda',
   lightpanda_cdp_url: 'ws://127.0.0.1:9222',
   embedding_enabled: false,
-  embedding_model: 'nomic-embed-text:latest',
+  embedding_model: 'openai/text-embedding-3-small',
   zvec_collection: 'university_wiki',
   use_tavily_for_map: true,
   tmux_session_grace_seconds: 900,
@@ -53,4 +53,12 @@ if (payload.pi_cmd !== 'pi') {
 
 if (payload.tmux_session_grace_seconds !== 900) {
   throw new Error('settings save payload should convert grace minutes back to seconds');
+}
+
+if (payload.llm_provider !== 'openrouter' || payload.url_reasoning_provider !== 'openrouter') {
+  throw new Error('settings save payload should force OpenRouter providers');
+}
+
+if (estimateOpenRouterCost('openai/gpt-4.1-mini', [{ id: 'openai/gpt-4.1-mini', label: 'mini', inputPerMTok: 0.4, outputPerMTok: 1.6, category: 'llm' }], 1_000_000, 1_000_000) !== 2) {
+  throw new Error('OpenRouter cost estimate should use selected model pricing');
 }

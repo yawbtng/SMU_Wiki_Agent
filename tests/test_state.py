@@ -90,9 +90,9 @@ def test_app_state_repository_normalizes_provider_and_index_settings(tmp_path: P
 
     assert loaded["openrouter_api_key"] == "123"
     assert loaded["tavily_api_key"] == " tavily "
-    assert loaded["url_reasoning_provider"] == "ollama"
+    assert loaded["url_reasoning_provider"] == "openrouter"
     assert loaded["graph_enrichment_provider"] == "openrouter"
-    assert loaded["graph_answer_provider"] == "ollama"
+    assert loaded["graph_answer_provider"] == "openrouter"
     assert loaded["url_reasoning_openrouter_model"] == "7"
     assert loaded["graph_answer_openrouter_model"] == "deepseek/deepseek-v4-flash"
     assert loaded["scrape_concurrency"] == 16
@@ -100,6 +100,8 @@ def test_app_state_repository_normalizes_provider_and_index_settings(tmp_path: P
     assert loaded["lightpanda_cdp_url"] == "42"
     assert loaded["embedding_enabled"] is False
     assert loaded["embedding_model"] == "False"
+    assert "ollama_model" not in loaded
+    assert "ollama_base_url" not in loaded
     assert loaded["zvec_collection"] == ""
     assert loaded["use_tavily_for_map"] is True
     assert loaded["default_llm_sleep_sec"] == 1.5

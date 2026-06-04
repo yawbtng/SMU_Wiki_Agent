@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +15,13 @@ from uuid import uuid4
 
 REGISTRY_STATUSES = {"ready", "failed", "needs-review"}
 CHANGE_STATES = {"new", "unchanged", "changed", "failed", "needs-review"}
-COUNT_KEYS = ("new", "unchanged", "changed", "ready", "failed", "needs-review")
+COUNT_KEYS = ("new", "unchanged", "changed", "ready", "failed", "needs-review", "registry_corrupt_lines")
+LOGGER = logging.getLogger(__name__)
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -92,22 +100,35 @@ def build_source_row(
 
 
 def read_registry_rows(path: Path) -> list[dict[str, Any]]:
+    rows, _corrupt = _read_registry_rows_with_diagnostics(path)
+    return rows
+
+
+def _read_registry_rows_with_diagnostics(path: Path) -> tuple[list[dict[str, Any]], int]:
     if not Path(path).exists():
-        return []
+        return [], 0
     rows: list[dict[str, Any]] = []
-    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+    corrupt_lines = 0
+    for line_number, line in enumerate(Path(path).read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
         if not line.strip():
             continue
         try:
             value = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            corrupt_lines += 1
+            LOGGER.warning("Corrupt raw source registry line ignored", extra={"registry_path": str(path), "line_number": line_number, "error": exc.msg})
             continue
         if isinstance(value, dict) and value.get("source_id"):
             rows.append(_with_defaults(value, now=""))
-    return sorted(_dedupe_by_source_id(rows).values(), key=lambda row: str(row.get("source_id") or ""))
+    return sorted(_dedupe_by_source_id(rows).values(), key=lambda row: str(row.get("source_id") or "")), corrupt_lines
 
 
 def write_registry_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    with _registry_lock(path):
+        _write_registry_rows_unlocked(path, rows)
+
+
+def _write_registry_rows_unlocked(path: Path, rows: list[dict[str, Any]]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     deduped = _dedupe_by_source_id(rows)
@@ -120,20 +141,65 @@ def write_registry_rows(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def merge_registry_rows(path: Path, incoming_rows: list[dict[str, Any]], *, now: str | None = None) -> RegistryMergeResult:
     timestamp = now or utc_now_iso()
-    existing = {str(row.get("source_id")): row for row in read_registry_rows(path)}
-    incoming = _dedupe_by_source_id([_with_defaults(row, now=timestamp) for row in incoming_rows])
-    counts = {key: 0 for key in COUNT_KEYS}
+    with _registry_lock(path):
+        current_rows, corrupt_lines = _read_registry_rows_with_diagnostics(path)
+        existing = {str(row.get("source_id")): row for row in current_rows}
+        incoming = _quarantine_duplicate_checksums([_with_defaults(row, now=timestamp) for row in incoming_rows], now=timestamp)
+        counts = {key: 0 for key in COUNT_KEYS}
+        counts["registry_corrupt_lines"] = corrupt_lines
 
-    for source_id in sorted(incoming):
-        new_row = incoming[source_id]
-        previous = existing.get(source_id)
-        merged = _merge_one(previous, new_row, now=timestamp)
-        existing[source_id] = merged
-        _increment_counts(counts, merged)
+        for source_id in sorted(incoming):
+            new_row = incoming[source_id]
+            previous = existing.get(source_id)
+            merged = _merge_one(previous, new_row, now=timestamp)
+            existing[source_id] = merged
+            _increment_counts(counts, merged)
 
-    rows = [existing[key] for key in sorted(existing)]
-    write_registry_rows(path, rows)
-    return RegistryMergeResult(rows=rows, counts=counts)
+        rows = [existing[key] for key in sorted(existing)]
+        _write_registry_rows_unlocked(path, rows)
+        return RegistryMergeResult(rows=rows, counts=counts)
+
+
+@contextmanager
+def _registry_lock(path: Path):
+    lock_path = Path(path).with_suffix(Path(path).suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a", encoding="utf-8") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _quarantine_duplicate_checksums(rows: list[dict[str, Any]], *, now: str) -> dict[str, dict[str, Any]]:
+    seen: dict[str, str] = {}
+    deduped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        source_id = str(row.get("source_id") or "")
+        checksum = str(row.get("checksum") or "")
+        status = str(row.get("status") or "")
+        if source_id and checksum and status == "ready" and checksum in seen and seen[checksum] != source_id:
+            first_source_id = seen[checksum]
+            row = {
+                **row,
+                "status": "needs-review",
+                "change_state": "needs-review",
+                "last_changed_at": row.get("last_changed_at") or now,
+                "error_reason": f"duplicate_checksum:{first_source_id}",
+                "provenance": {
+                    **(row.get("provenance") if isinstance(row.get("provenance"), dict) else {}),
+                    "duplicate_of_source_id": first_source_id,
+                    "quality_action": "quarantined",
+                },
+            }
+        elif source_id and checksum and status == "ready":
+            seen[checksum] = source_id
+        if source_id:
+            deduped[source_id] = row
+    return deduped
 
 
 def _merge_one(previous: dict[str, Any] | None, incoming: dict[str, Any], *, now: str) -> dict[str, Any]:

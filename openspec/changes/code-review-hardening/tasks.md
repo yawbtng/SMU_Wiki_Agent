@@ -34,7 +34,7 @@
 - [ ] 3.3 Apply policy in `manual_url_pipeline` before scrape.
 - [ ] 3.4 Add `scrape/safe_fetch.py` (or export from `ingest_safety`); use in discovery, sitemap, scrape HTTP mode.
 - [ ] 3.5 Scrape `_execute`: outer try/finally terminal status; periodic `failures.json` flush.
-- [ ] 3.6 Registry merge file lock; log corrupt JSONL lines; quarantine in-batch duplicate checksums.
+- [x] 3.6 Registry merge file lock; log corrupt JSONL lines; quarantine in-batch duplicate checksums.
 - [ ] 3.7 Tests: `tests/test_scrape_policy.py`, `tests/test_scrape_durability.py`; extend `test_url_policy.py` for discovery integration.
 
 ## 4. Index & MCP safety (Medium M11–M16)
