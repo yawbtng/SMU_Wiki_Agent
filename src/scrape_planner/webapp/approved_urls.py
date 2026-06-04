@@ -22,7 +22,45 @@ def approved_urls_path(site_id: str) -> Path:
     return site_root(site_id) / "approved_urls.md"
 
 
-SCHOOL_PATH_ROOTS = {"cox", "dedman", "dedmanlaw", "lyle", "meadows", "simmons", "perkins"}
+SCHOOL_PATH_ROOTS = {"cox", "dedman", "dedmanlaw", "law", "lyle", "meadows", "simmons", "perkins"}
+
+SCHOOL_TERM_TO_ROOT = {
+    "cox": "cox",
+    "dedman": "dedman",
+    "deadman": "dedman",
+    "dedmanlaw": "dedmanlaw",
+    "law": "dedmanlaw",
+    "lyle": "lyle",
+    "meadows": "meadows",
+    "simmons": "simmons",
+    "perkins": "perkins",
+}
+
+LAW_SCHOOL_TERMS = {"dedmanlaw", "law"}
+
+
+def _school_roots_from_terms(terms: list[str]) -> set[str]:
+    roots: set[str] = set()
+    normalized_terms: set[str] = set()
+    for term in terms:
+        normalized = str(term or "").strip().lower().replace("-", "").replace(" ", "")
+        normalized_terms.add(normalized)
+        if not normalized:
+            continue
+        if normalized in LAW_SCHOOL_TERMS:
+            roots.update({"dedmanlaw", "law"})
+        elif root := SCHOOL_TERM_TO_ROOT.get(normalized):
+            roots.add(root)
+    if normalized_terms & LAW_SCHOOL_TERMS and "schools" not in normalized_terms:
+        roots.discard("dedman")
+    return roots
+
+
+def _url_school_root(url: str) -> str:
+    parts = [part.lower() for part in urlparse(url).path.split("/") if part]
+    if parts and parts[0] in SCHOOL_PATH_ROOTS:
+        return parts[0]
+    return ""
 
 
 def _url_group_key(url: str) -> str:
@@ -48,9 +86,14 @@ def _url_groups(urls: list[str]) -> list[dict[str, Any]]:
 
 
 def _term_matches_url_or_group(url: str, terms: list[str]) -> bool:
+    school_roots = _school_roots_from_terms(terms)
+    if school_roots:
+        return _url_school_root(url) in school_roots
     haystack = f"{url}\n{_url_group_key(url)}".lower().replace("-", " ")
     compact = haystack.replace(" ", "-")
     for term in terms:
+        if str(term or "").strip().lower() in SCHOOL_TERM_TO_ROOT:
+            continue
         needle = str(term or "").strip().lower().replace("/", " ").replace("-", " ")
         if not needle:
             continue
@@ -65,6 +108,7 @@ def _discovery_url_pool(site_id: str, *, extra_exclude_terms: list[str] | None =
     eligible_urls: list[str] = []
     rejected = 0
     total = 0
+    reject_reasons: Counter[str] = Counter()
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, dict):
             continue
@@ -73,16 +117,19 @@ def _discovery_url_pool(site_id: str, *, extra_exclude_terms: list[str] | None =
         title = str(row.get("title") or "")
         if row.get("excluded_reason") == "operator_rejected_area" or _term_matches_url_or_group(url, exclude_terms):
             rejected += 1
+            reject_reasons["operator_rejected_area" if row.get("excluded_reason") == "operator_rejected_area" else "operator_exclude_term"] += 1
             continue
         decision = classify_url_for_student_wiki(url, title=title, lastmod=row.get("lastmod"))
         if decision.selected:
             eligible_urls.append(url)
         else:
             rejected += 1
+            reject_reasons[decision.reason] += 1
     return {
         "discovered_total": total,
         "eligible_total": len(eligible_urls),
         "rejected_total": rejected,
+        "reject_reasons": [{"reason": reason, "count": count} for reason, count in reject_reasons.most_common()],
         "groups": _url_groups(eligible_urls),
     }
 
@@ -95,14 +142,31 @@ def approved_urls_payload(site_id: str) -> dict[str, Any]:
     return {"site_id": site_id, "path": str(path), "markdown": markdown, "urls": urls, "groups": _url_groups(urls), "available_groups": pool["groups"], "discovery": {"discovered_total": pool["discovered_total"], "eligible_total": pool["eligible_total"], "rejected_total": pool["rejected_total"]}, "count": len(urls), "generated_at": utc_now()}
 
 
-def write_approved_urls_payload(site_id: str, markdown: str) -> dict[str, Any]:
-    path = approved_urls_path(site_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _policy_filtered_approved_markdown(markdown: str) -> tuple[str, list[dict[str, str]]]:
     content = markdown if markdown.strip() else APPROVED_URLS_HEADER + "\n"
     if "scrape-planner:approved-urls:v1" not in content:
         content = APPROVED_URLS_HEADER + "\n" + content.strip() + "\n"
+
+    accepted_lines: dict[str, str] = {}
+    rejected: list[dict[str, str]] = []
+    for url in _approved_url_lines(content):
+        decision = classify_url_for_student_wiki(url)
+        if decision.selected:
+            accepted_lines[url] = url
+        else:
+            rejected.append({"url": url, "reason": decision.reason})
+    if not accepted_lines:
+        return APPROVED_URLS_HEADER + "\n", rejected
+    return _render_approved_urls_markdown(accepted_lines), rejected
+
+
+def write_approved_urls_payload(site_id: str, markdown: str) -> dict[str, Any]:
+    path = approved_urls_path(site_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content, rejected = _policy_filtered_approved_markdown(markdown)
     path.write_text(content, encoding="utf-8")
-    return approved_urls_payload(site_id)
+    payload = approved_urls_payload(site_id)
+    return {**payload, "filtered_rejected_urls": rejected}
 
 
 def apply_operator_discovery_exclusions(site_id: str, terms: list[str]) -> int:
@@ -163,11 +227,8 @@ def _render_approved_urls_markdown(lines_by_url: dict[str, str], *, note: str = 
     if note:
         lines.extend([f"> {note}", ""])
     lines.extend(["## Approved for next scrape", ""])
-    for url, line in sorted(lines_by_url.items()):
-        rendered = line if url in line else f"- [x] {url}"
-        if not rendered.lstrip().startswith("-"):
-            rendered = f"- [x] {rendered}"
-        lines.append(rendered)
+    for url in sorted(lines_by_url):
+        lines.append(f"- [x] {url}")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -180,6 +241,19 @@ def _message_urls(message: str) -> list[str]:
             seen.add(url)
             urls.append(url)
     return urls
+
+
+def _message_subpaths(message: str) -> list[str]:
+    subpaths: list[str] = []
+    for match in re.finditer(r"\bpath:([^\s,;]+)", message or "", flags=re.IGNORECASE):
+        raw = match.group(1).strip()
+        if raw == "/":
+            subpath = "/"
+        else:
+            subpath = "/" + raw.strip("/")
+        if subpath not in subpaths:
+            subpaths.append(subpath)
+    return subpaths
 
 
 def _removal_terms(message: str) -> list[str]:
@@ -196,15 +270,19 @@ def _candidate_rows_for_instruction(site_id: str, instruction: str, *, limit: in
     raw_rows = read_json(root / "discovered_urls.json", [])
     row_list = [row for row in raw_rows if isinstance(row, dict)] if isinstance(raw_rows, list) else []
     terms = _message_terms(instruction)
+    school_roots = _school_roots_from_terms(terms)
     explicit_urls = _message_urls(instruction)
     matched_groups: set[str] = {_url_group_key(url) for url in explicit_urls}
+    matched_groups.update(_message_subpaths(instruction))
+    if school_roots:
+        matched_groups.update(f"/{root}" for root in school_roots)
     rejected: list[dict[str, Any]] = []
 
     for row in row_list:
         url = str(row.get("url") or "")
         title = str(row.get("title") or "")
         haystack = f"{url}\n{title}".lower()
-        if url and (not terms or any(term in haystack for term in terms)):
+        if url and not school_roots and (not terms or any(term in haystack for term in terms)):
             matched_groups.add(_url_group_key(url))
 
     candidates: list[dict[str, Any]] = []
@@ -256,6 +334,8 @@ def _message_terms(message: str) -> list[str]:
         "housing": ["housing", "dining", "student-life", "health", "counseling", "parking", "orientation", "accessibility"],
         "admission": ["admission", "apply", "application", "transfer", "visit"],
         "cox": ["cox"],
+        "dedmanlaw": ["dedmanlaw", "dedman law", "dedman-law"],
+        "law": ["law"],
         "dedman": ["dedman", "deadman"],
         "deadman": ["dedman", "deadman"],
         "meadows": ["meadows"],
@@ -267,10 +347,25 @@ def _message_terms(message: str) -> list[str]:
     lowered = message.lower()
     terms: list[str] = []
     for key, values in aliases.items():
-        if key in lowered or any(value in lowered for value in values):
+        if key == "schools":
+            if re.search(r"\b(?:schools|colleges)\b", lowered):
+                terms.extend(values)
+            continue
+        if re.search(rf"\b{re.escape(key)}\b", lowered) or any(re.search(rf"\b{re.escape(value)}\b", lowered) for value in values):
             terms.extend(values)
     for token in re.findall(r"[a-z0-9][a-z0-9-]{3,}", lowered):
-        if token not in {"approve", "approved", "source", "sources", "scrape", "pages", "urls", "student", "students"}:
+        if token not in {
+            "approve",
+            "approved",
+            "choose",
+            "source",
+            "sources",
+            "scrape",
+            "pages",
+            "urls",
+            "student",
+            "students",
+        }:
             terms.append(token)
     deduped: list[str] = []
     for term in terms:
@@ -288,15 +383,27 @@ def _analysis_terms(message: str) -> list[str]:
     return terms
 
 
+def _url_matches_analysis_terms(url: str, title: str, terms: list[str], *, school_roots: set[str]) -> bool:
+    if not terms:
+        return True
+    if school_roots:
+        return _url_school_root(url) in school_roots
+    haystack = f"{url}\n{title}".lower()
+    return any(term in haystack for term in terms if term not in SCHOOL_TERM_TO_ROOT)
+
+
 def _approval_analysis(site_id: str, markdown: str, message: str) -> dict[str, Any]:
     rows = read_json(site_root(site_id) / "discovered_urls.json", [])
     selected_urls = set(parse_approved_urls_markdown(markdown))
     terms = _analysis_terms(message)
+    school_roots = _school_roots_from_terms(terms)
     eligible_urls: list[str] = []
     matched_eligible_urls: list[str] = []
     reject_reasons: Counter[str] = Counter()
+    rejected_samples: list[dict[str, str]] = []
+    scoped_rejected_samples: list[dict[str, str]] = []
     root_counts: Counter[str] = Counter()
-    school_roots = {"cox", "dedman", "dedmanlaw", "law", "lyle", "meadows", "simmons", "perkins"}
+    path_school_roots = {"cox", "dedman", "dedmanlaw", "law", "lyle", "meadows", "simmons", "perkins"}
     student_roots = {"admission", "enrollment-services", "studentaffairs", "student-life", "libraries", "bursar", "financialaid", "student-financial-services", "housing", "dining"}
     school_or_student = 0
 
@@ -312,15 +419,20 @@ def _approval_analysis(site_id: str, markdown: str, message: str) -> dict[str, A
         decision = classify_url_for_student_wiki(url, title=title, lastmod=row.get("lastmod"))
         if decision.selected:
             eligible_urls.append(url)
-            if not terms or any(term in haystack for term in terms):
+            if _url_matches_analysis_terms(url, title, terms, school_roots=school_roots):
                 matched_eligible_urls.append(url)
             parts = [part.lower() for part in urlparse(url).path.split("/") if part]
             root = parts[0] if parts else "/"
             root_counts[root] += 1
-            if root in school_roots or root in student_roots or any(marker in haystack for marker in ("/registrar", "/academic-calendar", "/tuition", "/financial-aid", "/scholarship", "/housing", "/dining", "/health", "/accessibility", "/orientation")):
+            if root in path_school_roots or root in student_roots or any(marker in haystack for marker in ("/registrar", "/academic-calendar", "/tuition", "/financial-aid", "/scholarship", "/housing", "/dining", "/health", "/accessibility", "/orientation")):
                 school_or_student += 1
         else:
             reject_reasons[decision.reason] += 1
+            sample = {"url": url, "reason": decision.reason}
+            if len(rejected_samples) < 5:
+                rejected_samples.append(sample)
+            if _url_matches_analysis_terms(url, title, terms, school_roots=school_roots) and len(scoped_rejected_samples) < 5:
+                scoped_rejected_samples.append(sample)
 
     selected_groups = _url_groups(sorted(selected_urls))
     available_groups = _url_groups(eligible_urls)
@@ -334,10 +446,12 @@ def _approval_analysis(site_id: str, markdown: str, message: str) -> dict[str, A
         "top_roots": [{"root": root, "count": count} for root, count in root_counts.most_common(15)],
         "top_available_groups": available_groups[:15],
         "matched_terms": terms,
+        "matched_school_roots": sorted(school_roots),
         "matched_eligible_total": len(matched_eligible_urls),
         "matched_groups": matched_groups[:15],
         "selected_groups": selected_groups[:15],
         "reject_reasons": [{"reason": reason, "count": count} for reason, count in reject_reasons.most_common()],
+        "rejected_samples": scoped_rejected_samples if terms and scoped_rejected_samples else rejected_samples,
     }
 
 
@@ -350,7 +464,8 @@ def _analysis_message(analysis: dict[str, Any]) -> str:
         f"School or student-service candidate count is {analysis['school_or_student_total']} URLs.",
     ]
     if analysis.get("matched_terms"):
-        lines.append(f"For {', '.join(analysis['matched_terms'])}, matched {analysis['matched_eligible_total']} eligible URLs.")
+        scope = ", ".join(analysis.get("matched_school_roots") or analysis["matched_terms"])
+        lines.append(f"For {scope}, matched {analysis['matched_eligible_total']} eligible URLs after spam filtering.")
     top = analysis.get("matched_groups") or analysis.get("top_available_groups") or []
     if top:
         lines.append("Top selectable subpaths:")
@@ -359,6 +474,10 @@ def _analysis_message(analysis: dict[str, Any]) -> str:
     if reasons:
         lines.append("Top rejection reasons:")
         lines.extend(f"{item['reason']}: {item['count']}" for item in reasons[:5])
+    samples = analysis.get("rejected_samples") or []
+    if samples:
+        lines.append("Sample rejected noisy URLs:")
+        lines.extend(f"{item['url']} ({item['reason']})" for item in samples[:3])
     return "\n".join(lines)
 
 
@@ -384,7 +503,7 @@ def _operator_intent_from_message(message: str, analysis: dict[str, Any] | None)
     elif any(token in lowered for token in ("remove", "delete", "exclude", "filter", "drop", "demote")):
         intent = "remove"
         terms = _removal_terms(message)
-    elif any(token in lowered for token in ("approve", "add", "include", "select", "scrape")):
+    elif any(token in lowered for token in ("approve", "add", "include", "select", "choose", "scrape")):
         intent = "approve"
         terms = _message_terms(message)
     else:
@@ -414,7 +533,8 @@ def approval_chat_payload(site_id: str, request: ApprovedUrlsChatRequest) -> dic
     if intent not in {"analyze", "approve", "remove"}:
         raise HTTPException(status_code=502, detail=f"URL agent returned invalid intent: {intent or 'missing'}")
     llm_terms = [str(term) for term in llm.get("terms", []) if str(term).strip()]
-    effective_message = " ".join(llm_terms) if llm_terms else message
+    exact_path_terms = [f"path:{subpath}" for subpath in _message_subpaths(message)]
+    effective_message = " ".join([*llm_terms, *exact_path_terms]) if llm_terms or exact_path_terms else message
 
     if intent == "remove":
         urls = _message_urls(message)
@@ -449,8 +569,9 @@ def approval_chat_payload(site_id: str, request: ApprovedUrlsChatRequest) -> dic
     markdown = _render_approved_urls_markdown(lines_by_url, note="Managed by Approval chat. Edit by chatting or changing this file directly.")
     should_save = request.autosave and intent in {"remove", "approve"}
     saved = False
+    saved_payload: dict[str, Any] | None = None
     if should_save:
-        write_approved_urls_payload(site_id, markdown)
+        saved_payload = write_approved_urls_payload(site_id, markdown)
         saved = True
     event = {
         "message": message,
@@ -469,18 +590,24 @@ def approval_chat_payload(site_id: str, request: ApprovedUrlsChatRequest) -> dic
     added_urls = [item["url"] for item in added]
     removed_urls = [item["url"] for item in removed]
     rejected_urls = [item["url"] for item in rejected]
+    response_markdown = str(saved_payload["markdown"]) if saved_payload else markdown
+    response_urls = list(saved_payload["urls"]) if saved_payload else list(lines_by_url)
+    response_groups = list(saved_payload["groups"]) if saved_payload else _url_groups(list(lines_by_url))
+    response_count = int(saved_payload["count"]) if saved_payload else len(lines_by_url)
+    filtered_rejected_urls = list(saved_payload.get("filtered_rejected_urls", [])) if saved_payload else []
     return {
         "site_id": site_id,
         "assistant_message": assistant_message + (" Saved approved_urls.md." if saved else (" Review the proposed URL groups, then click Update approved_urls.md." if intent in {"remove", "approve"} else "")),
-        "markdown": markdown,
-        "urls": list(lines_by_url),
-        "groups": _url_groups(list(lines_by_url)),
+        "markdown": response_markdown,
+        "urls": response_urls,
+        "groups": response_groups,
         "added_groups": _url_groups(added_urls),
         "removed_groups": _url_groups(removed_urls),
         "rejected_groups": _url_groups(rejected_urls),
         "available_groups": pool["groups"],
         "discovery": {"discovered_total": pool["discovered_total"], "eligible_total": pool["eligible_total"], "rejected_total": pool["rejected_total"]},
-        "count": len(lines_by_url),
+        "count": response_count,
+        "filtered_rejected_urls": filtered_rejected_urls,
         "added": added,
         "removed": removed,
         "rejected": rejected,

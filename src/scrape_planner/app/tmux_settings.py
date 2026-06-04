@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 from functools import lru_cache
 from pathlib import Path
 
@@ -11,6 +12,12 @@ from .repositories import _normalize_app_state_payload
 
 DEFAULT_GRACE_SECONDS = 30 * 60
 VALID_WIKI_RUNTIMES = frozenset({"pi", "python"})
+
+APP_STATE_ENV_FIELDS: tuple[tuple[str, str], ...] = (
+    ("openrouter_api_key", "OPENROUTER_API_KEY"),
+    ("tavily_api_key", "TAVILY_API_KEY"),
+    ("embedding_model", "OPENROUTER_EMBED_MODEL"),
+)
 
 
 def app_state_path() -> Path:
@@ -26,6 +33,32 @@ def load_app_state() -> AppStateContract:
 
 def refresh_app_state_cache() -> None:
     load_app_state.cache_clear()
+
+
+def app_state_env_values() -> dict[str, str]:
+    state = load_app_state()
+    values: dict[str, str] = {}
+    for field, env_name in APP_STATE_ENV_FIELDS:
+        value = str(state.get(field) or "").strip()
+        if value:
+            values[env_name] = value
+    return values
+
+
+def build_app_state_env_exports(*, existing_env: dict[str, str] | None = None) -> list[str]:
+    env = existing_env if existing_env is not None else os.environ
+    exports: list[str] = []
+    for env_name, value in app_state_env_values().items():
+        if not str(env.get(env_name, "")).strip():
+            exports.append(f"export {env_name}={shlex.quote(value)}")
+    return exports
+
+
+def apply_app_state_env_bridge(*, existing_env: dict[str, str] | None = None) -> None:
+    env = existing_env if existing_env is not None else os.environ
+    for env_name, value in app_state_env_values().items():
+        if not str(env.get(env_name, "")).strip():
+            env[env_name] = value
 
 
 def tmux_session_grace_seconds(*, override: int | None = None) -> int:

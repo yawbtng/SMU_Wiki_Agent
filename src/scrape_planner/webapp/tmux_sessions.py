@@ -120,3 +120,23 @@ def archive_site_tmux_session_payload(site_id: str, session: str, *, site_root_f
         "killed": True,
         "generated_at": utc_now(),
     }
+
+
+def kill_site_tmux_sessions(site_id: str, *, runner: TmuxRunner | None = None) -> list[str]:
+    """Best-effort kill of live tmux sessions tied to a site before workspace removal."""
+    tmux = runner or TmuxRunner()
+    killed: list[str] = []
+    if not tmux.available():
+        return killed
+    safe_site = sanitize_tmux_session_name(site_id)
+    for name in tmux.list_sessions():
+        belongs = _session_belongs_to_site(name, site_id)
+        if not belongs and safe_site:
+            belongs = f"-{safe_site}-" in name or name.endswith(f"-{safe_site}")
+        if not belongs:
+            continue
+        if tmux.session_exists(name):
+            result = tmux.kill(name)
+            if result.get("ok"):
+                killed.append(name)
+    return killed

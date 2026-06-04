@@ -25,9 +25,13 @@ def build_managed_session_shell(
     grace: int | None = None,
 ) -> str:
     """Run command, tee output to archive, wait grace period, then exit (no interactive shell)."""
+    from ..app.tmux_settings import build_app_state_env_exports
+
     grace_value = grace_seconds(grace)
     workdir_q = shlex.quote(workdir)
     path_prefix = "export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+    env_exports = build_app_state_env_exports()
+    env_prefix = " && ".join(env_exports)
     if archive_path:
         archive_q = shlex.quote(str(archive_path))
         run = f"set -o pipefail; {command} 2>&1 | tee {archive_q}; code=$?"
@@ -42,5 +46,9 @@ def build_managed_session_shell(
         tail.append(f'echo "[tmux-runner] session closes in {grace_value}s"')
         tail.append(f"sleep {grace_value}")
     tail.append("exit $code")
-    inner = f"cd {workdir_q} && {path_prefix} && {run}; " + "; ".join(tail)
+    setup = [f"cd {workdir_q}", path_prefix]
+    if env_prefix:
+        setup.append(env_prefix)
+    setup.append(run)
+    inner = " && ".join(setup) + "; " + "; ".join(tail)
     return f"/bin/zsh -lic {shlex.quote(inner)}"

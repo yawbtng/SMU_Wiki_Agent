@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import shutil
 import sys
 import threading
 import uuid
@@ -18,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..runtime.agent_run_metrics import STANDARD_WINDOWS
 from ..app.navigation import WORKFLOW_TABS
+from ..pdf.pdf_ingest import PdfIngestConfig, ingest_pdfs
 from ..runtime.run_persistence import read_page_states, read_run_events, read_run_status
 from ..scrape.scrape_url_selection import urls_for_site_scrape
 from ..scrape.scrape_worker import ScrapeRunner
@@ -25,7 +28,9 @@ from ..scrape.sitemap_discovery import discover_site_urls, normalize_site_url
 from ..runtime.state import RunStateStore
 from ..core.storage import read_json, write_json
 from ..infra.tmux_runner import TmuxRunner
+from ..sources.raw_source_normalizer import normalize_pdf_pages
 from ..wiki.self_improving import read_confidence_gaps
+from ..wiki.llm_wiki_index import site_mcp_query_readiness
 from .approved_urls import (
     approval_chat_payload,
     approved_urls_payload,
@@ -58,6 +63,7 @@ from .embeddings import (
     trigger_embedding_rebuild,
 )
 from .schemas import ApprovedUrlsChatRequest
+from .tmux_sessions import kill_site_tmux_sessions
 
 __all__ = [
     "ApprovedUrlsChatRequest",
@@ -91,6 +97,46 @@ def list_sites_payload() -> dict[str, Any]:
                 }
             )
     return {"data_root": str(data_root()), "sites": sites, "generated_at": utc_now()}
+
+
+def delete_site_payload(site_id: str, *, runner: TmuxRunner | None = None) -> dict[str, Any]:
+    root = site_root(site_id)
+    if not root.exists():
+        raise HTTPException(status_code=404, detail="site not found")
+
+    metadata = _workspace_metadata()
+    workspace_url = str(metadata.get(site_id, {}).get("url") or "")
+    if not workspace_url:
+        summary = read_json(root / "discovery_summary.json", {})
+        if isinstance(summary, dict):
+            workspace_url = str(summary.get("site_url") or "")
+
+    killed_sessions = kill_site_tmux_sessions(site_id, runner=runner)
+    shutil.rmtree(root)
+
+    repo = state_repo()
+    state = dict(repo.load())
+    workspaces = [
+        item
+        for item in state.get("workspaces", [])
+        if isinstance(item, dict) and str(item.get("id") or "") != site_id
+    ]
+    state["workspaces"] = workspaces
+    if str(state.get("active_workspace_id") or "") == site_id:
+        state["active_workspace_id"] = ""
+    if str(state.get("last_site_id") or "") == site_id:
+        state["last_site_id"] = ""
+    if workspace_url:
+        state["site_history"] = [item for item in state.get("site_history", []) if item != workspace_url]
+    repo.save(state)
+
+    return {
+        "site_id": site_id,
+        "deleted": True,
+        "killed_sessions": killed_sessions,
+        "app_state": repo.load(),
+        **list_sites_payload(),
+    }
 
 
 def _counter_dict(value: Any) -> dict[str, Any]:
@@ -277,7 +323,8 @@ def list_mcp_universities_payload() -> dict[str, Any]:
             url = str(meta.get("url") or summary.get("site_url") or "")
             domain = urlparse(url).netloc or site_id
             wiki_ready = _site_has_markdown_pages(path)
-            index_ready = _site_has_query_index(path)
+            query_health = site_mcp_query_readiness(path)
+            index_ready = bool(query_health.get("query_ready"))
             universities.append(
                 {
                     "site_id": site_id,
@@ -287,7 +334,8 @@ def list_mcp_universities_payload() -> dict[str, Any]:
                     "site_root": str(path),
                     "wiki_ready": wiki_ready,
                     "index_ready": index_ready,
-                    "mcp_enabled": wiki_ready or index_ready,
+                    "mcp_enabled": index_ready,
+                    "mcp_block_reason": str(query_health.get("mcp_block_reason") or ""),
                 }
             )
     ready_count = sum(1 for row in universities if row["mcp_enabled"])
@@ -627,6 +675,107 @@ def sources_payload(site_id: str, limit: int = 500, offset: int = 0) -> dict[str
         "rows": rows[offset : offset + limit],
         "generated_at": utc_now(),
     }
+
+
+def upload_documents_payload(site_id: str, files: list[dict[str, Any]]) -> dict[str, Any]:
+    root = site_root(site_id)
+    if not root.exists():
+        raise HTTPException(status_code=404, detail="site not found")
+    if not files:
+        raise HTTPException(status_code=400, detail="no files uploaded")
+
+    sources_root = root / "sources"
+    uploads_dir = sources_root / "pdf_uploads"
+    ingest_dir = sources_root / "pdf_ingest"
+    pages_dir = sources_root / "pdf_pages"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    ingest_dir.mkdir(parents=True, exist_ok=True)
+
+    uploaded: list[dict[str, Any]] = []
+    paths: list[Path] = []
+    timestamp = utc_now()
+    for item in files:
+        filename = _safe_upload_filename(str(item.get("filename") or "document.pdf"))
+        if not filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail=f"unsupported file type: {filename}")
+        content = item.get("content")
+        if not isinstance(content, bytes) or not content:
+            raise HTTPException(status_code=400, detail=f"empty upload: {filename}")
+        path = _unique_upload_path(uploads_dir, filename)
+        path.write_bytes(content)
+        paths.append(path)
+        uploaded.append({"path": str(path), "filename": path.name, "uploaded_at": timestamp})
+
+    _merge_pdf_manifest(sources_root / "pdf_manifest.json", uploaded)
+
+    result = ingest_pdfs(paths, PdfIngestConfig(page_markdown_dir=pages_dir))
+    _write_jsonl(ingest_dir / "pdf_sources.jsonl", [row.to_dict() for row in result.sources])
+    _write_jsonl(ingest_dir / "pdf_chunks.jsonl", [row.to_dict() for row in result.chunks])
+    _write_jsonl(ingest_dir / "pdf_quarantine.jsonl", [row.to_dict() for row in result.quarantine])
+    registry = normalize_pdf_pages(root)
+
+    return {
+        "site_id": site_id,
+        "uploaded_count": len(uploaded),
+        "accepted_count": sum(1 for row in result.sources if row.accepted),
+        "chunk_count": len(result.chunks),
+        "quarantine_count": len(result.quarantine),
+        "uploaded": uploaded,
+        "sources": [row.to_dict() for row in result.sources],
+        "quarantine": [row.to_dict() for row in result.quarantine],
+        "registry": {
+            "counts": registry.counts,
+            "registry_path": registry.registry_path,
+            "report_path": registry.report_path,
+        },
+        "generated_at": utc_now(),
+    }
+
+
+def _safe_upload_filename(filename: str) -> str:
+    name = Path(filename).name.strip()
+    cleaned = "".join(ch if ch.isalnum() or ch in {".", "-", "_"} else "-" for ch in name).strip(".-")
+    return cleaned or "document.pdf"
+
+
+def _unique_upload_path(directory: Path, filename: str) -> Path:
+    candidate = directory / filename
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem
+    suffix = candidate.suffix
+    for index in range(2, 1000):
+        next_candidate = directory / f"{stem}-{index}{suffix}"
+        if not next_candidate.exists():
+            return next_candidate
+    raise HTTPException(status_code=409, detail=f"too many uploads named {filename}")
+
+
+def _merge_pdf_manifest(path: Path, rows: list[dict[str, Any]]) -> None:
+    current = read_json(path, [])
+    merged = {str(row.get("path") or ""): row for row in current if isinstance(row, dict) and row.get("path")}
+    for row in rows:
+        merged[str(row["path"])] = row
+    write_json(path, list(merged.values()))
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    existing = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.strip():
+                with contextlib.suppress(json.JSONDecodeError):
+                    parsed = json.loads(line)
+                    if isinstance(parsed, dict):
+                        existing.append(parsed)
+    key = "chunk_id" if path.name == "pdf_chunks.jsonl" else "pdf_source_id"
+    merged = {str(row.get(key) or ""): row for row in existing if row.get(key)}
+    for row in rows:
+        row_key = str(row.get(key) or "")
+        if row_key:
+            merged[row_key] = row
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(row, ensure_ascii=True) + "\n" for row in merged.values()), encoding="utf-8")
 
 
 _TMUX_CACHE: dict[str, tuple[float, bool]] = {}

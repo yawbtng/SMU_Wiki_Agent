@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import shlex
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from src.scrape_planner.app.tmux_settings import refresh_app_state_cache
+from src.scrape_planner.core.storage import write_json
 from src.scrape_planner.infra.tmux_runner import TmuxRunner
 from src.scrape_planner.infra.tmux_session_shell import build_managed_session_shell, grace_seconds, sanitize_tmux_session_name
 from src.scrape_planner.infra.tmux_session_lifecycle import reconcile_expired_tmux_sessions
@@ -16,6 +19,52 @@ def test_build_managed_session_shell_archives_sleeps_and_exits() -> None:
     assert "sleep 1800" in shell
     assert "exit $code" in shell
     assert "exec /bin/zsh -l" not in shell
+
+
+def test_build_managed_session_shell_exports_app_state_api_keys(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    write_json(
+        data_root / "app_state.json",
+        {
+            "openrouter_api_key": "fake-openrouter-key",
+            "tavily_api_key": "fake-tavily-key",
+            "embedding_model": "openai/text-embedding-3-large",
+        },
+    )
+    monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(data_root))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_EMBED_MODEL", raising=False)
+    refresh_app_state_cache()
+
+    shell = build_managed_session_shell("echo hi", str(tmp_path / "work"), grace=0)
+
+    assert f"export OPENROUTER_API_KEY={shlex.quote('fake-openrouter-key')}" in shell
+    assert f"export TAVILY_API_KEY={shlex.quote('fake-tavily-key')}" in shell
+    assert f"export OPENROUTER_EMBED_MODEL={shlex.quote('openai/text-embedding-3-large')}" in shell
+
+
+def test_build_managed_session_shell_skips_app_state_exports_when_env_set(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    write_json(
+        data_root / "app_state.json",
+        {"openrouter_api_key": "fake-openrouter-key"},
+    )
+    monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "env-openrouter-key")
+    refresh_app_state_cache()
+
+    shell = build_managed_session_shell("echo hi", str(tmp_path / "work"), grace=0)
+
+    assert "export OPENROUTER_API_KEY=" not in shell
 
 
 def test_sanitize_tmux_session_name_replaces_dots() -> None:
@@ -94,3 +143,44 @@ def test_reconcile_kills_expired_completed_sessions(tmp_path: Path) -> None:
     assert actions[0]["killed"] is True
     assert runner.killed == ["wiki-site-20260522-101112"]
     assert (archives / "wiki-site-20260522-101112.log").exists()
+
+
+def test_archive_site_tmux_session_reconciles_running_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.scrape_planner.webapp.tmux_sessions import archive_site_tmux_session_payload
+
+    data_root = tmp_path / "data"
+    site_root = data_root / "sites" / "demo.edu"
+    reports = site_root / "wiki" / "reports"
+    reports.mkdir(parents=True)
+    report_path = reports / "wiki-build-latest.json"
+    write_json(
+        report_path,
+        {
+            "status": "running",
+            "job_status": "running",
+            "tmux_session": "wiki-demo.edu-test",
+        },
+    )
+
+    class FakeRunner:
+        def available(self) -> bool:
+            return True
+
+        def session_exists(self, name: str) -> bool:
+            return True
+
+        def capture(self, name: str, lines: int = 5000) -> str:
+            return "pane output"
+
+        def kill(self, name: str):
+            return {"ok": True}
+
+    monkeypatch.setattr("src.scrape_planner.webapp.tmux_sessions.TmuxRunner", FakeRunner)
+    monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(data_root))
+
+    payload = archive_site_tmux_session_payload("demo.edu", "wiki-demo.edu-test", site_root_fn=lambda _site_id: site_root)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert payload["killed"] is True
+    assert report["job_status"] == "archived"
+    assert report["status"] == "archived"

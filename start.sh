@@ -10,6 +10,13 @@ source "$ROOT/scripts/lib/webapp-runtime.sh"
 LOG_DIR="$ROOT/logs"
 mkdir -p "$LOG_DIR"
 
+if [[ -f "$ROOT/.env" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$ROOT/.env"
+  set +a
+fi
+
 if [[ ! -x "$ROOT/.venv/bin/python" ]]; then
   echo "ERROR: missing virtualenv at $ROOT/.venv — run: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
   exit 1

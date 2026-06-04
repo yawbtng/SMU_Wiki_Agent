@@ -53,7 +53,12 @@ def test_execute_success_path(monkeypatch, tmp_path: Path):
     )
     monkeypatch.setattr(
         "src.scrape_planner.scrape.scrape_worker.extract_content",
-        lambda html: ("text", "# title\nbody", 1200, 0.02),
+        lambda html: (
+            "text",
+            "# Admissions\n\nStudents can apply for admission, review tuition deadlines, and prepare academic records for enrollment.",
+            1200,
+            0.02,
+        ),
     )
 
     runner._execute("site-a", "run-1", _selected_urls("https://example.com/a"))
@@ -68,7 +73,16 @@ def test_execute_success_path(monkeypatch, tmp_path: Path):
     assert pages[0]["status"] == "success"
     assert pages[0]["markdown_path"]
     assert any(e["event"] == "artifacts_saved" for e in events)
-    assert (tmp_path / "sites" / "site-a" / "run-1" / "scrape_manifest.json").exists()
+    site_root = tmp_path / "sites" / "site-a"
+    assert (site_root / "run-1" / "scrape_manifest.json").exists()
+    registry_rows = [
+        json.loads(line)
+        for line in (site_root / "raw_sources" / "registry.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(registry_rows) == 1
+    assert registry_rows[0]["source_kind"] == "web"
+    assert registry_rows[0]["status"] == "ready"
 
 
 def test_execute_skips_policy_rejected_urls(monkeypatch, tmp_path: Path):
@@ -140,6 +154,155 @@ def test_execute_pdf_url_downloads_and_writes_pdf_chunks(monkeypatch, tmp_path: 
     assert pages[0]["markdown_path"] is None
     assert chunks[0]["text"] == "PDF catalog content"
     assert any(event["event"] == "pdf_artifacts_saved" for event in events)
+
+
+def test_execute_pdf_url_persists_registry_after_normalization(monkeypatch, tmp_path: Path):
+    runner, state = _make_runner(tmp_path)
+    item = DiscoveredURL(
+        url="https://example.com/catalog.pdf",
+        source_sitemap="https://example.com/sitemap.xml",
+        content_type_guess="pdf",
+        selected=True,
+    )
+
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape.scrape_worker.requests.get",
+        lambda url, timeout, stream=False: _FakeResponse(text="%PDF-1.7", content_type="application/pdf"),
+    )
+
+    class Source:
+        accepted = True
+
+        def to_dict(self):
+            return {"pdf_source_id": "pdf-1", "path": str(tmp_path / "catalog.pdf"), "accepted": True}
+
+    class Chunk:
+        char_count = 19
+
+        def to_dict(self):
+            return {"chunk_id": "chunk-1", "pdf_source_id": "pdf-1", "text": "PDF catalog content", "char_count": 19}
+
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape.scrape_worker.ingest_pdfs",
+        lambda paths, config: SimpleNamespace(sources=[Source()], chunks=[Chunk()], quarantine=[]),
+    )
+
+    runner._execute("site-a", "run-pdf-registry", [item])
+
+    site_root = tmp_path / "sites" / "site-a"
+    registry_path = site_root / "raw_sources" / "registry.jsonl"
+    assert registry_path.exists()
+    rows = [json.loads(line) for line in registry_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert any(str(row.get("source_kind") or "") == "pdf" for row in rows)
+
+
+def test_execute_failed_pdf_url_is_visible_in_registry(monkeypatch, tmp_path: Path):
+    runner, _state = _make_runner(tmp_path)
+    item = DiscoveredURL(
+        url="https://example.com/bad.pdf",
+        source_sitemap="https://example.com/sitemap.xml",
+        content_type_guess="pdf",
+        selected=True,
+    )
+
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape.scrape_worker.requests.get",
+        lambda url, timeout, stream=False: _FakeResponse(text="%PDF-1.7", content_type="application/pdf"),
+    )
+
+    class Source:
+        accepted = False
+
+        def to_dict(self):
+            return {"pdf_source_id": "pdf-bad", "path": str(tmp_path / "bad.pdf"), "accepted": False}
+
+    class Quarantine:
+        reason = "parse_failed"
+        detail = "markitdown failed"
+
+        def to_dict(self):
+            return {"pdf_source_id": "pdf-bad", "reason": self.reason, "detail": self.detail}
+
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape.scrape_worker.ingest_pdfs",
+        lambda paths, config: SimpleNamespace(sources=[Source()], chunks=[], quarantine=[Quarantine()]),
+    )
+
+    runner._execute("site-a", "run-pdf-failed", [item])
+
+    site_root = tmp_path / "sites" / "site-a"
+    registry_path = site_root / "raw_sources" / "registry.jsonl"
+    assert registry_path.exists()
+    rows = [json.loads(line) for line in registry_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    failed = [row for row in rows if str(row.get("source_kind") or "") == "pdf"]
+    assert failed
+    assert any(str(row.get("status") or "") == "failed" for row in failed)
+
+
+def test_execute_mixed_web_success_and_quarantined_pdf_is_visible_in_registry(monkeypatch, tmp_path: Path):
+    runner, _state = _make_runner(tmp_path)
+    pdf_url = "https://example.com/handbook.pdf"
+    items = _selected_urls(
+        "https://example.com/page-a",
+        "https://example.com/page-b",
+        "https://example.com/page-c",
+        "https://example.com/page-d",
+        pdf_url,
+    )
+    items[-1] = DiscoveredURL(
+        url=pdf_url,
+        source_sitemap="https://example.com/sitemap.xml",
+        content_type_guess="pdf",
+        selected=True,
+    )
+
+    monkeypatch.setattr(
+        runner, "_fetch_with_mode", lambda mode, url, lightpanda_cdp_url=None: _FakeResponse()
+    )
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape.scrape_worker.extract_content",
+        lambda html: (
+            "text",
+            "# Admissions\n\nStudents can apply for admission, review tuition deadlines, and prepare academic records for enrollment.",
+            1200,
+            0.02,
+        ),
+    )
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape.scrape_worker.requests.get",
+        lambda url, timeout, stream=False: _FakeResponse(text="%PDF-1.7", content_type="application/pdf"),
+    )
+
+    class Source:
+        accepted = False
+
+        def to_dict(self):
+            return {"pdf_source_id": "pdf-bad", "path": str(tmp_path / "handbook.pdf"), "accepted": False}
+
+    class Quarantine:
+        reason = "low_text"
+        detail = "meaningful_chars=0 pages=1"
+
+        def to_dict(self):
+            return {"pdf_source_id": "pdf-bad", "reason": self.reason, "detail": self.detail}
+
+    monkeypatch.setattr(
+        "src.scrape_planner.scrape.scrape_worker.ingest_pdfs",
+        lambda paths, config: SimpleNamespace(sources=[Source()], chunks=[], quarantine=[Quarantine()]),
+    )
+
+    runner._execute("site-a", "run-mixed-pdf", items)
+
+    site_root = tmp_path / "sites" / "site-a"
+    registry_path = site_root / "raw_sources" / "registry.jsonl"
+    assert registry_path.exists()
+    rows = [json.loads(line) for line in registry_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    web_rows = [row for row in rows if str(row.get("source_kind") or "") == "web"]
+    pdf_rows = [row for row in rows if str(row.get("source_kind") or "") == "pdf"]
+    assert len(web_rows) == 4
+    assert pdf_rows
+    assert any(str(row.get("status") or "") == "failed" for row in pdf_rows)
+    assert any(str(row.get("original_url") or "") == pdf_url for row in pdf_rows)
 
 
 def test_execute_retry_then_success(monkeypatch, tmp_path: Path):

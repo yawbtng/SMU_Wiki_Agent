@@ -67,6 +67,43 @@ def test_list_sites(client: TestClient) -> None:
     assert payload["sites"][0]["has_wiki"] is True
 
 
+def test_delete_site_removes_data_and_app_state(client: TestClient, tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    remove_root = data_root / "sites" / "remove-me.edu"
+    remove_root.mkdir(parents=True)
+    (remove_root / "raw_sources").mkdir()
+    write_json(
+        data_root / "app_state.json",
+        {
+            "active_workspace_id": "remove-me.edu",
+            "last_site_id": "remove-me.edu",
+            "workspaces": [
+                {"id": "demo.edu", "name": "demo.edu", "url": "https://demo.edu"},
+                {"id": "remove-me.edu", "name": "remove-me.edu", "url": "https://remove-me.edu"},
+            ],
+            "site_history": ["https://remove-me.edu", "https://demo.edu"],
+        },
+    )
+
+    response = client.delete("/api/sites/remove-me.edu")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted"] is True
+    assert payload["site_id"] == "remove-me.edu"
+    assert not remove_root.exists()
+    assert all(site["id"] != "remove-me.edu" for site in payload["sites"])
+    state = payload["app_state"]
+    assert state["active_workspace_id"] == ""
+    assert state["last_site_id"] == ""
+    assert all(item.get("id") != "remove-me.edu" for item in state["workspaces"])
+    assert "https://remove-me.edu" not in state["site_history"]
+
+
+def test_delete_site_not_found(client: TestClient) -> None:
+    response = client.delete("/api/sites/missing.example")
+    assert response.status_code == 404
+
+
 def test_site_overview_compact_payload(client: TestClient) -> None:
     response = client.get("/api/sites/demo.edu/overview")
     assert response.status_code == 200
@@ -228,6 +265,329 @@ def test_approved_urls_markdown_round_trip_draft_and_chat(client: TestClient, tm
     assert (site_root / "approved_urls_chat.jsonl").exists()
 
 
+def test_choose_dedman_analysis_uses_school_path_not_title_lexicon(client: TestClient, tmp_path: Path) -> None:
+    site_root = tmp_path / "data" / "sites" / "demo.edu"
+    write_json(
+        site_root / "discovered_urls.json",
+        [
+            {"url": "https://demo.edu/dedman/academics", "title": "Dedman Academics"},
+            {"url": "https://demo.edu/news/2021/01/01/dedman-professor-feature", "title": "Dedman Professor Feature"},
+            {"url": "https://demo.edu/cox/academics/mba", "title": "MBA"},
+            {"url": "https://demo.edu/giving/ways-to-give", "title": "Giving"},
+            {"url": "https://demo.edu/human-resources/benefits", "title": "Benefits"},
+        ],
+    )
+
+    response = client.post(
+        "/api/sites/demo.edu/approved-urls/chat",
+        json={"message": "how many urls could we select for Choose Dedman", "autosave": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["intent"] == "analyze"
+    analysis = response.json()["analysis"]
+    assert analysis["matched_eligible_total"] == 1
+    assert analysis["matched_groups"] == [{"subpath": "/dedman", "count": 1, "examples": ["https://demo.edu/dedman/academics"]}]
+    assert analysis["matched_school_roots"] == ["dedman"]
+    assert any(item["reason"] == "donor_advancement_or_alumni" for item in analysis["reject_reasons"])
+    assert any(item["reason"] == "hr_or_employee" for item in analysis["reject_reasons"])
+    assert "Top rejection reasons:" in response.json()["assistant_message"]
+
+
+def test_choose_dedman_analysis_prefers_scoped_rejected_samples(client: TestClient, tmp_path: Path) -> None:
+    site_root = tmp_path / "data" / "sites" / "demo.edu"
+    write_json(
+        site_root / "discovered_urls.json",
+        [
+            {"url": "https://demo.edu/giving/ways-to-give", "title": "Giving"},
+            {"url": "https://demo.edu/human-resources/benefits", "title": "Benefits"},
+            {"url": "https://demo.edu/dedman/academics", "title": "Dedman Academics"},
+            {"url": "https://demo.edu/dedman/news/archive", "title": "Dedman News Archive"},
+            {"url": "https://demo.edu/dedman/faculty/profiles/jane-doe", "title": "Faculty Profile"},
+        ],
+    )
+
+    response = client.post(
+        "/api/sites/demo.edu/approved-urls/chat",
+        json={"message": "how many urls could we select for Choose Dedman", "autosave": False},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    samples = payload["analysis"]["rejected_samples"]
+    assert samples == [
+        {"url": "https://demo.edu/dedman/news/archive", "reason": "generic_news_archive"},
+        {"url": "https://demo.edu/dedman/faculty/profiles/jane-doe", "reason": "staff_faculty_bio"},
+    ]
+    assert "Sample rejected noisy URLs:" in payload["assistant_message"]
+    assert "https://demo.edu/dedman/news/archive (generic_news_archive)" in payload["assistant_message"]
+
+
+def test_commit_filters_noisy_urls_and_reports_rejections(client: TestClient, tmp_path: Path) -> None:
+    site_root = tmp_path / "data" / "sites" / "demo.edu"
+    markdown = """# Approved URLs
+
+<!-- scrape-planner:approved-urls:v1 -->
+
+- [x] https://demo.edu/enrollment-services/registrar/transcripts
+- [x] https://demo.edu/human-resources/benefits
+- [x] https://demo.edu/news/archive
+"""
+
+    response = client.post(
+        "/api/sites/demo.edu/approved-urls/commit",
+        json={"markdown": markdown, "remove_terms": []},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["urls"] == ["https://demo.edu/enrollment-services/registrar/transcripts"]
+    assert payload["filtered_rejected_urls"] == [
+        {"url": "https://demo.edu/human-resources/benefits", "reason": "hr_or_employee"},
+        {"url": "https://demo.edu/news/archive", "reason": "generic_news_archive"},
+    ]
+    saved = (site_root / "approved_urls.md").read_text(encoding="utf-8")
+    assert "https://demo.edu/enrollment-services/registrar/transcripts" in saved
+    assert "https://demo.edu/human-resources/benefits" not in saved
+    assert "https://demo.edu/news/archive" not in saved
+
+
+def test_put_approved_urls_filters_noisy_urls_and_normalizes_markdown(client: TestClient, tmp_path: Path) -> None:
+    site_root = tmp_path / "data" / "sites" / "demo.edu"
+    markdown = """# Approved URLs
+
+<!-- scrape-planner:approved-urls:v1 -->
+
+Keep this prose https://demo.edu/enrollment-services/registrar/transcripts
+- [ ] https://demo.edu/student-life/housing
+- [x] https://demo.edu/aboutsmu/office-of-the-president/messages
+- [x] https://demo.edu/development/ways-to-give
+"""
+
+    response = client.put("/api/sites/demo.edu/approved-urls", json={"markdown": markdown})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["urls"] == [
+        "https://demo.edu/enrollment-services/registrar/transcripts",
+        "https://demo.edu/student-life/housing",
+    ]
+    assert payload["filtered_rejected_urls"] == [
+        {"url": "https://demo.edu/aboutsmu/office-of-the-president/messages", "reason": "governance_or_admin"},
+        {"url": "https://demo.edu/development/ways-to-give", "reason": "donor_advancement_or_alumni"},
+    ]
+    assert payload["markdown"] == (
+        "# Approved URLs\n\n"
+        "<!-- scrape-planner:approved-urls:v1 -->\n\n"
+        "## Approved for next scrape\n\n"
+        "- [x] https://demo.edu/enrollment-services/registrar/transcripts\n"
+        "- [x] https://demo.edu/student-life/housing\n"
+    )
+    saved = (site_root / "approved_urls.md").read_text(encoding="utf-8")
+    assert saved == payload["markdown"]
+    assert "Keep this prose" not in saved
+    assert "- [ ]" not in saved
+
+
+def test_choose_dedman_approve_does_not_add_unrelated_lexical_matches(client: TestClient, tmp_path: Path) -> None:
+    site_root = tmp_path / "data" / "sites" / "demo.edu"
+    write_json(
+        site_root / "discovered_urls.json",
+        [
+            {"url": "https://demo.edu/dedman/academics", "title": "Dedman Academics"},
+            {"url": "https://demo.edu/dedmanlaw/academics", "title": "Dedman Law Academics"},
+            {"url": "https://demo.edu/news/2021/01/01/dedman-professor-feature", "title": "Dedman Professor Feature"},
+            {"url": "https://demo.edu/cox/academics/mba", "title": "MBA"},
+        ],
+    )
+
+    response = client.post(
+        "/api/sites/demo.edu/approved-urls/chat",
+        json={"message": "choose dedman", "autosave": True, "limit": 20},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 1
+    assert payload["urls"] == ["https://demo.edu/dedman/academics"]
+    assert payload["added"] == [{"url": "https://demo.edu/dedman/academics", "reason": "subpath:/dedman"}]
+
+
+@pytest.mark.parametrize("message", ["choose law", "choose dedman law", "choose dedmanlaw"])
+def test_choose_law_phrases_scope_to_dedman_law_only(client: TestClient, tmp_path: Path, message: str) -> None:
+    site_root = tmp_path / "data" / "sites" / "demo.edu"
+    write_json(
+        site_root / "discovered_urls.json",
+        [
+            {"url": "https://demo.edu/law/academics", "title": "Law Academics"},
+            {"url": "https://demo.edu/law/admission/apply", "title": "Law Apply"},
+            {"url": "https://demo.edu/dedmanlaw/academics", "title": "Dedman Law Academics"},
+            {"url": "https://demo.edu/dedmanlaw/admission/apply", "title": "Dedman Law Apply"},
+            {"url": "https://demo.edu/dedman/academics", "title": "Dedman College Academics"},
+            {"url": "https://demo.edu/student-life/law-housing", "title": "Law Student Housing"},
+            {"url": "https://demo.edu/news/2024/05/01/dedman-law-story", "title": "Dedman Law Story"},
+        ],
+    )
+
+    response = client.post(
+        "/api/sites/demo.edu/approved-urls/chat",
+        json={"message": message, "autosave": True, "limit": 20},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["urls"] == [
+        "https://demo.edu/dedmanlaw/academics",
+        "https://demo.edu/dedmanlaw/admission/apply",
+        "https://demo.edu/law/academics",
+        "https://demo.edu/law/admission/apply",
+    ]
+    assert payload["groups"] == [
+        {
+            "subpath": "/dedmanlaw",
+            "count": 2,
+            "examples": [
+                "https://demo.edu/dedmanlaw/academics",
+                "https://demo.edu/dedmanlaw/admission/apply",
+            ],
+        },
+        {
+            "subpath": "/law",
+            "count": 2,
+            "examples": [
+                "https://demo.edu/law/academics",
+                "https://demo.edu/law/admission/apply",
+            ],
+        }
+    ]
+    assert payload["added"] == [
+        {"url": "https://demo.edu/law/academics", "reason": "subpath:/law"},
+        {"url": "https://demo.edu/law/admission/apply", "reason": "subpath:/law"},
+        {"url": "https://demo.edu/dedmanlaw/academics", "reason": "subpath:/dedmanlaw"},
+        {"url": "https://demo.edu/dedmanlaw/admission/apply", "reason": "subpath:/dedmanlaw"},
+    ]
+    assert "https://demo.edu/dedman/academics" not in payload["markdown"]
+    assert "https://demo.edu/student-life/law-housing" not in payload["markdown"]
+    assert "https://demo.edu/news/2024/05/01/dedman-law-story" not in payload["markdown"]
+
+
+@pytest.mark.parametrize("message", ["choose law", "choose dedman law", "choose dedmanlaw"])
+def test_law_analysis_scopes_to_law_roots_only(client: TestClient, tmp_path: Path, message: str) -> None:
+    site_root = tmp_path / "data" / "sites" / "demo.edu"
+    write_json(
+        site_root / "discovered_urls.json",
+        [
+            {"url": "https://demo.edu/law/academics", "title": "Law Academics"},
+            {"url": "https://demo.edu/law/admission/apply", "title": "Law Apply"},
+            {"url": "https://demo.edu/dedmanlaw/academics", "title": "Dedman Law Academics"},
+            {"url": "https://demo.edu/dedmanlaw/admission/apply", "title": "Dedman Law Apply"},
+            {"url": "https://demo.edu/dedman/academics", "title": "Dedman College Academics"},
+            {"url": "https://demo.edu/student-life/law-housing", "title": "Law Student Housing"},
+            {"url": "https://demo.edu/news/2024/05/01/dedman-law-story", "title": "Dedman Law Story"},
+        ],
+    )
+
+    response = client.post(
+        "/api/sites/demo.edu/approved-urls/chat",
+        json={"message": f"how many urls could we select for {message}", "autosave": False},
+    )
+
+    assert response.status_code == 200
+    analysis = response.json()["analysis"]
+    assert analysis["matched_school_roots"] == ["dedmanlaw", "law"]
+    assert analysis["matched_eligible_total"] == 4
+    assert analysis["matched_groups"] == [
+        {
+            "subpath": "/dedmanlaw",
+            "count": 2,
+            "examples": [
+                "https://demo.edu/dedmanlaw/academics",
+                "https://demo.edu/dedmanlaw/admission/apply",
+            ],
+        },
+        {
+            "subpath": "/law",
+            "count": 2,
+            "examples": [
+                "https://demo.edu/law/academics",
+                "https://demo.edu/law/admission/apply",
+            ],
+        },
+    ]
+
+
+def test_approved_url_chat_autosave_returns_filtered_payload(client: TestClient, tmp_path: Path) -> None:
+    site_root = tmp_path / "data" / "sites" / "demo.edu"
+    write_json(
+        site_root / "discovered_urls.json",
+        [{"url": "https://demo.edu/student-life/housing", "title": "Housing"}],
+    )
+    (site_root / "approved_urls.md").write_text(
+        "# Approved URLs\n\n"
+        "<!-- scrape-planner:approved-urls:v1 -->\n\n"
+        "- [x] https://demo.edu/human-resources/benefits\n",
+        encoding="utf-8",
+    )
+
+    response = client.post(
+        "/api/sites/demo.edu/approved-urls/chat",
+        json={"message": "approve path:/student-life/housing", "autosave": True, "limit": 20},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["urls"] == ["https://demo.edu/student-life/housing"]
+    assert payload["count"] == 1
+    assert "https://demo.edu/human-resources/benefits" not in payload["markdown"]
+    assert payload["filtered_rejected_urls"] == [
+        {"url": "https://demo.edu/human-resources/benefits", "reason": "hr_or_employee"}
+    ]
+    saved = (site_root / "approved_urls.md").read_text(encoding="utf-8")
+    assert saved == payload["markdown"]
+    assert "https://demo.edu/human-resources/benefits" not in saved
+    assert "https://demo.edu/student-life/housing" in saved
+
+
+def test_approved_url_area_addition_preserves_root_pages_and_pdf(client: TestClient, tmp_path: Path) -> None:
+    site_root = tmp_path / "data" / "sites" / "demo.edu"
+    write_json(
+        site_root / "discovered_urls.json",
+        [
+            {"url": "https://demo.edu/", "title": "Home"},
+            {"url": "https://demo.edu/pages/admissions.html", "title": "Admissions"},
+            {"url": "https://demo.edu/pages/calendar.html", "title": "Calendar"},
+            {"url": "https://demo.edu/pages/tuition.html", "title": "Tuition"},
+            {"url": "https://demo.edu/docs/student-handbook.pdf", "title": "Student Handbook"},
+        ],
+    )
+
+    response = client.post(
+        "/api/sites/demo.edu/approved-urls/chat",
+        json={
+            "message": (
+                "approve path:/ path:/pages/admissions.html path:/pages/calendar.html "
+                "path:/pages/tuition.html path:/docs/student-handbook.pdf"
+            ),
+            "autosave": True,
+            "limit": 20,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 5
+    assert set(payload["urls"]) == {
+        "https://demo.edu/",
+        "https://demo.edu/docs/student-handbook.pdf",
+        "https://demo.edu/pages/admissions.html",
+        "https://demo.edu/pages/calendar.html",
+        "https://demo.edu/pages/tuition.html",
+    }
+    markdown = (site_root / "approved_urls.md").read_text(encoding="utf-8")
+    assert "https://demo.edu/" in markdown
+    assert "https://demo.edu/docs/student-handbook.pdf" in markdown
+
+
 def test_sse_event_helper() -> None:
     framed = sse_event("site", {"ok": True})
     assert framed.startswith("event: site\n")
@@ -260,6 +620,99 @@ def test_document_preview_rejects_path_escape(client: TestClient) -> None:
     assert response.status_code == 400
 
 
+def test_document_upload_extracts_pdf_and_refreshes_registry(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.scrape_planner.pdf_contracts import PdfChunkRow, PdfSourceRow
+    from src.scrape_planner.pdf.pdf_ingest import PdfIngestResult
+    from src.scrape_planner.sources.raw_source_normalizer import NormalizationReport
+
+    captured: dict[str, object] = {}
+
+    def fake_ingest(paths: list[Path], config: object) -> PdfIngestResult:
+        captured["paths"] = paths
+        captured["page_markdown_dir"] = getattr(config, "page_markdown_dir", None)
+        page_dir = Path(str(captured["page_markdown_dir"])) / "pdf123"
+        page_dir.mkdir(parents=True)
+        page_path = page_dir / "page-0001.md"
+        page_path.write_text("Admissions document page.", encoding="utf-8")
+        (page_dir / "pages.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "pdf_source_id": "pdf123",
+                        "source_path": str(paths[0]),
+                        "page_number": 1,
+                        "parser": "markitdown",
+                        "markdown_path": str(page_path),
+                        "char_count": 25,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return PdfIngestResult(
+            sources=[PdfSourceRow("pdf123", str(paths[0]), 21, 1, True, "now")],
+            chunks=[PdfChunkRow("chunk123", "pdf123", 1, 0, "Admissions document page.", 25, "now")],
+            quarantine=[],
+        )
+
+    def fake_normalize(site_root: Path) -> NormalizationReport:
+        captured["normalized_site_root"] = site_root
+        registry = site_root / "raw_sources" / "registry.jsonl"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text(
+            json.dumps(
+                {
+                    "source_id": "rawpdf123",
+                    "source_kind": "pdf",
+                    "status": "ready",
+                    "title": "catalog.pdf p. 1",
+                    "markdown_path": "raw_sources/pdf/rawpdf123.md",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return NormalizationReport(
+            counts={"added": 1, "updated": 0, "unchanged": 0, "removed": 0},
+            registry_path=str(registry),
+            report_path=str(site_root / "raw_sources" / "reports" / "normalization-pdf-test.json"),
+            sources=[],
+        )
+
+    monkeypatch.setattr("src.scrape_planner.webapp.api.ingest_pdfs", fake_ingest)
+    monkeypatch.setattr("src.scrape_planner.webapp.api.normalize_pdf_pages", fake_normalize)
+
+    response = client.post(
+        "/api/sites/demo.edu/documents/upload",
+        files=[("files", ("catalog.pdf", b"%PDF-1.7 fake content", "application/pdf"))],
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["uploaded_count"] == 1
+    assert payload["accepted_count"] == 1
+    assert payload["chunk_count"] == 1
+    assert payload["registry"]["counts"]["added"] == 1
+    upload_path = tmp_path / "data" / "sites" / "demo.edu" / "sources" / "pdf_uploads" / "catalog.pdf"
+    assert upload_path.exists()
+    assert captured["paths"] == [upload_path]
+    assert captured["page_markdown_dir"] == tmp_path / "data" / "sites" / "demo.edu" / "sources" / "pdf_pages"
+    manifest = json.loads((tmp_path / "data" / "sites" / "demo.edu" / "sources" / "pdf_manifest.json").read_text(encoding="utf-8"))
+    assert manifest == [{"path": str(upload_path), "filename": "catalog.pdf", "uploaded_at": payload["uploaded"][0]["uploaded_at"]}]
+    ingest_dir = tmp_path / "data" / "sites" / "demo.edu" / "sources" / "pdf_ingest"
+    assert "pdf123" in (ingest_dir / "pdf_sources.jsonl").read_text(encoding="utf-8")
+    assert "chunk123" in (ingest_dir / "pdf_chunks.jsonl").read_text(encoding="utf-8")
+
+
+def test_document_upload_route_is_exposed_in_openapi(client: TestClient) -> None:
+    response = client.get("/openapi.json")
+
+    assert response.status_code == 200
+    assert "/api/sites/{site_id}/documents/upload" in response.json()["paths"]
+
+
 def write_embedding_ready_site(data_root: Path, *, changed: int = 3, embedding_enabled: bool = True) -> Path:
     site_root = data_root / "sites" / "demo.edu"
     raw_sources = site_root / "raw_sources"
@@ -286,6 +739,16 @@ def write_embedding_ready_site(data_root: Path, *, changed: int = 3, embedding_e
         },
     )
     write_json(data_root / "app_state.json", {"embedding_enabled": embedding_enabled})
+    write_json(
+        indexes_dir / "llm_wiki_manifest.json",
+        {
+            "status": "ready",
+            "version": "llm-wiki-hybrid-v2",
+            "wiki_index_count": 2,
+            "raw_index_count": 5,
+            "vector_store": {"ready": True, "backend": "zvec", "documents": 7},
+        },
+    )
     return site_root
 
 
@@ -318,6 +781,23 @@ def test_overview_does_not_auto_queue_when_embeddings_disabled(tmp_path: Path, m
     assert embeddings["auto_rebuild_reason"] == "embedding_disabled"
     assert embeddings["job_state"]["status"] == "idle"
     assert not (site_root / "indexes" / "embedding-job-latest.json").exists()
+
+
+def test_embedding_rebuild_blocked_without_prerequisites(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data_root = tmp_path / "data"
+    site_root = data_root / "sites" / "demo.edu"
+    (site_root / "raw_sources").mkdir(parents=True)
+    (site_root / "raw_sources" / "registry.jsonl").write_text("", encoding="utf-8")
+    write_json(data_root / "app_state.json", {"embedding_enabled": True})
+    monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(data_root))
+
+    response = TestClient(create_app()).post("/api/sites/demo.edu/embeddings/rebuild")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "prerequisites_unhealthy"
+    assert payload["job_state"]["status"] != "running"
 
 
 def test_embedding_rebuild_endpoint_coalesces_running_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -655,3 +1135,73 @@ def test_site_job_status(client: TestClient, tmp_path: Path) -> None:
     payload = response.json()
     assert payload["skill"] == "site-discovery"
     assert payload["report"]["status"] == "completed"
+
+
+def test_mcp_universities_excludes_non_query_ready_indexes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data_root = tmp_path / "data"
+    sites = data_root / "sites"
+    v1_site = sites / "127.0.0.1:8765"
+    v2_site = sites / "127.0.0.1:8766"
+    for site_root in (v1_site, v2_site):
+        (site_root / "wiki" / "pages").mkdir(parents=True)
+        (site_root / "wiki" / "pages" / "index.md").write_text("# Wiki\n", encoding="utf-8")
+        (site_root / "indexes").mkdir(parents=True)
+    write_json(
+        v1_site / "indexes" / "llm_wiki_manifest.json",
+        {
+            "status": "ready",
+            "version": "llm-wiki-hybrid-v1",
+            "wiki_index_count": 3,
+            "raw_index_count": 3,
+        },
+    )
+    write_json(
+        v2_site / "indexes" / "llm_wiki_manifest.json",
+        {
+            "status": "ready",
+            "version": "llm-wiki-hybrid-v2",
+            "wiki_index_count": 3,
+            "raw_index_count": 3,
+            "vector_store": {"ready": True, "backend": "zvec", "documents": 3},
+        },
+    )
+    monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(data_root))
+
+    response = TestClient(create_app()).get("/api/mcp/universities")
+
+    assert response.status_code == 200
+    payload = response.json()
+    rows = {row["site_id"]: row for row in payload["universities"]}
+    assert payload["ready_count"] == 1
+    assert rows["127.0.0.1:8765"]["mcp_enabled"] is False
+    assert rows["127.0.0.1:8765"]["mcp_block_reason"]
+    assert "version" in rows["127.0.0.1:8765"]["mcp_block_reason"].lower()
+    assert rows["127.0.0.1:8766"]["mcp_enabled"] is True
+
+
+def test_wiki_job_status_marks_stale_pi_model_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.scrape_planner.app.job_launcher import job_status_payload
+
+    site_root = tmp_path / "sites" / "demo.edu"
+    reports = site_root / "wiki" / "reports"
+    reports.mkdir(parents=True)
+    events_path = reports / "wiki-build.events.jsonl"
+    events_path.write_text(
+        json.dumps({"type": "stderr", "message": 'Warning: No models match pattern "github-copilot/gpt-4o"'}) + "\n",
+        encoding="utf-8",
+    )
+    write_json(
+        reports / "wiki-build-latest.json",
+        {
+            "status": "running",
+            "job_status": "running",
+            "tmux_session": "wiki-demo-old",
+            "pi_events_path": str(events_path),
+        },
+    )
+    monkeypatch.setattr("src.scrape_planner.wiki.wiki_launcher.tmux_session_alive", lambda *args, **kwargs: False)
+
+    payload = job_status_payload(site_root, "llm-wiki-noninteractive")
+
+    assert payload["report"]["job_status"] == "failed"
+    assert "no models match pattern" in str(payload["report"]["last_error"]).lower()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from ..runtime.agent_run_metrics import STANDARD_WINDOWS
@@ -62,6 +62,10 @@ def register_routes(app: FastAPI) -> None:
     @app.get("/api/sites")
     def list_sites() -> dict[str, Any]:
         return to_jsonable(payloads.list_sites_payload())
+
+    @app.delete("/api/sites/{site_id}")
+    def delete_site(site_id: str) -> dict[str, Any]:
+        return to_jsonable(payloads.delete_site_payload(site_id))
 
     @app.get("/api/mcp/status")
     def global_mcp_status() -> dict[str, Any]:
@@ -250,6 +254,13 @@ def register_routes(app: FastAPI) -> None:
     @app.get("/api/sites/{site_id}/document-preview")
     def document_preview(site_id: str, path: str, limit_chars: int = Query(80_000, ge=1, le=500_000)) -> dict[str, Any]:
         return to_jsonable(payloads.site_relative_text_payload(site_id, path, limit_chars=limit_chars))
+
+    @app.post("/api/sites/{site_id}/documents/upload")
+    async def upload_documents(site_id: str, files: list[UploadFile] = File(...)) -> dict[str, Any]:
+        uploads = []
+        for item in files:
+            uploads.append({"filename": item.filename or "document.pdf", "content": await item.read()})
+        return to_jsonable(payloads.upload_documents_payload(site_id, uploads))
 
     @app.get("/api/stream/sites/{site_id}")
     async def stream_site(site_id: str, request: Request, interval: float = Query(2.5, ge=0.5, le=10.0)) -> StreamingResponse:

@@ -114,6 +114,96 @@ def test_web_quality_gate_quarantines_pdf_markdown_with_diagnostic(tmp_path: Pat
     assert stored_report["quality_summary"]["counts"]["quarantined"] == 1
 
 
+def test_failed_pdf_manifest_with_web_successes_registers_pdf_failure(tmp_path: Path) -> None:
+    site_root = ensure_site_layout(tmp_path, "site-1").site_root
+    run_root = site_root / "run-mixed"
+    run_root.mkdir(parents=True)
+    for index in range(4):
+        markdown = run_root / "markdown" / f"page{index}.md"
+        markdown.parent.mkdir(parents=True, exist_ok=True)
+        markdown.write_text(
+            f"# Page {index}\n\nAdmissions, tuition, and enrollment requirements for students.\n",
+            encoding="utf-8",
+        )
+    pdf_path = run_root / "pdf_downloads" / "handbook.pdf"
+    pdf_path.parent.mkdir(parents=True)
+    pdf_path.write_bytes(b"%PDF-1.4")
+    metadata = run_root / "metadata" / "handbook.json"
+    metadata.parent.mkdir(parents=True)
+    write_json(
+        metadata,
+        {
+            "url": "https://example.edu/handbook.pdf",
+            "fetch_mode": "pdf",
+            "pdf_path": str(pdf_path),
+            "pdf_quarantine": [{"reason": "low_text", "detail": "meaningful_chars=0 pages=1"}],
+        },
+    )
+    write_json(
+        run_root / "scrape_manifest.json",
+        [
+            {
+                "url": f"https://example.edu/page{index}",
+                "status": "success",
+                "fetch_mode": "fetcher",
+                "markdown_path": str(run_root / "markdown" / f"page{index}.md"),
+            }
+            for index in range(4)
+        ]
+        + [
+            {
+                "url": "https://example.edu/handbook.pdf",
+                "status": "failed",
+                "fetch_mode": "pdf",
+                "failure_reason": "ocr_required",
+                "metadata_path": str(metadata),
+                "pdf_path": str(pdf_path),
+                "raw_html_path": str(pdf_path),
+            }
+        ],
+    )
+    s05 = run_root / "s05"
+    s05.mkdir(parents=True)
+    (s05 / "pdf_sources.jsonl").write_text(
+        json.dumps(
+            {
+                "pdf_source_id": "pdf-low-text",
+                "path": str(pdf_path),
+                "accepted": False,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (s05 / "pdf_quarantine.jsonl").write_text(
+        json.dumps(
+            {
+                "pdf_source_id": "pdf-low-text",
+                "path": str(pdf_path),
+                "reason": "low_text",
+                "detail": "meaningful_chars=0 pages=1",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    web_report = normalize_scraped_markdown(site_root, run_root, now=NOW)
+    pdf_report = normalize_pdf_pages(site_root, now=NOW)
+
+    rows = read_registry_rows(site_root / "raw_sources" / "registry.jsonl")
+    web_rows = [row for row in rows if row["source_kind"] == "web"]
+    pdf_rows = [row for row in rows if row["source_kind"] == "pdf"]
+
+    assert web_report.counts["ready"] == 4
+    assert len(web_rows) == 4
+    assert len(pdf_rows) == 1
+    assert pdf_report.counts["failed"] == 1
+    assert pdf_rows[0]["status"] == "failed"
+    assert pdf_rows[0]["original_url"] == "https://example.edu/handbook.pdf"
+    assert pdf_rows[0]["error_reason"] in {"ocr_required", "low_text"}
+
+
 def test_successful_pdf_scrape_without_markdown_path_is_skipped_by_web_normalizer(tmp_path: Path) -> None:
     site_root = ensure_site_layout(tmp_path, "site-1").site_root
     run_root = site_root / "run-001"

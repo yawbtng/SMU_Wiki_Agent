@@ -104,6 +104,9 @@ WEBAPP_FRONTEND_PORT=$WEBAPP_FRONTEND_PORT
 # Reload blocks shutdown while SSE clients are connected; default off for ./start.sh.
 WEBAPP_RELOAD=${WEBAPP_RELOAD:-0}
 EOF
+  if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+    printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY" >>"$env_file"
+  fi
 }
 
 webapp_backend_command() {

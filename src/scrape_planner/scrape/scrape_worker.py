@@ -22,6 +22,7 @@ from ..pdf.pdf_ingest import PdfIngestConfig, ingest_pdfs
 from ..runtime.run_persistence import read_page_states, upsert_page_state, write_page_states, write_run_status
 from ..runtime.state import RunStateStore
 from ..core.storage import ensure_run_dirs, read_jsonl, write_json
+from ..sources.raw_source_normalizer import normalize_pdf_pages, normalize_scraped_markdown
 
 try:
     from scrapling.fetchers import Fetcher, PlayWrightFetcher
@@ -47,6 +48,14 @@ def _safe_pdf_filename(url: str) -> str:
 def _is_pdf_url(item: DiscoveredURL) -> bool:
     content_guess = str(item.content_type_guess or "").lower()
     return urlparse(item.url).path.lower().endswith(".pdf") or "pdf" in content_guess
+
+
+def _pdf_artifact_row(row: dict[str, Any], original_url: str) -> dict[str, Any]:
+    payload = dict(row)
+    if original_url and not str(payload.get("original_url") or payload.get("url") or "").strip():
+        payload["original_url"] = original_url
+        payload["url"] = original_url
+    return payload
 
 
 def _utc_now_iso() -> str:
@@ -494,20 +503,21 @@ class ScrapeRunner:
                             run_id=run_id,
                         )
                         pdf_result = ingest_pdfs([pdf_path], PdfIngestConfig())
+                        pdf_url = item.url
                         with pdf_lock:
                             _merge_jsonl_rows(
                                 run_root / "s05" / "pdf_sources.jsonl",
-                                [row.to_dict() for row in pdf_result.sources],
+                                [_pdf_artifact_row(row.to_dict(), pdf_url) for row in pdf_result.sources],
                                 key="pdf_source_id",
                             )
                             _merge_jsonl_rows(
                                 run_root / "s05" / "pdf_chunks.jsonl",
-                                [row.to_dict() for row in pdf_result.chunks],
+                                [_pdf_artifact_row(row.to_dict(), pdf_url) for row in pdf_result.chunks],
                                 key="chunk_id",
                             )
                             _merge_jsonl_rows(
                                 run_root / "s05" / "pdf_quarantine.jsonl",
-                                [row.to_dict() for row in pdf_result.quarantine],
+                                [_pdf_artifact_row(row.to_dict(), pdf_url) for row in pdf_result.quarantine],
                                 key="pdf_source_id",
                             )
                         accepted = any(row.accepted for row in pdf_result.sources)
@@ -536,6 +546,8 @@ class ScrapeRunner:
                                 page["failure_reason"] = reason
                                 page["fetch_mode"] = "pdf"
                                 page["metadata_path"] = str(meta_path)
+                                page["pdf_path"] = str(pdf_path)
+                                page["raw_html_path"] = str(pdf_path)
                                 page["text_length"] = 0
                                 page["link_density"] = 0.0
                                 page["finished_at"] = _utc_now_iso()
@@ -906,6 +918,39 @@ class ScrapeRunner:
             pages_final = _pages_snapshot_locked()
         write_json(run_root / "scrape_manifest.json", pages_final)
         write_json(run_root / "failures.json", failures)
+        if status.get("state") == "completed" and (
+            int(status.get("success") or 0) > 0 or int(status.get("failed") or 0) > 0
+        ):
+            site_root = self.base_data_dir / "sites" / site_id
+            try:
+                report = normalize_scraped_markdown(site_root, run_root)
+                pdf_report = normalize_pdf_pages(site_root)
+            except Exception as exc:
+                self.state.push_event(
+                    site_id,
+                    run_id,
+                    {
+                        "ts": _utc_now_iso(),
+                        "event": "raw_source_normalization_failed",
+                        "status": "failed",
+                        "error": str(exc),
+                    },
+                )
+            else:
+                self.state.push_event(
+                    site_id,
+                    run_id,
+                    {
+                        "ts": _utc_now_iso(),
+                        "event": "raw_source_registry_updated",
+                        "status": "completed",
+                        "registry_path": report.registry_path,
+                        "report_path": report.report_path,
+                        "counts": report.counts,
+                        "pdf_report_path": pdf_report.report_path,
+                        "pdf_counts": pdf_report.counts,
+                    },
+                )
 
 
 def _merge_jsonl_rows(path: Path, rows: list[dict[str, Any]], *, key: str) -> None:

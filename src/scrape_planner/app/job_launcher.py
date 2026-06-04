@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shlex
 import shutil
 from pathlib import Path
@@ -14,10 +15,51 @@ from ..core.wiki_common import session_timestamp_slug
 from ..infra.tmux_runner import TmuxRunner
 from ..infra.tmux_session_shell import sanitize_tmux_session_name
 from ..sources.source_registry import utc_now_iso
-from ..wiki.stepper_status import tmux_session_alive
+from ..wiki.stepper_status import reconcile_tmux_job_status, tmux_session_alive
 from .operator_skills import OperatorSkillSpec, get_operator_skill, skill_script_path
 from .pi_agent import build_pi_json_command, pi_events_filename
 from .tmux_settings import pi_cmd, tmux_archive_sessions, tmux_session_grace_seconds
+
+
+def _wiki_runtime_failure(events: list[dict[str, Any]]) -> str | None:
+    needles = (
+        "no models match pattern",
+        "model not available",
+        "authentication failed",
+        "invalid api key",
+    )
+    for event in events:
+        blob = json.dumps(event, ensure_ascii=True).lower()
+        for needle in needles:
+            if needle in blob:
+                return f"Pi runtime unavailable: {needle}."
+    return None
+
+
+def _reconcile_wiki_build_report(report_path: Path, report: dict[str, Any], *, tmux: TmuxRunner, pi_events: list[dict[str, Any]]) -> dict[str, Any]:
+    session = str(report.get("tmux_session") or "")
+    reported_status = str(report.get("status") or report.get("job_status") or "")
+    reconciled = reconcile_tmux_job_status(reported_status, session, runner=tmux)
+    runtime_failure = _wiki_runtime_failure(pi_events) if reconciled.get("stale_running") else None
+    if runtime_failure and report_path.exists():
+        report = {
+            **report,
+            "status": "failed",
+            "job_status": "failed",
+            "last_error": runtime_failure,
+            "updated_at": utc_now_iso(),
+            "job_finished_at": utc_now_iso(),
+        }
+        write_json(report_path, report)
+        reconciled = reconcile_tmux_job_status("failed", session, runner=tmux)
+    return {
+        **report,
+        "job_status": reconciled["job_status"],
+        "reported_job_status": reconciled["reported_job_status"],
+        "stale_running": reconciled["stale_running"],
+        "tmux_session_alive": reconciled["tmux_session_alive"],
+        "last_error": str(report.get("last_error") or runtime_failure or ""),
+    }
 
 
 def site_jobs_report_dir(site_root: Path) -> Path:
@@ -134,24 +176,19 @@ def job_status_payload(site_root: Path, skill_id: str) -> dict[str, Any]:
         tmux = TmuxRunner()
         active = _active_session(report_path, tmux)
         report = read_json(report_path, {})
-        stale_running = bool(
-            report
-            and str(report.get("status") or report.get("job_status") or "").lower()
-            in {"running", "starting", "initializing"}
-            and not active
-        )
         events_path = report.get("pi_events_path")
         pi_events: list[dict[str, Any]] = []
         if events_path:
             from .pi_agent import read_pi_events_after
 
             pi_events, _ = read_pi_events_after(Path(events_path), 0, limit=200)
+        report = _reconcile_wiki_build_report(report_path, report, tmux=tmux, pi_events=pi_events)
         return {
             "skill": skill_id,
             "report_path": str(report_path),
             "report": report,
             "tmux_session": active or str(report.get("tmux_session") or ""),
-            "stale_running": stale_running,
+            "stale_running": bool(report.get("stale_running")),
             "pi_events_path": events_path or "",
             "pi_events": pi_events,
             "generated_at": utc_now_iso(),

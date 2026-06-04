@@ -44,9 +44,36 @@ def normalize_scraped_markdown(site_root: Path, run_root: Path, *, now: str | No
     seen_checksums: set[str] = set()
 
     for item in manifest if isinstance(manifest, list) else []:
-        if not isinstance(item, dict) or str(item.get("status") or "") != "success":
+        if not isinstance(item, dict):
             continue
         url = str(item.get("url") or "")
+        fetch_mode = str(item.get("fetch_mode") or "").lower()
+        metadata = _manifest_item_metadata(item, Path(run_root))
+        if fetch_mode != "pdf" and _manifest_fetch_mode(metadata) == "pdf":
+            fetch_mode = "pdf"
+        if _is_pdf_manifest_item(item, metadata):
+            pdf_path = _manifest_pdf_path(item, metadata)
+            if str(item.get("status") or "") != "success":
+                rows.append(
+                    _failed_row(
+                        layout.site_root,
+                        source_kind="pdf",
+                        title=_title_from_identity(url or "PDF source"),
+                        identity=url or pdf_path or str(item.get("raw_html_path") or ""),
+                        original_url=url,
+                        original_path=pdf_path,
+                        parser="scrape_worker.pdf",
+                        error_reason=_pdf_manifest_error_reason(item, metadata),
+                        now=timestamp,
+                        provenance={
+                            "run_root": str(run_root),
+                            "scrape_manifest_path": str(Path(run_root) / "scrape_manifest.json"),
+                        },
+                    )
+                )
+            continue
+        if str(item.get("status") or "") != "success":
+            continue
         raw_markdown_path = str(item.get("markdown_path") or "").strip()
         if not raw_markdown_path:
             continue
@@ -201,6 +228,7 @@ def normalize_pdf_pages(site_root: Path, *, now: str | None = None) -> Normaliza
     layout = ensure_layout_for_site_root(site_root)
     rows: list[dict[str, Any]] = []
     pages_root = layout.site_root / "sources" / "pdf_pages"
+    pdf_url_index = _scrape_pdf_url_index(layout.site_root)
 
     page_groups: dict[str, list[dict[str, Any]]] = {}
     if pages_root.exists():
@@ -220,6 +248,7 @@ def normalize_pdf_pages(site_root: Path, *, now: str | None = None) -> Normaliza
             timestamp,
             skip_pdf_source_ids=set(page_groups),
             skip_source_ids={str(row.get("source_id") or "") for row in rows},
+            pdf_url_index=pdf_url_index,
         )
     )
 
@@ -572,11 +601,13 @@ def _normalize_pdf_chunk_fallbacks(
     *,
     skip_pdf_source_ids: set[str] | None = None,
     skip_source_ids: set[str] | None = None,
+    pdf_url_index: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     layout = ensure_layout_for_site_root(site_root)
     skipped = skip_pdf_source_ids or set()
     protected_source_ids = {source_id for source_id in (skip_source_ids or set()) if source_id}
     rows_by_source_id: dict[str, dict[str, Any]] = {}
+    url_index = pdf_url_index or _scrape_pdf_url_index(layout.site_root)
     site_ingest_dir = (layout.site_root / "sources" / "pdf_ingest").resolve()
     for artifact_dir in _pdf_ingest_artifact_dirs(layout.site_root):
         is_site_level_artifact = artifact_dir.resolve() == site_ingest_dir
@@ -606,7 +637,7 @@ def _normalize_pdf_chunk_fallbacks(
                 or (chunks[0].get("source_path") if chunks else "")
                 or ""
             )
-            original_url = _pdf_original_url(source, quarantine, chunks)
+            original_url = _pdf_original_url(source, quarantine, chunks) or _lookup_scraped_pdf_url(url_index, source_path)
             source_identity = _pdf_identity(original_url, source_path, pdf_source_id)
             source_id = stable_source_id("pdf", source_identity)
             if source_id in protected_source_ids:
@@ -984,6 +1015,88 @@ def _first_text(rows: list[dict[str, Any]], *keys: str) -> str:
             if value:
                 return value
     return ""
+
+
+def _manifest_item_metadata(item: dict[str, Any], run_root: Path) -> dict[str, Any]:
+    metadata_path = str(item.get("metadata_path") or "").strip()
+    if not metadata_path:
+        return {}
+    payload = read_json(_manifest_path(metadata_path, run_root), {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _manifest_fetch_mode(metadata: dict[str, Any]) -> str:
+    return str(metadata.get("fetch_mode") or "").lower()
+
+
+def _manifest_pdf_path(item: dict[str, Any], metadata: dict[str, Any]) -> str:
+    for value in (
+        item.get("pdf_path"),
+        item.get("raw_html_path"),
+        metadata.get("pdf_path"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _is_pdf_manifest_item(item: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    fetch_mode = str(item.get("fetch_mode") or "").lower()
+    if fetch_mode == "pdf" or _manifest_fetch_mode(metadata) == "pdf":
+        return True
+    url = str(item.get("url") or "").strip()
+    return url.lower().endswith(".pdf")
+
+
+def _pdf_manifest_error_reason(item: dict[str, Any], metadata: dict[str, Any]) -> str:
+    for value in (
+        item.get("failure_reason"),
+        metadata.get("failure_reason"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    quarantine = metadata.get("pdf_quarantine")
+    if isinstance(quarantine, list):
+        for row in quarantine:
+            if not isinstance(row, dict):
+                continue
+            for key in ("reason", "error_reason", "detail"):
+                text = str(row.get(key) or "").strip()
+                if text:
+                    return text
+    return "pdf_scrape_failed"
+
+
+def _scrape_pdf_url_index(site_root: Path) -> dict[str, str]:
+    index: dict[str, str] = {}
+    for manifest_path in sorted(site_root.glob("*/scrape_manifest.json")):
+        run_root = manifest_path.parent
+        for item in read_json(manifest_path, []):
+            if not isinstance(item, dict):
+                continue
+            metadata = _manifest_item_metadata(item, run_root)
+            url = str(item.get("url") or metadata.get("url") or "").strip()
+            if not url:
+                continue
+            index.setdefault(url, url)
+            for path_value in (
+                item.get("pdf_path"),
+                item.get("raw_html_path"),
+                metadata.get("pdf_path"),
+            ):
+                path_text = str(path_value or "").strip()
+                if path_text:
+                    index[_stable_path_string(Path(path_text))] = url
+    return index
+
+
+def _lookup_scraped_pdf_url(index: dict[str, str], source_path: str) -> str:
+    raw = str(source_path or "").strip()
+    if not raw:
+        return ""
+    return str(index.get(_stable_path_string(Path(raw))) or index.get(raw) or "").strip()
 
 
 def _pdf_original_url(source: dict[str, Any], quarantine: dict[str, Any], chunks: list[dict[str, Any]]) -> str:

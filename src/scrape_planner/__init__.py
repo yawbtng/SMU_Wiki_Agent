@@ -4,7 +4,7 @@ Subpackages
 -----------
 core      Shared models, storage, data paths, site layout
 scrape    Discovery, fetch, HTML extraction, scrape worker
-pdf       PDF contracts and Docling ingest
+pdf       PDF contracts and MarkItDown ingest
 sources   Raw source registry, normalization, quality
 wiki      LLM wiki build, hybrid index, ingestion pipeline
 index     Embedding / vector indexes
