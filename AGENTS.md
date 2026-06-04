@@ -23,18 +23,29 @@ Before every code/doc/config change:
 3. Identify which changes are pre-existing and do not touch unrelated user work.
 4. Make one focused logical change.
 5. Run relevant verification.
-6. Run `git status --short` again.
-7. Commit only the approved/relevant files for that logical change when the user has requested a change workflow that includes commits.
+6. Run `/code-review` through a subagent on the completed change and resolve blocking findings before moving on.
+7. Run `git status --short` again.
+8. Stage and commit only the approved/relevant files or hunks for that logical change. In this repo, a normal change workflow includes a scoped commit after each completed logical change unless the user explicitly says not to commit.
 
 Git rules:
 
 - Use small GitHub-style commits: one concern per commit, clear imperative message, no unrelated files.
 - Commit only explicit paths/hunks. Do not `git add .` in this repo.
-- Never stage, revert, reset, rebase, clean, amend, push, or rewrite history unless explicitly authorized.
+- This section is standing authorization to run non-destructive `git add <explicit paths/hunks>` and `git commit` for the current focused change after verification and subagent review. It does not authorize staging unrelated work, amending, rebasing, resetting, cleaning, or pushing.
+- Start each new feature or behavior-change effort on its own GitHub-ready branch, using the `codex/` prefix unless the user asks for another branch name.
+- Use the user's `shenoyabhijith` GitHub account/owner context for GitHub work in this repo.
+- When agent work uncovers a reproducible bug, file or update a GitHub issue with concise evidence and no secrets. This is standing authorization for bug issues found during assigned repo work; if GitHub write access is unavailable or the report could expose sensitive data, prepare an issue draft instead.
+- Never stage unrelated work, and never revert, reset, rebase, clean, amend, push, or rewrite history unless explicitly authorized.
 - Never push to any remote without a fresh, explicit manual approval in the current thread, even if the user previously asked to merge or an approved command prefix exists.
 - Never swap, repoint, or replace the active workspace while inside it. Exit the workspace first, then perform an explicit workspace switch as the only operation.
 - If the worktree contains many unrelated changes, keep your commit scoped to your files and report the remaining unrelated changes.
-- Before a commit: inspect the diff and run verification. If verification cannot run, state that clearly before committing.
+- Before a commit: inspect the diff, run verification, and complete the subagent `/code-review` pass. If verification or review cannot run, state that clearly before committing.
+
+## Karpathy discipline
+
+- After routing through the repo skill router, always use the `$karpathy` skill as a required companion discipline for implementation, debugging, refactoring, review, planning, and any other code/doc/config change where restraint and verification matter.
+- State assumptions up front, choose the smallest useful change, avoid speculative abstractions, and keep every changed line tied to the user's request or verification.
+- Before completion, review the diff for accidental scope creep, run the narrowest relevant checks, and report exactly what changed and what was verified.
 
 ## Approval boundary
 
