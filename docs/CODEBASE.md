@@ -8,7 +8,7 @@ Product code lives under `src/scrape_planner/`. Subpackages group the Ultra Fast
 |------------|---------|
 | `core` | Shared models, storage, data paths, site layout |
 | `scrape` | Discovery, fetch, HTML extraction, scrape worker |
-| `pdf` | PDF contracts and Docling ingest |
+| `pdf` | PDF contracts and MarkItDown ingest |
 | `sources` | Raw source registry, normalization, quality |
 | `wiki` | LLM wiki build, hybrid index, ingestion pipeline |
 | `graph` | Markdown knowledge graph and URL-path profiling |
@@ -46,7 +46,7 @@ Web discovery through scraped markdown artifacts.
 
 PDF ingest and page-level normalization inputs.
 
-- `pdf_ingest.py` — Docling-based PDF parsing and chunk emission
+- `pdf_ingest.py` — MarkItDown-based PDF parsing and chunk emission
 
 Root module: `pdf_contracts.py` (contracts only).
 

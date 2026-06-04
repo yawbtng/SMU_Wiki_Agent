@@ -51,7 +51,7 @@ Prerequisites: indexes built (Embeddings tab / `llm_wiki_manifest.json` present)
 
 ## Production (pre-built site, query via MCP)
 
-Use this when wiki + indexes are **already built** (on a laptop or build host with Docling and the full operator flow). Production does **not** re-parse PDFs or rebuild the wiki on each question.
+Use this when wiki + indexes are **already built** (on a laptop or build host with MarkItDown and the full operator flow). Production does **not** re-parse PDFs or rebuild the wiki on each question.
 
 ### What to ship
 
@@ -86,6 +86,6 @@ Original PDFs and `sources/pdf_ingest/` are optional on the query host.
 | `answer_question` | Optional; may trigger web/ingest if confidence is low |
 | `ingest_url` | Operator refresh only |
 
-Docling remains part of the **full app** (`requirements-pdf.txt`) for when you ingest new PDFs on a build machine; it is not required for steady-state MCP query over existing indexes.
+MarkItDown remains part of the **full app** (`requirements-pdf.txt`) for when you ingest new PDFs on a build machine; it is not required for steady-state MCP query over existing indexes.
 
 See README sections **Local operator vs production** and **Using MCP in production**.
