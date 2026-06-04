@@ -96,6 +96,32 @@ def test_rollups_use_standard_windows(tmp_path: Path) -> None:
     assert rollups["all_time"]["total_tokens"] == 730
 
 
+def test_summary_rebuild_estimates_embedding_cost_from_tokens(tmp_path: Path) -> None:
+    repo = AgentRunMetricsRepository(tmp_path)
+    repo.append_event(
+        build_embedding_metric_event(
+            run_id="run-est",
+            site_id="example.edu",
+            timestamp="2026-05-01T12:00:00Z",
+            stage="embed",
+            operation="build_llm_wiki_index",
+            provider="openrouter",
+            model="openai/text-embedding-3-small",
+            input_tokens=1_000_000,
+            document_count=10,
+            chunk_count=10,
+            vector_count=10,
+            cost_usd=None,
+            cost_source="unknown",
+        )
+    )
+
+    summary = repo.rebuild_run_summary("example.edu", "run-est", status="completed")
+
+    assert summary["cost"]["source"] == "estimated"
+    assert summary["cost"]["amount_usd"] == 0.02
+
+
 def test_summary_rebuild_marks_unknown_cost_instead_of_zero(tmp_path: Path) -> None:
     repo = AgentRunMetricsRepository(tmp_path)
     repo.append_event(

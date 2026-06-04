@@ -11,6 +11,12 @@ from uuid import uuid4
 from ..core.storage import append_jsonl as _append_jsonl_impl
 from ..core.storage import read_jsonl
 from ..core.storage import write_json_atomic as _write_json_atomic_impl
+from .openrouter_pricing import (
+    estimate_embedding_cost_usd,
+    estimate_llm_cost_usd,
+    estimated_embedding_cost_from_payloads,
+    resolve_embedding_metric_cost,
+)
 
 CostSource = Literal["reported", "estimated", "unknown", "partial", "mixed"]
 TerminalStatus = Literal["completed", "failed", "canceled", "cancelled"]
@@ -285,8 +291,17 @@ class AgentRunMetricsRepository:
         rows: list[dict[str, Any]] = []
         for path in sorted(summaries_dir.glob("*.json")):
             payload = _read_json(path, {})
-            if isinstance(payload, dict) and payload.get("run_id"):
-                rows.append(payload)
+            if not isinstance(payload, dict) or not payload.get("run_id"):
+                continue
+            run_id = str(payload["run_id"])
+            cost = payload.get("cost") if isinstance(payload.get("cost"), dict) else {}
+            if str(cost.get("source") or "unknown") == "unknown":
+                payload = self.rebuild_run_summary(
+                    site_id,
+                    run_id,
+                    status=str(payload.get("status") or "unknown"),
+                )
+            rows.append(payload)
         return sorted(rows, key=lambda row: str(row.get("started_at") or ""), reverse=True)
 
     def rebuild_run_summary(
@@ -353,7 +368,12 @@ def _build_run_summary(
     llm_usage = _summarize_llm_usage(llm_events, warnings)
     embedding_usage = _summarize_embedding_usage(embedding_events, warnings)
     total_model_tokens = _combine_optional_ints(llm_usage.total_tokens, embedding_usage.input_tokens)
-    cost = _combine_costs([llm_usage.cost, embedding_usage.cost], warnings)
+    usage_costs: list[MetricCost] = []
+    if llm_events:
+        usage_costs.append(llm_usage.cost)
+    if embedding_events:
+        usage_costs.append(embedding_usage.cost)
+    cost = _combine_costs(usage_costs, warnings) if usage_costs else MetricCost(None, "unknown")
     breakdowns = _build_breakdowns(events)
 
     return AgentRunSummary(
@@ -437,19 +457,43 @@ def _summarize_embedding_usage(events: list[dict[str, Any]], warnings: set[str])
     )
 
 
+def _estimate_cost_from_event(event: dict[str, Any]) -> MetricCost:
+    metrics = _metrics(event)
+    amount = _to_float(metrics.get("cost_usd"))
+    source = str(metrics.get("cost_source") or "unknown")
+    if amount is not None and source != "unknown":
+        return MetricCost(amount, _as_cost_source(source))
+
+    model = str(event.get("model") or "")
+    if _event_type(event) == "embedding":
+        tokens = _to_int(metrics.get("input_tokens"))
+        estimated = estimate_embedding_cost_usd(tokens, model)
+        if estimated is not None:
+            return MetricCost(estimated, "estimated")
+        return MetricCost(None, "unknown")
+
+    prompt = _to_int(metrics.get("prompt_tokens"))
+    completion = _to_int(metrics.get("completion_tokens"))
+    total = _to_int(metrics.get("total_tokens"))
+    if total is not None and prompt is None and completion is None:
+        prompt, completion = total, 0
+    estimated = estimate_llm_cost_usd(prompt, completion, model)
+    if estimated is not None:
+        return MetricCost(estimated, "estimated")
+    return MetricCost(None, "unknown")
+
+
 def _cost_from_events(events: list[dict[str, Any]], warnings: set[str]) -> MetricCost:
     costs: list[float] = []
     sources: set[str] = set()
     unknown = False
     for event in events:
-        metrics = _metrics(event)
-        amount = _to_float(metrics.get("cost_usd"))
-        source = str(metrics.get("cost_source") or "unknown")
-        if amount is None or source == "unknown":
+        resolved = _estimate_cost_from_event(event)
+        if resolved.amount_usd is None:
             unknown = True
             continue
-        costs.append(amount)
-        sources.add(source)
+        costs.append(float(resolved.amount_usd))
+        sources.add(resolved.source)
     if unknown and events:
         warnings.add("unknown_cost")
     if not costs:
