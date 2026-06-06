@@ -250,32 +250,33 @@ MCP supports local stdio servers and Streamable HTTP servers. This repo uses std
 Codex stores MCP config in `~/.codex/config.toml` or a trusted project-scoped `.codex/config.toml`. Add the server with the CLI from the repo root:
 
 ```bash
-cd /Users/abhsheno/Desktop/Projects/ultra-fast-rag
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+cd "$ROOT_DIR"
 codex mcp add llm-wiki \
-  --env PYTHONPATH=/Users/abhsheno/Desktop/Projects/ultra-fast-rag \
-  -- /Users/abhsheno/Desktop/Projects/ultra-fast-rag/.venv/bin/python \
+  --env PYTHONPATH="$ROOT_DIR" \
+  -- "$ROOT_DIR/.venv/bin/python" \
   -m mcp_servers.llm_wiki_mcp \
-  --data-root /Users/abhsheno/Desktop/Projects/ultra-fast-rag/data
+  --data-root "$ROOT_DIR/data"
 ```
 
 Equivalent `config.toml`:
 
 ```toml
 [mcp_servers.llm-wiki]
-command = "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.venv/bin/python"
+command = "<PROJECT_ROOT>/.venv/bin/python"
 args = [
   "-m",
   "mcp_servers.llm_wiki_mcp",
   "--data-root",
-  "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data",
+  "<PROJECT_ROOT>/data",
 ]
-cwd = "/Users/abhsheno/Desktop/Projects/ultra-fast-rag"
+cwd = "<PROJECT_ROOT>"
 env_vars = ["OPENROUTER_API_KEY"]
 startup_timeout_sec = 20
 tool_timeout_sec = 60
 
 [mcp_servers.llm-wiki.env]
-PYTHONPATH = "/Users/abhsheno/Desktop/Projects/ultra-fast-rag"
+PYTHONPATH = "<PROJECT_ROOT>"
 ```
 
 In the Codex TUI, run `/mcp` to confirm the server is active.
@@ -285,13 +286,14 @@ In the Codex TUI, run `/mcp` to confirm the server is active.
 Claude Code can add a local stdio MCP server with `claude mcp add`. Use project scope when you want the config shared through a project `.mcp.json`; use local or user scope for private machine config.
 
 ```bash
-cd /Users/abhsheno/Desktop/Projects/ultra-fast-rag
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+cd "$ROOT_DIR"
 claude mcp add llm-wiki \
   --scope local \
-  --env PYTHONPATH=/Users/abhsheno/Desktop/Projects/ultra-fast-rag \
-  -- /Users/abhsheno/Desktop/Projects/ultra-fast-rag/.venv/bin/python \
+  --env PYTHONPATH="$ROOT_DIR" \
+  -- "$ROOT_DIR/.venv/bin/python" \
   -m mcp_servers.llm_wiki_mcp \
-  --data-root /Users/abhsheno/Desktop/Projects/ultra-fast-rag/data
+  --data-root "$ROOT_DIR/data"
 ```
 
 Equivalent project `.mcp.json`:
@@ -300,15 +302,15 @@ Equivalent project `.mcp.json`:
 {
   "mcpServers": {
     "llm-wiki": {
-      "command": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.venv/bin/python",
+      "command": "<PROJECT_ROOT>/.venv/bin/python",
       "args": [
         "-m",
         "mcp_servers.llm_wiki_mcp",
         "--data-root",
-        "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/data"
+        "<PROJECT_ROOT>/data"
       ],
       "env": {
-        "PYTHONPATH": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag",
+        "PYTHONPATH": "<PROJECT_ROOT>",
         "OPENROUTER_API_KEY": ""
       }
     }
