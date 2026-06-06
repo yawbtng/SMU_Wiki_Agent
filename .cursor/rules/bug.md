@@ -1,5 +1,13 @@
 # Known bugs and regressions
 
+## Docker fresh clone shows "No site data found" (2026-06-06)
+
+**Symptom:** Operator UI at `http://127.0.0.1:8000` (or a smoke port like `18080`) shows `No site data found. Set SCRAPE_PLANNER_DATA_ROOT…` even though the API health check passes.
+
+**Root cause:** `data/` is gitignored, so clones start empty. Docker mounted `./data` (or a removed test dataset path) with no `sites/` children.
+
+**Fix:** `scripts/bootstrap-data.sh` copies `fixtures/demo-workspace` into the runtime data root when empty. Docker entrypoint and `./start.sh` call it automatically on first boot.
+
 ## OpenRouter embedding rebuild fails with generic unavailable message (2026-06-05)
 
 **Symptom:** Embeddings tab shows `OpenRouter embeddings unavailable. Set OPENROUTER_API_KEY…` even when Settings shows OpenRouter key as `set`. Rebuild reaches the embedding plan then fails at 0%.

@@ -54,6 +54,7 @@ def test_pi_skill_scripts_fall_back_to_container_python() -> None:
 
 def test_verify_docker_script_builds_runs_and_smokes_stack() -> None:
     script = (ROOT / "scripts/verify-docker.sh").read_text(encoding="utf-8")
+    smoke = (ROOT / "scripts" / "docker-smoke.sh").read_text(encoding="utf-8")
 
     for expected in (
         "compose build app",
@@ -72,3 +73,10 @@ def test_verify_docker_script_builds_runs_and_smokes_stack() -> None:
         "Docker cannot resolve or pull a required base image",
     ):
         assert expected in script
+    assert "expected at least one seeded workspace" in smoke
+
+
+def test_docker_image_includes_demo_workspace_seed() -> None:
+    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+    assert "fixtures" not in dockerignore.splitlines()
+    assert (ROOT / "fixtures" / "demo-workspace" / "sites" / "codex.test.edu").is_dir()

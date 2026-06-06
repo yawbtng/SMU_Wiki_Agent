@@ -88,6 +88,8 @@ cd ..
 ./start.sh
 ```
 
+`./start.sh` runs the same demo seed into `./data` when no workspaces exist yet.
+
 Open:
 
 - UI: `http://127.0.0.1:5173`
@@ -170,6 +172,8 @@ Build and start:
 PATH=/Applications/Docker.app/Contents/Resources/bin:$PATH docker compose build
 PATH=/Applications/Docker.app/Contents/Resources/bin:$PATH docker compose up -d
 ```
+
+On first boot, the container seeds `data/` from `fixtures/demo-workspace` when `data/sites/` is empty, so the dashboard opens with a demo `codex.test.edu` workspace instead of a blank state.
 
 Open:
 

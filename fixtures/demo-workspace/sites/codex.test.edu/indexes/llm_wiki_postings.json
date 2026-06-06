@@ -1,0 +1,153 @@
+{
+  "catalog": {
+    "raw:pdf_catalog:1": 2
+  },
+  "tuition": {
+    "raw:pdf_catalog:1": 2,
+    "raw:web_tuition:1": 2,
+    "wiki:wiki/pages/tuition-and-aid.md:1": 2
+  },
+  "raw": {
+    "raw:pdf_catalog:1": 1,
+    "raw:web_admissions:1": 1,
+    "raw:web_tuition:1": 1
+  },
+  "for": {
+    "raw:pdf_catalog:1": 1,
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "the": {
+    "raw:pdf_catalog:1": 1,
+    "raw:web_admissions:1": 1,
+    "wiki:wiki/pages/admissions.md:1": 2
+  },
+  "graduate": {
+    "raw:pdf_catalog:1": 1
+  },
+  "is": {
+    "raw:pdf_catalog:1": 1,
+    "raw:web_admissions:1": 1,
+    "raw:web_tuition:1": 1,
+    "wiki:wiki/pages/admissions.md:1": 1,
+    "wiki:wiki/pages/tuition-and-aid.md:1": 1
+  },
+  "100": {
+    "raw:pdf_catalog:1": 1
+  },
+  "credits": {
+    "raw:pdf_catalog:1": 1
+  },
+  "per": {
+    "raw:pdf_catalog:1": 1,
+    "raw:web_tuition:1": 1,
+    "wiki:wiki/pages/tuition-and-aid.md:1": 1
+  },
+  "term": {
+    "raw:pdf_catalog:1": 1
+  },
+  "admissions": {
+    "raw:web_admissions:1": 1,
+    "wiki:wiki/pages/admissions.md:1": 2
+  },
+  "final": {
+    "raw:web_admissions:1": 1,
+    "wiki:wiki/pages/admissions.md:1": 1
+  },
+  "application": {
+    "raw:web_admissions:1": 1,
+    "wiki:wiki/pages/admissions.md:1": 1
+  },
+  "deadline": {
+    "raw:web_admissions:1": 1,
+    "wiki:wiki/pages/admissions.md:1": 1
+  },
+  "february": {
+    "raw:web_admissions:1": 1,
+    "wiki:wiki/pages/admissions.md:1": 1
+  },
+  "1": {
+    "raw:web_admissions:1": 1,
+    "wiki:wiki/pages/admissions.md:1": 1
+  },
+  "transcripts": {
+    "raw:web_admissions:1": 1
+  },
+  "are": {
+    "raw:web_admissions:1": 1
+  },
+  "required": {
+    "raw:web_admissions:1": 1
+  },
+  "undergraduate": {
+    "raw:web_tuition:1": 1,
+    "wiki:wiki/pages/tuition-and-aid.md:1": 1
+  },
+  "58": {
+    "raw:web_tuition:1": 1,
+    "wiki:wiki/pages/tuition-and-aid.md:1": 1
+  },
+  "000": {
+    "raw:web_tuition:1": 1,
+    "wiki:wiki/pages/tuition-and-aid.md:1": 1
+  },
+  "year": {
+    "raw:web_tuition:1": 1,
+    "wiki:wiki/pages/tuition-and-aid.md:1": 1
+  },
+  "before": {
+    "raw:web_tuition:1": 1,
+    "wiki:wiki/pages/tuition-and-aid.md:1": 1
+  },
+  "aid": {
+    "raw:web_tuition:1": 1,
+    "wiki:wiki/pages/tuition-and-aid.md:1": 2
+  },
+  "wiki": {
+    "wiki:wiki/pages/admissions.md:1": 1
+  },
+  "says": {
+    "wiki:wiki/pages/admissions.md:1": 1
+  },
+  "codex": {
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "fixture": {
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "university": {
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "demo": {
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "workspace": {
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "shipped": {
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "with": {
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "ultra": {
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "fast": {
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "rag": {
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "first": {
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "run": {
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "setup": {
+    "wiki:wiki/pages/index.md:1": 1
+  },
+  "and": {
+    "wiki:wiki/pages/tuition-and-aid.md:1": 1
+  }
+}
