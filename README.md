@@ -2,7 +2,7 @@
 
 Ultra Fast RAG is a local-first operator app for building a student-focused LLM Wiki from university web pages, PDFs, and other source artifacts. It gives an operator one place to discover sources, approve what matters, scrape and normalize content, compile wiki pages, build retrieval indexes, inspect jobs, and expose cited answers through the web app or a local MCP server.
 
-![Ultra Fast RAG operator app](docs/assets/app-screenshot.jpg)
+![Ultra Fast RAG operator app demo](docs/assets/app-demo.gif)
 
 ## Architecture
 
