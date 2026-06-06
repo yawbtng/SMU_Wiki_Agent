@@ -27,6 +27,8 @@ if [[ ! -d "$ROOT/frontend/node_modules" ]]; then
   exit 1
 fi
 
+"$ROOT/scripts/bootstrap-data.sh" "$ROOT/data"
+
 DATA_ROOT="$(resolve_data_root "$ROOT")"
 webapp_write_env_file "$LOG_DIR/webapp.env" "$DATA_ROOT"
 export SCRAPE_PLANNER_DATA_ROOT="$DATA_ROOT"

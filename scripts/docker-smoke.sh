@@ -16,10 +16,14 @@ print('health ok:', p.get('data_root', ''))
 "
 
 curl -fsS "${BASE_URL}/api/sites" | python3 -c "
-import json, sys
+import json, os, sys
 p = json.load(sys.stdin)
+sites = p.get('sites', [])
 assert 'sites' in p
-print('sites:', len(p['sites']))
+require_sites = os.environ.get('DOCKER_SMOKE_REQUIRE_SITES', '1') == '1'
+if require_sites:
+    assert sites, 'expected at least one seeded workspace; run scripts/bootstrap-data.sh or restart Docker'
+print('sites:', len(sites))
 "
 
 curl -fsS "${BASE_URL}/api/operator/skills" | python3 -c "

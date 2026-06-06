@@ -1,0 +1,16 @@
+{
+  "site_id": "codex.test.edu",
+  "site_url": "http://codex.test.edu",
+  "name": "Codex Fixture University",
+  "discovered_total": 5,
+  "eligible_total": 5,
+  "rejected_total": 0,
+  "excluded_by_policy": 0,
+  "sitemap_sources": [
+    "fixture"
+  ],
+  "notes": [
+    "Bundled demo workspace for first-run bootstrap."
+  ],
+  "generated_at": "2026-05-21T12:00:00+00:00"
+}

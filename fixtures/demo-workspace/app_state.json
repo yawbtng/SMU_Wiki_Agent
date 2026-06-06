@@ -1,0 +1,18 @@
+{
+  "active_workspace_id": "codex.test.edu",
+  "workspaces": [
+    {
+      "id": "codex.test.edu",
+      "name": "Codex Fixture University",
+      "url": "http://codex.test.edu"
+    }
+  ],
+  "last_site_url": "http://codex.test.edu",
+  "last_site_id": "codex.test.edu",
+  "site_history": [
+    "http://codex.test.edu"
+  ],
+  "openrouter_api_key": "",
+  "tavily_api_key": "",
+  "gemini_api_key": ""
+}

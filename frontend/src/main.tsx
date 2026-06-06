@@ -673,7 +673,8 @@ function App() {
     const detail = sitesQuery.error instanceof Error ? sitesQuery.error.message : 'request failed';
     bootstrapMessage = `API unavailable (${detail}). Run ./start.sh from the repo root and confirm http://127.0.0.1:8000/api/health responds.`;
   } else if (!sites.length) {
-    bootstrapMessage = 'No site data found. Set SCRAPE_PLANNER_DATA_ROOT to your data directory.';
+    bootstrapMessage =
+      'No site data found. Fresh installs seed a demo workspace on Docker start or via ./scripts/bootstrap-data.sh. For a custom directory, set SCRAPE_PLANNER_DATA_ROOT or DATA_HOST_DIR.';
   }
 
   return (

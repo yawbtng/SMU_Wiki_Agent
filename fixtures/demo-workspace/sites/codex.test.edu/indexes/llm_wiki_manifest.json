@@ -1,0 +1,63 @@
+{
+  "version": "llm-wiki-hybrid-v2",
+  "status": "ready",
+  "site_root": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.tmp-demo-workspace-build/site",
+  "documents_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.tmp-demo-workspace-build/site/indexes/llm_wiki_documents.jsonl",
+  "postings_path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.tmp-demo-workspace-build/site/indexes/llm_wiki_postings.json",
+  "built_at": "2026-05-21T12:00:00+00:00",
+  "raw_index_count": 3,
+  "wiki_index_count": 3,
+  "raw_documents": 3,
+  "wiki_documents": 3,
+  "raw_count": 3,
+  "wiki_count": 3,
+  "changed_raw_count": 3,
+  "changed_wiki_count": 3,
+  "changed_document_count": 6,
+  "skipped_document_count": 0,
+  "term_count": 42,
+  "reranker_ready": false,
+  "index_health": "ready",
+  "embedding_space": "hash-fallback",
+  "vector_leg_enabled": false,
+  "vector_store": {
+    "backend": "zvec",
+    "ready": false,
+    "path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.tmp-demo-workspace-build/site/indexes/zvec_llm_wiki",
+    "collection": "",
+    "documents": 0,
+    "vector_dimensions": 1536,
+    "error": "embedding_degraded"
+  },
+  "zvec": {
+    "backend": "zvec",
+    "ready": false,
+    "path": "/Users/abhsheno/Desktop/Projects/ultra-fast-rag/.tmp-demo-workspace-build/site/indexes/zvec_llm_wiki",
+    "collection": "",
+    "documents": 0,
+    "vector_dimensions": 1536,
+    "error": "embedding_degraded"
+  },
+  "query_modes_available": [
+    "lexical",
+    "page_only"
+  ],
+  "embedding": {
+    "provider": "openrouter",
+    "model": "openai/text-embedding-3-small",
+    "vector_dimensions": 1536,
+    "degraded": true,
+    "space": "hash-fallback"
+  },
+  "embedding_degraded": true,
+  "estimated_input_tokens": 146,
+  "estimated_embedding_cost_usd": 3e-06,
+  "embedding_price_per_million_input_tokens": 0.02,
+  "embedding_price_source": "openrouter_catalog",
+  "reranker": {
+    "provider": "",
+    "model": "",
+    "api_url": ""
+  },
+  "invalid_sources": []
+}
