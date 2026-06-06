@@ -37,18 +37,19 @@ and committed.
 
 ## Learned User Preferences
 
-- Structural code questions: CodeGraph first; use `rg` only for literal strings, policy text, configs, markdown, and logs.
+- Structural code questions: CodeGraph first; use `rg` only for literal strings, policy text, configs, markdown, and logs; use `rtk` for noisy shell commands where exact raw output is not required.
 - After source, config, test, or doc edits: run `codegraph sync` before further CodeGraph queries or completion reports.
 - Never print or log real API keys; in tests and reports use fake keys or only presence/empty/length.
 - Assigned `docs/superpowers/plans/*.md` work: implement the plan exactly, one focused logical change at a time.
 - Sources-tab edits in `frontend/src/main.tsx`: preserve WorkspaceDashboard, workspace return (X), durable agent panel, and dynamic Available-areas picker unless explicitly asked otherwise.
 - `uops` MCP is read-only retrieval (`query_wiki`, `get_wiki_page`, `search_sources`) unless the user explicitly requests ingest, rebuild, or operator refresh.
-- Operator workspace UI: Inter/sans on cards and metadata (not monospace); Sources/Wiki/runs as neutral flat labels, not colored pills; hero data-root shows only a short project-relative tail (e.g. `repo-name/data`) with no absolute path or hover tooltip.
+- Operator workspace UI: minimalist layout with orange status-band accent; Inter/sans on cards and metadata (not monospace); Sources/Wiki/runs as neutral flat labels, not colored pills; hero data-root shows only a short project-relative tail (e.g. `repo-name/data`) with no absolute path or tooltip; Metrics use line charts with human-readable run labels (sequence, job kind, time), not truncated run IDs.
 
 ## Learned Workspace Facts
 
 - Metrics tab covers Pi agent and embedding-index jobs only; scrape run outcomes stay on Runs.
 - OpenRouter key saved in Settings must flow through app-state persistence into Pi/wiki build and MCP launch environment.
-- Sources URL curation uses `POST /api/sites/{site_id}/approved-urls/chat` for realtime group approve/preview updates.
+- Sources URL curation uses `POST /api/sites/{site_id}/approved-urls/chat` for realtime group approve/preview updates; match URL candidates from the operator message only, not the default `base_prompt` school lexicon.
+- Wiki tab Job metric reflects `job_status` from `/api/sites/{site}/jobs/llm-wiki-noninteractive`.
 - Raw source registry rows need click-to-inspect via document-preview, not opaque IDs alone.
 - Wiki Settings should expose a single LLM Wiki compile path; avoid redundant fallback compile modes in the operator UI.

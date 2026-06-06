@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shlex
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,8 @@ from .operator_skills import OperatorSkillSpec, get_operator_skill, skill_script
 from .pi_agent import build_pi_json_command, pi_events_filename
 from .tmux_settings import pi_cmd, tmux_archive_sessions, tmux_session_grace_seconds
 
+WIKI_RUNNING_EVENT_STALL_SECONDS = 300
+
 
 def _wiki_runtime_failure(events: list[dict[str, Any]]) -> str | None:
     needles = (
@@ -34,6 +37,29 @@ def _wiki_runtime_failure(events: list[dict[str, Any]]) -> str | None:
             if needle in blob:
                 return f"Pi runtime unavailable: {needle}."
     return None
+
+
+def _file_age_seconds(path_value: Any) -> int | None:
+    path_text = str(path_value or "").strip()
+    if not path_text:
+        return None
+    try:
+        modified_at = Path(path_text).stat().st_mtime
+    except OSError:
+        return None
+    return max(0, int(time.time() - modified_at))
+
+
+def _wiki_running_stall(report: dict[str, Any], reconciled: dict[str, Any]) -> tuple[bool, int | None]:
+    if str(reconciled.get("job_status") or "").lower() not in {"running", "starting", "initializing", "queued"}:
+        return False, None
+    if not bool(reconciled.get("tmux_session_alive")):
+        return False, None
+    age_seconds = _file_age_seconds(report.get("pi_events_path"))
+    return (
+        age_seconds is not None and age_seconds >= WIKI_RUNNING_EVENT_STALL_SECONDS,
+        age_seconds,
+    )
 
 
 def _reconcile_wiki_build_report(report_path: Path, report: dict[str, Any], *, tmux: TmuxRunner, pi_events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -52,13 +78,21 @@ def _reconcile_wiki_build_report(report_path: Path, report: dict[str, Any], *, t
         }
         write_json(report_path, report)
         reconciled = reconcile_tmux_job_status("failed", session, runner=tmux)
+    stalled_running, last_event_age_seconds = _wiki_running_stall(report, reconciled)
+    display_status = "stalled" if stalled_running else reconciled["job_status"]
+    last_error = str(report.get("last_error") or runtime_failure or "")
+    if stalled_running and not last_error:
+        age_label = f"{last_event_age_seconds}s" if last_event_age_seconds is not None else "several minutes"
+        last_error = f"Pi job is still alive but has not emitted build output for {age_label}."
     return {
         **report,
-        "job_status": reconciled["job_status"],
+        "job_status": display_status,
         "reported_job_status": reconciled["reported_job_status"],
         "stale_running": reconciled["stale_running"],
+        "stalled_running": stalled_running,
+        "last_event_age_seconds": last_event_age_seconds,
         "tmux_session_alive": reconciled["tmux_session_alive"],
-        "last_error": str(report.get("last_error") or runtime_failure or ""),
+        "last_error": last_error,
     }
 
 
@@ -189,6 +223,7 @@ def job_status_payload(site_root: Path, skill_id: str) -> dict[str, Any]:
             "report": report,
             "tmux_session": active or str(report.get("tmux_session") or ""),
             "stale_running": bool(report.get("stale_running")),
+            "stalled_running": bool(report.get("stalled_running")),
             "pi_events_path": events_path or "",
             "pi_events": pi_events,
             "generated_at": utc_now_iso(),

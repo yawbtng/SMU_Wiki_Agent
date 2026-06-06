@@ -117,6 +117,31 @@ class EmbeddingUnavailableError(RuntimeError):
     """Raised when required dense embeddings cannot be produced."""
 
 
+def _embedding_unavailable_message(exc: Exception) -> str:
+    detail = str(exc).strip()
+    lowered = detail.lower()
+    if "openrouter_api_key is required" in lowered:
+        return (
+            "OpenRouter embeddings unavailable. Set OPENROUTER_API_KEY in Settings "
+            "or choose a reachable OpenRouter embedding model."
+        )
+    if "401" in detail or "unauthorized" in lowered:
+        return (
+            "OpenRouter API key was rejected (401 Unauthorized). "
+            "Create a new key at openrouter.ai/keys, save it in Settings, then rebuild."
+        )
+    if "402" in detail or "payment" in lowered or "insufficient" in lowered:
+        return "OpenRouter account has insufficient credits for embeddings. Add credits, then rebuild."
+    if detail:
+        return (
+            "OpenRouter embeddings unavailable. Set OPENROUTER_API_KEY or choose a reachable "
+            f"OpenRouter embedding model. ({detail})"
+        )
+    return (
+        "OpenRouter embeddings unavailable. Set OPENROUTER_API_KEY or choose a reachable OpenRouter embedding model."
+    )
+
+
 def build_llm_wiki_index(
     site_root: Path,
     *,
@@ -2372,9 +2397,7 @@ def _embedding_vector_and_space(
             return _hash_embedding_vector(text, dimensions=dimensions), EMBEDDING_SPACE_HASH
         _DENSE_EMBEDDING_UNAVAILABLE = True
         _EMBEDDING_DEGRADED = True
-        raise EmbeddingUnavailableError(
-            "OpenRouter embeddings unavailable. Set OPENROUTER_API_KEY or choose a reachable OpenRouter embedding model."
-        ) from exc
+        raise EmbeddingUnavailableError(_embedding_unavailable_message(exc)) from exc
     if not vector:
         _DENSE_EMBEDDING_UNAVAILABLE = True
         _EMBEDDING_DEGRADED = True
@@ -2414,9 +2437,7 @@ def _embedding_vectors_and_space(
             return [_hash_embedding_vector(text, dimensions=dimensions) for text in texts], EMBEDDING_SPACE_HASH
         _DENSE_EMBEDDING_UNAVAILABLE = True
         _EMBEDDING_DEGRADED = True
-        raise EmbeddingUnavailableError(
-            "OpenRouter embeddings unavailable. Set OPENROUTER_API_KEY or choose a reachable OpenRouter embedding model."
-        ) from exc
+        raise EmbeddingUnavailableError(_embedding_unavailable_message(exc)) from exc
     if len(vectors) != len(texts):
         _DENSE_EMBEDDING_UNAVAILABLE = True
         _EMBEDDING_DEGRADED = True

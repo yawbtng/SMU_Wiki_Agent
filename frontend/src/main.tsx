@@ -31,6 +31,7 @@ import {
   formatCompact,
   metricsChartRangeLabel,
   metricsTokenMixSegments,
+  formatPiEventLabel,
   resolveWikiJobStatus,
   scrapeStartPayload,
   summarizePiBuildEvents,
@@ -77,7 +78,11 @@ async function apiForm<T>(path: string, method: string, body: FormData): Promise
 
 async function apiDelete<T>(path: string): Promise<T> {
   const res = await fetch(path, { method: 'DELETE' });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const payload = await res.json().catch(() => ({})) as { detail?: unknown };
+    const detail = payload.detail;
+    throw new Error(typeof detail === 'string' && detail.trim() ? detail : `${res.status} ${res.statusText}`);
+  }
   return res.json();
 }
 
@@ -408,6 +413,13 @@ function fmt(value: unknown, fallback = '—'): string {
   return String(value);
 }
 
+function firstPositiveNumber(...values: unknown[]): number {
+  const finite = values
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value));
+  return finite.find((value) => value > 0) ?? finite[0] ?? 0;
+}
+
 function siteDisplay(siteId: string, appState?: AnyRecord): { name: string; url: string; runId: string } {
   const workspaces = appState?.state?.workspaces ?? [];
   const match = workspaces.find((item: AnyRecord) => item.id === siteId);
@@ -513,19 +525,7 @@ function activeWorkspaceStatus(runId: string, liveSnapshot: AnyRecord | null, ac
 type PiStreamEvent = AnyRecord;
 
 function piEventLabel(event: PiStreamEvent): string {
-  const type = String(event.type ?? '');
-  if (type === 'message_update') {
-    const nested = event.assistantMessageEvent as AnyRecord | undefined;
-    if (nested?.type === 'text_delta') return String(nested.delta ?? '');
-  }
-  if (type === 'tool_execution_start') return `[tool start] ${String(event.toolName ?? '')}`;
-  if (type === 'tool_execution_end') {
-    return `[tool end] ${String(event.toolName ?? '')}${event.isError ? ' (error)' : ''}`;
-  }
-  if (type === 'auto_retry_start') return `[retry] ${String(event.errorMessage ?? '')}`;
-  if (type.startsWith('agent_') || type.startsWith('turn_') || type.startsWith('message_')) return `[${type}]`;
-  if (type === 'session') return `[session ${String((event as AnyRecord).id ?? '').slice(0, 8)}]`;
-  return type ? `[${type}]` : '';
+  return formatPiEventLabel(event);
 }
 
 function useSiteStream(siteId?: string) {
@@ -1962,9 +1962,22 @@ const Wiki = memo(function Wiki({
     generationStatus: wikiGeneration.data?.job_status,
     staleRunning: Boolean(wikiJob.data?.stale_running ?? wikiReport.stale_running),
   });
+  const wikiStatusValue = wikiStatus.label.toLowerCase();
+  const buildActivitySourceCount = firstPositiveNumber(
+    overview.wiki?.integrated_sources,
+    wikiReport.integrated_sources,
+    wikiGeneration.data?.integrated_sources,
+    overview.wiki?.source_count,
+  );
+  const buildActivityPageCount = firstPositiveNumber(
+    overview.wiki?.pages_created,
+    wikiReport.pages_created,
+    wikiGeneration.data?.semantic_page_count,
+    wikiGeneration.data?.total_page_count,
+  );
   const wikiJobRunning = ['running', 'starting', 'initializing'].includes(
     String(wikiReport.job_status ?? wikiReport.status ?? '').toLowerCase(),
-  ) && !['archived', 'stale', 'failed'].includes(wikiStatus.label.toLowerCase());
+  ) && !['archived', 'stale', 'stalled', 'failed'].includes(wikiStatusValue);
   useEffect(() => {
     if (!selectedPath && pages.data?.pages?.[0]?.path) setSelectedPath(`wiki/${pages.data.pages[0].path}`);
   }, [pages.data, selectedPath]);
@@ -2139,7 +2152,7 @@ const Wiki = memo(function Wiki({
       <Panel title="Wiki generation status">
         <MetricStrip
           metrics={[
-            { label: 'Build', value: fmt(wikiGeneration.data?.job_status ?? overview.wiki?.job_status) },
+            { label: 'Build', value: wikiStatusValue },
             { label: 'Semantic pages', value: formatCount(wikiGeneration.data?.semantic_page_count) },
             { label: 'Evidence pages', value: formatCount(wikiGeneration.data?.source_page_count) },
             { label: 'Index updated', value: wikiGeneration.data?.index_updated_at ? fmt(wikiGeneration.data.index_updated_at).slice(0, 19) : '—' },
@@ -2153,9 +2166,9 @@ const Wiki = memo(function Wiki({
         <MetricStrip
           metrics={[
             { label: 'Runtime', value: fmt(overview.wiki?.runtime ?? 'python') },
-            { label: 'State', value: fmt(overview.wiki?.job_status ?? 'ready') },
-            { label: 'Sources', value: formatCount(overview.wiki?.integrated_sources) },
-            { label: 'Pages', value: formatCount(overview.wiki?.pages_created) },
+            { label: 'State', value: wikiStatusValue },
+            { label: 'Sources', value: formatCount(buildActivitySourceCount) },
+            { label: 'Pages', value: formatCount(buildActivityPageCount) },
           ]}
         />
         <details className="operator-details">

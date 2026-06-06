@@ -323,6 +323,20 @@ def _positive_instruction_text(message: str) -> str:
     return re.split(r"\b(?:exclude|reject|do not include|avoid|remove)\b", message, maxsplit=1, flags=re.IGNORECASE)[0]
 
 
+def _approval_select_limit(message: str) -> int | None:
+    for pattern in (
+        r"\b(?:top|first|best|up\s+to)\s+(\d{1,6})\b",
+        r"\bchoose\s+(\d{1,6})\b",
+        r"\b(\d{1,6})\s+(?:urls?|pages?|links?)\b",
+    ):
+        match = re.search(pattern, message, flags=re.IGNORECASE)
+        if match:
+            value = int(match.group(1))
+            if value > 0:
+                return value
+    return None
+
+
 def _message_terms(message: str) -> list[str]:
     message = _positive_instruction_text(message)
     aliases = {
@@ -363,8 +377,14 @@ def _message_terms(message: str) -> list[str]:
             "scrape",
             "pages",
             "urls",
+            "url",
             "student",
             "students",
+            "top",
+            "first",
+            "best",
+            "limit",
+            "hundred",
         }:
             terms.append(token)
     deduped: list[str] = []
@@ -551,8 +571,9 @@ def approval_chat_payload(site_id: str, request: ApprovedUrlsChatRequest) -> dic
         else:
             assistant_message = "I did not find matching approved URLs. Paste an exact URL or a distinctive path term."
     elif intent == "approve":
-        instruction = "\n".join(part for part in [request.base_prompt.strip(), effective_message] if part)
-        candidates, rejected_rows, terms = _candidate_rows_for_instruction(site_id, instruction, limit=request.limit)
+        select_cap = _approval_select_limit(message)
+        select_limit = min(request.limit, select_cap) if select_cap else request.limit
+        candidates, rejected_rows, terms = _candidate_rows_for_instruction(site_id, effective_message, limit=select_limit)
         rejected = [{"url": str(item.get("url") or ""), "reason": str(item.get("reason") or "") } for item in rejected_rows]
         for item in candidates:
             url = item["url"]

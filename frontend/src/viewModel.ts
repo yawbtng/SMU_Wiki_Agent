@@ -400,7 +400,7 @@ export function toneForStatus(value: unknown): Tone {
   if (['running', 'initializing', 'active', 'queued', 'starting'].some((item) => status.includes(item))) return 'active';
   if (['complete', 'completed', 'ready', 'current', 'ok', 'healthy'].some((item) => status.includes(item))) return 'ready';
   if (['failed', 'error', 'stale', 'missing', 'danger'].some((item) => status.includes(item))) return 'danger';
-  if (['review', 'pending', 'waiting', 'warning', 'paused'].some((item) => status.includes(item))) return 'warning';
+  if (['review', 'pending', 'waiting', 'warning', 'paused', 'stalled'].some((item) => status.includes(item))) return 'warning';
   return 'neutral';
 }
 
@@ -576,15 +576,91 @@ export function summarizePiBuildEvents(events: AnyRecord[]): string[] {
   const seen = new Set<string>();
   for (const event of events.slice(-80)) {
     const type = String(event.type ?? event.event ?? '').trim();
-    const status = String(event.status ?? '').trim();
-    const message = String(event.message ?? event.text ?? event.detail ?? '').trim();
-    const label = [type, status, message].filter(Boolean).join(' · ');
+    const label = formatPiEventLabel(event).replace(/^\[|\]$/g, '');
     if (!label || seen.has(label)) continue;
     seen.add(label);
     if (type.startsWith('message_') || type === 'message_update') continue;
     lines.push(label.slice(0, 240));
   }
   return lines.slice(-12);
+}
+
+export function formatPiEventLabel(event: AnyRecord): string {
+  const type = String(event.type ?? event.event ?? '').trim();
+  if (type === 'message_update') {
+    const nested = event.assistantMessageEvent as AnyRecord | undefined;
+    if (nested?.type === 'text_delta') return String(nested.delta ?? '');
+  }
+  if (type.startsWith('tool_execution_')) return formatToolExecutionEvent(type, event);
+  if (type === 'auto_retry_start') return `[retry] ${stringValue(event.errorMessage)}`;
+  if (type.startsWith('agent_') || type.startsWith('turn_') || type.startsWith('message_')) {
+    const detail = compactEventDetail(event, ['message', 'text', 'detail', 'status']);
+    return detail ? `[${type}] ${detail}` : `[${type}]`;
+  }
+  if (type === 'session') return `[session ${stringValue(event.id).slice(0, 8)}]`;
+  const status = stringValue(event.status);
+  const message = compactEventDetail(event, ['message', 'text', 'detail']);
+  const label = [type, status, message].filter(Boolean).join(' · ');
+  return label ? `[${label}]` : '';
+}
+
+function formatToolExecutionEvent(type: string, event: AnyRecord): string {
+  const phase = type.replace('tool_execution_', '').replace(/_/g, ' ');
+  const toolName = stringValue(event.toolName ?? event.tool_name ?? event.name) || 'tool';
+  const args = compactToolArgs(event.args ?? event.arguments ?? event.input ?? event.toolArgs);
+  const result = compactEventDetail(event, ['message', 'text', 'detail', 'errorMessage', 'result', 'output']);
+  const error = event.isError ? 'error' : '';
+  const detail = [args, result, error].filter(Boolean).join(' · ');
+  return detail ? `[tool ${phase}] ${toolName} · ${detail}` : `[tool ${phase}] ${toolName}`;
+}
+
+function compactToolArgs(value: unknown): string {
+  if (!value) return '';
+  if (typeof value === 'string') return value.trim().slice(0, 180);
+  if (Array.isArray(value)) return value.map((item) => compactScalar(item)).filter(Boolean).join(' ').slice(0, 180);
+  if (typeof value !== 'object') return compactScalar(value).slice(0, 180);
+  const record = value as AnyRecord;
+  const preferred = ['path', 'file', 'url', 'command', 'cmd', 'query', 'pattern', 'site_id', 'run_id'];
+  const parts: string[] = [];
+  for (const key of preferred) {
+    const text = compactScalar(record[key]);
+    if (text) parts.push(`${key}=${text}`);
+  }
+  if (!parts.length) {
+    for (const [key, item] of Object.entries(record).slice(0, 4)) {
+      const text = compactScalar(item);
+      if (text) parts.push(`${key}=${text}`);
+    }
+  }
+  return parts.join(' · ').slice(0, 180);
+}
+
+function compactEventDetail(event: AnyRecord, keys: string[]): string {
+  for (const key of keys) {
+    const text = compactScalar(event[key]);
+    if (text) return text.slice(0, 180);
+  }
+  return '';
+}
+
+function compactScalar(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return value.map((item) => compactScalar(item)).filter(Boolean).join(' ');
+  if (typeof value === 'object') {
+    const record = value as AnyRecord;
+    for (const key of ['path', 'file', 'url', 'command', 'cmd', 'query', 'message', 'error']) {
+      const text = compactScalar(record[key]);
+      if (text) return text;
+    }
+    return '';
+  }
+  return String(value);
+}
+
+function stringValue(value: unknown): string {
+  return value === null || value === undefined ? '' : String(value).trim();
 }
 
 export function buildMcpModel(mcp: AnyRecord = {}): McpModel {

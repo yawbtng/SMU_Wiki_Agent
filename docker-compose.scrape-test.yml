@@ -1,0 +1,12 @@
+services:
+  scrape-docs:
+    build:
+      context: ./test-fixtures/scrape-docs-site
+    image: ultra-fast-rag-scrape-docs:local
+    ports:
+      - "${SCRAPE_DOCS_HOST_PORT:-8766}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

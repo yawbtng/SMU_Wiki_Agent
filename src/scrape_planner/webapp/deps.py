@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,19 @@ def site_root(site_id: str) -> Path:
     if not safe or ".." in safe or "/" in safe:
         raise HTTPException(status_code=400, detail="invalid site_id")
     return data_root() / "sites" / safe
+
+
+def remove_site_directory(root: Path) -> None:
+    """Remove a site directory without following symlinks into other data roots."""
+    if not root.exists() and not root.is_symlink():
+        return
+    if root.is_symlink():
+        root.unlink()
+        return
+    if root.is_dir():
+        shutil.rmtree(root)
+        return
+    root.unlink()
 
 
 def run_root(site_id: str, run_id: str) -> Path:

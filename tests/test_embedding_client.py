@@ -61,6 +61,23 @@ def test_embedding_config_prefers_env_over_app_state_openrouter_key(
     assert config.api_key == "env-openrouter-key"
 
 
+def test_app_state_env_bridge_can_force_saved_openrouter_key(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    write_json(data_root / "app_state.json", {"openrouter_api_key": "saved-openrouter-key"})
+    monkeypatch.setenv("SCRAPE_PLANNER_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "stale-openrouter-key")
+    refresh_app_state_cache()
+
+    apply_app_state_env_bridge(force=True)
+    config = embedding_config_from_env()
+
+    assert config.api_key == "saved-openrouter-key"
+
+
 def test_openrouter_embed_batch_preserves_response_order(monkeypatch) -> None:
     captured: dict[str, object] = {}
 

@@ -54,10 +54,10 @@ def build_app_state_env_exports(*, existing_env: dict[str, str] | None = None) -
     return exports
 
 
-def apply_app_state_env_bridge(*, existing_env: dict[str, str] | None = None) -> None:
+def apply_app_state_env_bridge(*, existing_env: dict[str, str] | None = None, force: bool = False) -> None:
     env = existing_env if existing_env is not None else os.environ
     for env_name, value in app_state_env_values().items():
-        if not str(env.get(env_name, "")).strip():
+        if force or not str(env.get(env_name, "")).strip():
             env[env_name] = value
 
 

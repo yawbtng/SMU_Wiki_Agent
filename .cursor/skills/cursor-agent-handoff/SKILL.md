@@ -57,6 +57,7 @@ Reject any running `agent --print` whose command contains `--workspace` outside 
 - **Codex local lookups are limited to prerequisites and verification:** read this skill, `AGENTS.md`, `.cursor/skills/skill-router/SKILL.md`, check `git status`, check stale agents, write the plan, run final sync/status/compile/runtime checks, and inspect final diffs.
 - **Inside Cursor Agent prompts:** require CodeGraph first for symbols, definitions, call paths, dependencies, impact analysis, and affected-test discovery.
 - **Inside Cursor Agent prompts:** require `rg` only for literal policy text, config keys, string literals, logs, markdown, and non-indexed files.
+- **Inside Cursor Agent prompts:** require `rtk` for noisy shell commands such as git status/diff/log, test/build/lint output, package-manager output, Docker/Kubernetes status, and broad file/listing reads when exact raw output is not required. Use raw commands only when exact bytes, interactivity, or unsupported shell behavior matters.
 - After any delegated source/config/test/doc edit, run `codegraph sync` before further CodeGraph queries and before reporting completion.
 
 ## Workflow
@@ -79,7 +80,7 @@ Reject any running `agent --print` whose command contains `--workspace` outside 
 ## Implementation prompt skeleton
 
 ```text
-Trusted workspace is exactly /Users/abhsheno/Desktop/Projects/ultra-fast-rag. Do not inspect or trust any other directory, including /Users/abhsheno and sibling worktrees. Read AGENTS.md, .cursor/skills/skill-router/SKILL.md, and docs/superpowers/plans/<plan-file>.md first. Implement exactly the markdown plan, one focused logical change at a time. Before editing, run git status --short and inspect diffs for any files you will touch. Do not overwrite unrelated pre-existing changes. Use CodeGraph first for structural code questions and affected-test discovery. Use rg for literal strings, policy text, configs, markdown, and logs. After any source, config, test, or doc edit, run codegraph sync before further CodeGraph queries and before reporting completion. Run the compile/syntax and runtime verification commands listed in the plan. Do not commit unless the user explicitly asks.
+Trusted workspace is exactly /Users/abhsheno/Desktop/Projects/ultra-fast-rag. Do not inspect or trust any other directory, including /Users/abhsheno and sibling worktrees. Read AGENTS.md, .cursor/skills/skill-router/SKILL.md, and docs/superpowers/plans/<plan-file>.md first. Implement exactly the markdown plan, one focused logical change at a time. Before editing, run rtk git status --short and inspect diffs for any files you will touch. Do not overwrite unrelated pre-existing changes. Use CodeGraph first for structural code questions and affected-test discovery. Use rg for literal strings, policy text, configs, markdown, and logs. Use rtk for noisy shell commands when exact raw output is not required. After any source, config, test, or doc edit, run codegraph sync before further CodeGraph queries and before reporting completion. Run the compile/syntax and runtime verification commands listed in the plan. Do not commit unless the user explicitly asks.
 ```
 
 ## Output

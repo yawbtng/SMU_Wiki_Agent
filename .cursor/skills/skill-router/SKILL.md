@@ -26,6 +26,7 @@ Wiki build/refresh non-interactively?
 
 Broad explore / audit / "how does X work"?
   → Subagents + codegraph (AGENTS.md Exploration Preference)
+  → rtk for noisy shell output when exact raw output is not required
   → pstack how skill for traced runtime model
   → teaching create-learning-path if user wants to learn the area
 

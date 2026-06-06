@@ -22,7 +22,7 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 PYTHON="${ROOT}/.venv/bin/python"
 if [[ ! -x "$PYTHON" ]]; then
-  PYTHON="${PYTHON:-python3}"
+  PYTHON="${PYTHON_BIN:-python3}"
 fi
 
 export PYTHONPATH="$ROOT"

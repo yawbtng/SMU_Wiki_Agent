@@ -46,6 +46,7 @@ from .deps import (
     metrics_repo,
     read_json_file,
     read_jsonl_tail,
+    remove_site_directory,
     reports_dir,
     run_root,
     site_root,
@@ -112,7 +113,7 @@ def delete_site_payload(site_id: str, *, runner: TmuxRunner | None = None) -> di
             workspace_url = str(summary.get("site_url") or "")
 
     killed_sessions = kill_site_tmux_sessions(site_id, runner=runner)
-    shutil.rmtree(root)
+    remove_site_directory(root)
 
     repo = state_repo()
     state = dict(repo.load())
@@ -1136,8 +1137,10 @@ async def site_event_stream(
 
 
 def create_app() -> FastAPI:
+    from ..app.tmux_settings import apply_app_state_env_bridge
     from .routes import register_routes
 
+    apply_app_state_env_bridge()
     app = FastAPI(title="Ultra Fast RAG Web API", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,

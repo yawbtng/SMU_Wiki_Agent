@@ -14,6 +14,7 @@ import {
   buildScrapeModel,
   formatCost,
   formatCount,
+  formatPiEventLabel,
   metricsTokenMixSegments,
   resolveWikiJobStatus,
   scrapeStartPayload,
@@ -327,6 +328,16 @@ if (staleWiki.label !== 'Stale') {
   throw new Error('wiki hero status should reconcile stale running jobs when tmux is gone');
 }
 
+const failedWiki = resolveWikiJobStatus({ liveStatus: 'running', reportStatus: 'failed', generationStatus: 'running', staleRunning: false });
+if (failedWiki.label !== 'Failed') {
+  throw new Error('wiki status should prefer reconciled failed reports over stale running generation state');
+}
+
+const stalledWiki = resolveWikiJobStatus({ liveStatus: 'running', reportStatus: 'stalled', generationStatus: 'running', staleRunning: false });
+if (stalledWiki.label !== 'Stalled' || stalledWiki.tone !== 'warning') {
+  throw new Error('wiki status should surface silent live Pi jobs as stalled warnings');
+}
+
 const buildSummary = summarizePiBuildEvents([
   { type: 'message_update', text: 'token noise should be skipped' },
   { type: 'tool_start', status: 'running', message: 'Compiling wiki pages' },
@@ -334,4 +345,21 @@ const buildSummary = summarizePiBuildEvents([
 ]);
 if (!buildSummary.some((line) => line.includes('No models match pattern'))) {
   throw new Error('build event summary should surface runtime failure lines without token noise');
+}
+
+const readToolLabel = formatPiEventLabel({
+  type: 'tool_execution_start',
+  toolName: 'read',
+  args: { path: 'docs/wiki/page.md', offset: 120 },
+});
+if (!readToolLabel.includes('read') || !readToolLabel.includes('path=docs/wiki/page.md') || readToolLabel.includes('[object Object]')) {
+  throw new Error('tool execution labels should render toolName and compact args');
+}
+
+const turnEndLabel = formatPiEventLabel({
+  type: 'turn_end',
+  status: { usage: { input_tokens: 10 } },
+});
+if (turnEndLabel.includes('[object Object]')) {
+  throw new Error('turn lifecycle labels should never render object payloads as [object Object]');
 }

@@ -2,16 +2,26 @@ services:
   app:
     build: .
     image: ultra-fast-rag:local
-    container_name: ultra-fast-rag-webapp
     ports:
       - "${WEBAPP_HOST_PORT:-8000}:8000"
     environment:
+      ULTRA_FAST_RAG_DATA_ROOT: /app/data
       SCRAPE_PLANNER_DATA_ROOT: /app/data
+      SCRAPE_PLANNER_DATA_ROOT_STRICT: "1"
       REDIS_URL: redis://redis:6379/0
       SCRAPE_PLANNER_CORS_ORIGINS: http://localhost:8000,http://127.0.0.1:8000
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      PI_CODING_AGENT_DIR: /app/data/pi-agent
+      PI_CODING_AGENT_SESSION_DIR: /app/data/pi-agent/sessions
+      PI_OFFLINE: ${PI_OFFLINE:-1}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_EMBED_MODEL: ${OPENROUTER_EMBED_MODEL:-openai/text-embedding-3-small}
+      OPENROUTER_RERANK_MODEL: ${OPENROUTER_RERANK_MODEL:-cohere/rerank-4-pro}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     volumes:
-      - ./data:/app/data
+      - ${DATA_HOST_DIR:-./data}:/app/data
     depends_on:
       redis:
         condition: service_healthy
@@ -26,7 +36,6 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: ultra-fast-rag-redis
     ports:
       - "${REDIS_HOST_PORT:-6380}:6379"
     healthcheck:

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>http://scrape-docs:8080/</loc></url>
+  <url><loc>http://scrape-docs:8080/admissions.html</loc></url>
+  <url><loc>http://scrape-docs:8080/tuition.html</loc></url>
+  <url><loc>http://scrape-docs:8080/calendar.html</loc></url>
+  <url><loc>http://scrape-docs:8080/housing.html</loc></url>
+  <url><loc>http://scrape-docs:8080/student-life.html</loc></url>
+</urlset>

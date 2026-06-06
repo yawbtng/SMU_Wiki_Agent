@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -59,6 +61,18 @@ def test_put_app_state_persists_wiki_tmux_settings(client: TestClient) -> None:
     assert state["pi_cmd"] == "/usr/local/bin/pi"
 
 
+def test_put_app_state_refreshes_openrouter_env_for_running_app(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    response = client.put(
+        "/api/app-state",
+        json={"payload": {"openrouter_api_key": "saved-openrouter-key"}},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["state"]["openrouter_api_key"] == "saved-openrouter-key"
+    assert os.environ["OPENROUTER_API_KEY"] == "saved-openrouter-key"
+
+
 def test_list_sites(client: TestClient) -> None:
     response = client.get("/api/sites")
     assert response.status_code == 200
@@ -97,6 +111,32 @@ def test_delete_site_removes_data_and_app_state(client: TestClient, tmp_path: Pa
     assert state["last_site_id"] == ""
     assert all(item.get("id") != "remove-me.edu" for item in state["workspaces"])
     assert "https://remove-me.edu" not in state["site_history"]
+
+
+def test_delete_site_removes_symlink_without_following_target(client: TestClient, tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    external = tmp_path / "external-site"
+    external.mkdir(parents=True)
+    (external / "wiki").mkdir()
+    link_root = data_root / "sites" / "linked.example"
+    link_root.parent.mkdir(parents=True, exist_ok=True)
+    link_root.symlink_to(external, target_is_directory=True)
+    write_json(
+        data_root / "app_state.json",
+        {
+            "workspaces": [{"id": "linked.example", "name": "linked.example", "url": "https://linked.example"}],
+            "site_history": ["https://linked.example"],
+        },
+    )
+
+    response = client.delete("/api/sites/linked.example")
+
+    assert response.status_code == 200
+    assert not link_root.exists()
+    assert external.exists()
+    payload = response.json()
+    assert all(site["id"] != "linked.example" for site in payload["sites"])
+    assert all(item.get("id") != "linked.example" for item in payload["app_state"]["workspaces"])
 
 
 def test_delete_site_not_found(client: TestClient) -> None:
@@ -387,6 +427,45 @@ Keep this prose https://demo.edu/enrollment-services/registrar/transcripts
     assert saved == payload["markdown"]
     assert "Keep this prose" not in saved
     assert "- [ ]" not in saved
+
+
+DEFAULT_APPROVAL_BASE_PROMPT = (
+    "Select a broad but high-signal set of URLs for a student-facing university knowledge base. "
+    "Include admissions, registrar, academic calendar, tuition, financial aid, housing, dining, student life, "
+    "schools and colleges, Cox, Dedman, Dedman Law, Law, Meadows, Lyle, Simmons, and Perkins. "
+    "Exclude HR employee pages, donor/giving/alumni/event/news noise, and thin navigation."
+)
+
+
+def test_choose_top_100_with_base_prompt_ignores_school_lexicon_in_base_prompt(
+    client: TestClient, tmp_path: Path
+) -> None:
+    site_root = tmp_path / "data" / "sites" / "demo.edu"
+    discovered = [
+        {"url": f"https://demo.edu/admissions/page-{index}", "title": f"Admissions {index}"}
+        for index in range(60)
+    ]
+    discovered.extend(
+        {"url": f"https://demo.edu/student-life/service-{index}", "title": f"Student Life {index}"}
+        for index in range(60)
+    )
+    write_json(site_root / "discovered_urls.json", discovered)
+
+    response = client.post(
+        "/api/sites/demo.edu/approved-urls/chat",
+        json={
+            "message": "choose top 100 url",
+            "base_prompt": DEFAULT_APPROVAL_BASE_PROMPT,
+            "autosave": False,
+            "limit": 30000,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["intent"] == "approve"
+    assert len(payload["added"]) == 100
+    assert payload["count"] == 100
 
 
 def test_choose_dedman_approve_does_not_add_unrelated_lexical_matches(client: TestClient, tmp_path: Path) -> None:
@@ -749,6 +828,8 @@ def write_embedding_ready_site(data_root: Path, *, changed: int = 3, embedding_e
             "vector_store": {"ready": True, "backend": "zvec", "documents": 7},
         },
     )
+    (indexes_dir / "llm_wiki_documents.jsonl").write_text("{}\n", encoding="utf-8")
+    (indexes_dir / "llm_wiki_postings.json").write_text("{}", encoding="utf-8")
     return site_root
 
 
@@ -1207,3 +1288,43 @@ def test_wiki_job_status_marks_stale_pi_model_failure(tmp_path: Path, monkeypatc
 
     assert payload["report"]["job_status"] == "failed"
     assert "no models match pattern" in str(payload["report"]["last_error"]).lower()
+
+
+def test_wiki_job_status_marks_silent_live_pi_job_stalled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.scrape_planner.app.job_launcher import job_status_payload
+
+    site_root = tmp_path / "sites" / "demo.edu"
+    reports = site_root / "wiki" / "reports"
+    reports.mkdir(parents=True)
+    events_path = reports / "wiki-build.events.jsonl"
+    events_path.write_text(json.dumps({"type": "session", "id": "demo"}) + "\n", encoding="utf-8")
+    old_mtime = time.time() - 600
+    os.utime(events_path, (old_mtime, old_mtime))
+    write_json(
+        reports / "wiki-build-latest.json",
+        {
+            "status": "running",
+            "job_status": "running",
+            "tmux_session": "wiki-demo-live",
+            "pi_events_path": str(events_path),
+        },
+    )
+
+    class AliveTmux:
+        def available(self) -> bool:
+            return True
+
+        def session_exists(self, session: str) -> bool:
+            return session == "wiki-demo-live"
+
+    monkeypatch.setattr("src.scrape_planner.app.job_launcher.TmuxRunner", lambda: AliveTmux())
+    monkeypatch.setattr("src.scrape_planner.wiki.wiki_launcher.tmux_session_alive", lambda *args, **kwargs: True)
+
+    payload = job_status_payload(site_root, "llm-wiki-noninteractive")
+
+    assert payload["report"]["job_status"] == "stalled"
+    assert payload["report"]["reported_job_status"] == "running"
+    assert payload["report"]["stalled_running"] is True
+    assert payload["report"]["tmux_session_alive"] is True
+    assert payload["report"]["last_event_age_seconds"] >= 300
+    assert "has not emitted build output" in payload["report"]["last_error"]

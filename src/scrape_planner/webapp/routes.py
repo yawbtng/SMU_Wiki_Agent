@@ -49,10 +49,13 @@ def register_routes(app: FastAPI) -> None:
 
     @app.put("/api/app-state")
     def put_app_state(update: AppStateUpdate) -> dict[str, Any]:
+        from ..app.tmux_settings import apply_app_state_env_bridge
+
         repo = state_repo()
         current = dict(repo.load())
         current.update(update.payload)
         repo.save(current)
+        apply_app_state_env_bridge(force=True)
         return {"state": repo.load(), "path": str(app_state_path())}
 
     @app.post("/api/discover")

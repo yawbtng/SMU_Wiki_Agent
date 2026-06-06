@@ -534,6 +534,14 @@ def test_query_uses_openrouter_rerank_when_configured(tmp_path: Path, monkeypatc
     assert "openrouter_rerank" in response["evidence"][0]["ranking_reasons"]
 
 
+def test_embedding_unavailable_message_surfaces_openrouter_auth_errors() -> None:
+    from src.scrape_planner.wiki.llm_wiki_index import _embedding_unavailable_message
+
+    assert "401" in _embedding_unavailable_message(RuntimeError("401 Client Error: Unauthorized"))
+    assert "OPENROUTER_API_KEY" in _embedding_unavailable_message(ValueError("OPENROUTER_API_KEY is required for embeddings"))
+    assert "credits" in _embedding_unavailable_message(RuntimeError("402 Payment Required")).lower()
+
+
 def test_build_fails_when_dense_embeddings_are_unavailable(tmp_path: Path, monkeypatch) -> None:
     import src.scrape_planner.wiki.llm_wiki_index as llm_wiki_index
     from src.scrape_planner.wiki.llm_wiki_index import build_llm_wiki_index
